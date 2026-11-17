@@ -1,0 +1,77 @@
+# Сборка на GitHub. Каждый пуш в main собирает лаунчер (zip лежит во вкладке
+# Actions). Тег вида v0.2.0 ещё и выкладывает релиз с этим zip:
+#   git tag v0.2.0
+#   git push origin v0.2.0
+name: build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # MinGW: компоновщик для Rust (GNU), g++ для changer.dll, windres для иконки
+      - uses: msys2/setup-msys2@v2
+        id: msys2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-binutils
+          path-type: inherit
+
+      - name: MinGW в PATH
+        shell: pwsh
+        run: Add-Content $env:GITHUB_PATH "${{ steps.msys2.outputs.msys2-location }}\mingw64\bin"
+
+      - name: Rust (GNU)
+        shell: pwsh
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
+          rustup default stable-x86_64-pc-windows-gnu
+
+      - uses: Swatinem/rust-cache@v2
+
+      # версия из тега (v0.2.0 -> 0.2.0) попадает в Cargo.toml и в заголовок окна
+      - name: Версия из тега
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}".TrimStart("v")
+          (Get-Content Cargo.toml) -replace '^version = ".*"', "version = `"$v`"" | Set-Content Cargo.toml
+
+      - name: Тесты
+        run: cargo test --release
+
+      - name: Сборка
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File build.ps1
+
+      - name: Архив
+        shell: pwsh
+        run: |
+          $name = if ("${{ github.ref_type }}" -eq "tag") { "dota-skins-launcher-${{ github.ref_name }}" } else { "dota-skins-launcher-dev" }
+          New-Item -ItemType Directory -Force pack\$name | Out-Null
+          Copy-Item dist\dota-skins-launcher.exe, dist\gencatalog.exe, dist\changer.dll pack\$name\
+          Compress-Archive -Path pack\$name -DestinationPath "$name.zip" -Force
+          Add-Content $env:GITHUB_ENV "ZIP=$name.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dota-skins-launcher
+          path: ${{ env.ZIP }}
+
+      - name: Релиз
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP }}
+          generate_release_notes: true

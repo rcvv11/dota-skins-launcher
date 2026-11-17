@@ -1,0 +1,23 @@
+# Rust build output
+/target
+**/*.rs.bk
+
+# Release folder assembled by hand (launcher, DLL, generated catalog)
+/dist/
+
+# Native DLL build output (built from native/modelSwap.cpp)
+/native/*.dll
+/native/*.o
+
+# Third-party binaries (Source2Viewer-CLI), downloaded separately, see README
+/tools/
+
+# Generated catalog previews (gencatalog)
+/assets/previews/*
+!/assets/previews/.gitkeep
+
+# Crash dumps, logs, editor files
+*.mdmp
+*.log
+.vscode/
+.idea/

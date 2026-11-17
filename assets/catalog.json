@@ -1,0 +1,63 @@
+{
+  "skins": [
+    {
+      "id": "axe_arcana",
+      "name": "Demon's Reach",
+      "hero": "Axe",
+      "slot": "head",
+      "rarity": "arcana",
+      "preview": "previews/axe_arcana.png",
+      "files": []
+    },
+    {
+      "id": "invoker_immortal",
+      "name": "Cape of the Dark Magus",
+      "hero": "Invoker",
+      "slot": "back",
+      "rarity": "immortal",
+      "preview": null,
+      "files": [
+        {
+          "from": "overrides/invoker_cape/models/cape.vmdl_c",
+          "to": "models/heroes/invoker/cape.vmdl_c"
+        }
+      ]
+    },
+    {
+      "id": "lina_legendary",
+      "name": "Dragon's Fury",
+      "hero": "Lina",
+      "slot": "weapon",
+      "rarity": "legendary",
+      "preview": null,
+      "files": []
+    },
+    {
+      "id": "jugg_mythical",
+      "name": "Blade of the Silent",
+      "hero": "Juggernaut",
+      "slot": "weapon",
+      "rarity": "mythical",
+      "preview": null,
+      "files": []
+    },
+    {
+      "id": "crystal_rare",
+      "name": "Frost Sigil",
+      "hero": "Crystal Maiden",
+      "slot": "back",
+      "rarity": "rare",
+      "preview": null,
+      "files": []
+    },
+    {
+      "id": "pudge_uncommon",
+      "name": "Hook Wrap",
+      "hero": "Pudge",
+      "slot": "weapon",
+      "rarity": "uncommon",
+      "preview": null,
+      "files": []
+    }
+  ]
+}
