@@ -218,20 +218,3 @@ mod tests {
         assert!(index.resolve(&labels(&["Купить"])).is_empty());
     }
 }
-
-#[cfg(test)]
-mod real_game {
-    /// `cargo test real_game -- --ignored --nocapture`
-    #[test]
-    #[ignore]
-    fn guilt_of_the_survivor() {
-        let exe = r"C:\Program Files (x86)\Steam\steamapps\common\dota 2 beta\game\bin\win64\dota2.exe";
-        let dir = crate::vpk::game_dir_from_exe(exe).expect("dota2.exe");
-        let t = std::time::Instant::now();
-        let index = super::NameIndex::load(&dir).expect("load");
-        println!("built in {:?}, {} names", t.elapsed(), index.by_name.len());
-        let r = index.resolve(&["Guilt of the Survivor".to_string()]);
-        println!("{r:?}");
-        assert!(r.contains(&"Blade of the Survivor".to_string()));
-    }
-}

@@ -51,8 +51,8 @@ fn run(ctx: egui::Context) {
         let mtime = std::fs::metadata(crate::picks::equips_path()).and_then(|m| m.modified()).ok();
         if mtime != equips_mtime {
             equips_mtime = mtime;
-            // все нажатия с прошлого раза, по порядку: пока применялось одно,
-            // могли нажать ещё несколько — предметы надеваются одним применением
+            // every press since last time, in order: while one was being applied,
+            // more may have come; their items are put on in one apply
             let mut picks: Vec<(Vec<String>, Option<u32>)> = Vec::new();
             for press in crate::picks::presses_after(handled) {
                 handled = press.tick;
@@ -60,7 +60,7 @@ fn run(ctx: egui::Context) {
                 if !enabled {
                     continue;
                 }
-                // переключатель персоны в Dota: «@persona», имя героя
+                // Dota's persona switch: «@persona», hero name
                 if press.labels.first().map(String::as_str) == Some("@persona") {
                     if !picks.is_empty() {
                         let _ = wear(&ctx, &std::mem::take(&mut picks));
@@ -72,7 +72,7 @@ fn run(ctx: egui::Context) {
                 let ids: Vec<String> = crate::picks::items_at(&catalog, &press, names.get()).iter().map(|s| s.id.clone()).collect();
                 crate::picks::trace(&format!("  items: {}", ids.join(", ")));
                 if !ids.is_empty() {
-                    // стиль, выбранный стрелками на карточке Dota («2 / 2»)
+                    // the style picked with the arrows on Dota's item card («2 / 2»)
                     picks.push((ids, crate::styles::from_labels(&press.labels)));
                 }
             }
@@ -128,7 +128,7 @@ pub fn toggle_persona(ctx: &egui::Context, hero: &str) -> Result<bool, ()> {
     if ok == Some(true) { Ok(!worn) } else { Err(()) }
 }
 
-/// Install plan for a preset, as the launcher's «Применить» builds it.
+/// Install plan for a preset, as the launcher's «Apply» builds it.
 fn plan_for(config: &Config, catalog: &Catalog, assets: &std::path::Path, profile: &Profile) -> job::Plan {
     let chosen: Vec<&Skin> = catalog.skins.iter().filter(|s| profile.skins.contains(&s.id)).collect();
     let (overrides, schema_picks, unsupported) = crate::extract::plan(&chosen, catalog, &config.override_targets);

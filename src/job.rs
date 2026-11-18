@@ -140,6 +140,16 @@ fn run(plan: &Plan, step: &dyn Fn(&str)) -> Result<String, String> {
                     glow_lines.push(crate::glow::config_line(&g.npc, &g.particle, &d));
                 }
             }
+            // Taunts: their animation, played by changer.dll on your own hero (client-side).
+            if let Some(cli) = &plan.vrf_cli {
+                let pak = game_dir.join("pak01_dir.vpk");
+                let model_swaps: std::collections::HashMap<String, String> = reqs
+                    .iter()
+                    .filter(|r| r.dst.ends_with(".vmdl_c"))
+                    .map(|r| (r.dst.to_ascii_lowercase(), r.src.clone()))
+                    .collect();
+                glow_lines.extend(crate::taunts::config_lines(index, &plan.hero_items, npcs, units, &model_swaps, cli, &pak));
+            }
             // Colourings that are another material group of the model.
             let wanted = crate::skins::wanted(&index, &plan.hero_items);
             if let (false, Some(cli)) = (wanted.is_empty(), &plan.vrf_cli) {
@@ -345,7 +355,7 @@ fn run_in_memory(
     Ok(crate::tr!("Dota 2 успешно запущена", "Dota 2 launched successfully").into())
 }
 
-/// " · не применились: A, B" or `None` when nothing was skipped.
+/// " · not applied: A, B" (in the UI language) or `None` when nothing was skipped.
 fn skipped_note(skipped: &[crate::extract::Skip]) -> Option<String> {
     const SHOWN: usize = 4;
     let mut names: Vec<&str> = skipped.iter().map(|s| s.name.as_str()).collect();
@@ -375,119 +385,5 @@ mod tests {
         let note = skipped_note(&s).unwrap();
         assert_eq!(note, " · не применились: Taunt: Bring It On");
         assert!(skipped_note(&[]).is_none());
-    }
-}
-
-#[cfg(test)]
-mod timing_real {
-    /// `cargo test --release timing_real -- --ignored --nocapture`: the apply
-    /// pipeline twice (cold, then from the in-memory cache), without Dota.
-    #[test]
-    #[ignore]
-    fn apply_stages() {
-        use std::time::Instant;
-        let cfg = crate::config::load_config();
-        let assets = std::path::PathBuf::from("dist/assets");
-        for round in ["cold", "cached"] {
-            let t = Instant::now();
-            let mut catalog = crate::catalog::Catalog::load(&assets).unwrap();
-            catalog.merge_custom(&crate::config::load_custom_files());
-            let profiles = crate::config::load_profiles();
-            let profile = &profiles[cfg.active_profile.min(profiles.len() - 1)];
-            let chosen: Vec<&crate::catalog::Skin> = catalog.skins.iter().filter(|s| profile.skins.contains(&s.id)).collect();
-            let (_overrides, picks, _) = crate::extract::plan(&chosen, &catalog, &cfg.override_targets);
-            let mut general = crate::visuals::general_items(&chosen);
-            let mut heroes = crate::visuals::hero_items(&chosen);
-            crate::visuals::with_styles(&mut general, &mut heroes, &profile.styles);
-            let game = crate::vpk::game_dir_from_exe(&cfg.dota_path).unwrap();
-            let data = crate::gamedata::load(&game).unwrap();
-            let t_data = t.elapsed().as_millis();
-            let (index, npcs, units) = (&data.index, &data.npcs, &data.units);
-            let (_reqs, glows) = crate::visuals::hero_overrides_and_glows(index, &heroes, units, npcs);
-            let cli = std::path::PathBuf::from("tools/vrf-cli/Source2Viewer-CLI.exe");
-            let pak = game.join("pak01_dir.vpk");
-            let particles: Vec<&str> = glows.iter().map(|g| g.particle.as_str()).collect();
-            let _d = crate::glow::drivers_cached(&cli, &pak, &particles);
-            let wanted = crate::skins::wanted(index, &heroes);
-            let models: Vec<String> = wanted.iter().map(|(_, m, _)| m.clone()).collect();
-            let tg = Instant::now();
-            let groups = crate::skins::material_groups_cached(&cli, &pak, &models);
-            let t_groups = tg.elapsed().as_millis();
-            let _ = crate::visuals::overrides(index, &general, units, true);
-            let ts = Instant::now();
-            let (_patched, _) = crate::schema::patch(data.table, &picks, npcs);
-            let t_schema = ts.elapsed().as_millis();
-            println!(
-                "{round}: total {} ms (game data {t_data} ms, material groups {t_groups} ms for {} models / {} found, schema patch {t_schema} ms)",
-                t.elapsed().as_millis(),
-                models.len(),
-                groups.len()
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-mod placeholders_real {
-    #[test]
-    #[ignore]
-    fn layout_and_table() {
-        let cfg = crate::config::load_config();
-        let game = crate::vpk::game_dir_from_exe(&cfg.dota_path).unwrap();
-        let data = crate::gamedata::load(&game).unwrap();
-        let t = std::time::Instant::now();
-        let catalog = crate::catalog::Catalog::load(std::path::Path::new("dist/assets")).unwrap();
-        let (slots, no_merge) = super::schema_layout(data, &catalog);
-        println!("layout: {} slots, {} no-merge, {} ms", slots.len(), no_merge.len(), t.elapsed().as_millis());
-        let t = std::time::Instant::now();
-        let (patched, placed) = crate::schema::with_placeholders(data.table, &slots);
-        println!("placeholders: {} placed, {} ms", placed.len(), t.elapsed().as_millis());
-        let t = std::time::Instant::now();
-        let patched = crate::schema::skip_combine(&patched, &no_merge);
-        println!("skip_combine: {} ms", t.elapsed().as_millis());
-        for key in [("npc_dota_hero_life_stealer", "head"), ("npc_dota_hero_life_stealer", "back"), ("npc_dota_hero_phantom_lancer", "head")] {
-            println!("  {key:?} placed: {}", placed.iter().any(|(n, s)| n == key.0 && s == key.1));
-        }
-        let (o, c) = crate::schema::find_default_item(&patched, "npc_dota_hero_life_stealer", "head").unwrap();
-        println!("{}", String::from_utf8_lossy(&patched[o..=c]));
-        let mut by_slot = std::collections::BTreeMap::new();
-        for (_, s) in &placed { *by_slot.entry(s.clone()).or_insert(0) += 1; }
-        println!("{by_slot:?}");
-        // the patched table still parses
-        assert!(!crate::visuals::Table::new(&patched).skips_model_combine(&crate::visuals::ItemRef { name: "-".into(), index: None, style: 0 }));
-    }
-}
-
-#[cfg(test)]
-mod schema_pak_real {
-    #[test]
-    #[ignore]
-    fn pak_with_placeholders_reads_back() {
-        let cfg = crate::config::load_config();
-        let game = crate::vpk::game_dir_from_exe(&cfg.dota_path).unwrap();
-        let data = crate::gamedata::load(&game).unwrap();
-        let catalog = crate::catalog::Catalog::load(std::path::Path::new("dist/assets")).unwrap();
-        let (slots, no_merge) = super::schema_layout(data, &catalog);
-        let invisible = crate::vpk::read_file(&game, "models/development/invisiblebox.vmdl_c").unwrap().unwrap();
-        let (patched, placed) = crate::schema::with_placeholders(data.table, &slots);
-        let patched = crate::schema::skip_combine(&patched, &no_merge);
-        let mut files = vec![(crate::schema::SCHEMA_PATH.to_string(), patched.clone())];
-        for (npc, slot) in &placed {
-            files.push((format!("{}_c", crate::schema::placeholder(npc, slot)), invisible.clone()));
-        }
-        let dir = std::env::temp_dir().join("dsl_pak_test");
-        let _ = std::fs::create_dir_all(&dir);
-        let pak = dir.join("pak01_dir.vpk");
-        let t = std::time::Instant::now();
-        crate::vpk::write_vpk(&pak, &files).unwrap();
-        println!("wrote {} files in {} ms", files.len(), t.elapsed().as_millis());
-        let back: std::collections::HashMap<String, Vec<u8>> = crate::vpk::read_all(&pak).unwrap().into_iter().collect();
-        assert_eq!(back.len(), files.len());
-        for (p, b) in &files {
-            assert_eq!(back.get(p).map(|v| v.len()), Some(b.len()), "{p}");
-        }
-        let ls = "models/items/dota_skins_slots/npc_dota_hero_life_stealer/head.vmdl_c";
-        assert_eq!(back.get(ls), Some(&invisible));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

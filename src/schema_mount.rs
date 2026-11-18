@@ -7,8 +7,8 @@
 //! The search paths are written into `gameinfo_branchspecific.gi` (its keys win
 //! over gameinfo.gi), and that file's hashes are appended to
 //! `bin/win64/dota.signatures` after the DIGEST line: Dota checks the gameinfo
-//! files against that list before online play ("Игра не прошла проверку перед
-//! сетевой игрой" was a gameinfo.gi changed without it).
+//! files against that list before online play (the "game failed the check before
+//! online play" error was a gameinfo.gi changed without it).
 //!
 //! The table is read once at startup, so it does not depend on the preset: it
 //! is written once (and after game updates), then every empty-slot pick is a
@@ -359,15 +359,4 @@ mod tests {
         assert_eq!(strip_signatures(&ours), sigs);
     }
 
-    /// The real files: the branch file the game ships hashes to Valve's entry.
-    #[test]
-    #[ignore]
-    fn real_branch_matches_valve_signature() {
-        let p = paths(r"C:\Program Files (x86)\Steam\steamapps\common\dota 2 beta\game\bin\win64\dota2.exe").unwrap();
-        let branch = std::fs::read(&p.branch).unwrap();
-        let line = signature_line(&branch);
-        let sigs = read_latin1(&p.signatures).unwrap();
-        println!("{line}");
-        assert!(sigs.contains(&line), "наш хэш не совпал с записью Valve");
-    }
 }

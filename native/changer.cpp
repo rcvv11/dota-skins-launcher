@@ -1,18 +1,18 @@
-// changer.dll — подмена файлов ресурсов Dota 2 в памяти (режим «в памяти» лаунчера).
+// changer.dll: swaps Dota 2 resource files in memory (the launcher's memory mode).
 //
-// Хук CAsyncResourceDataRequest::InitForFileRead (resourcesystem.dll): имя ресурса
-// не меняется (он остаётся в манифесте предзагрузки и грузится штатно), подменяется
-// только файл, из которого читаются его данные (crystal_maiden_cape.vmdl_c ->
+// Hook on CAsyncResourceDataRequest::InitForFileRead (resourcesystem.dll): the resource's
+// name stays the same (it stays in the preload manifest and loads as usual), only the
+// file its data is read from is swapped (crystal_maiden_cape.vmdl_c ->
 // lumini_polare_back.vmdl_c).
 //
-// Таблицу подмен пишет лаунчер: %APPDATA%\dota-skins\model_swap.cfg
-// (перечитывается при изменении, действует на ресурсы, загруженные после этого)
-//   <оригинал>|<замена>     пути без суффикса _c
-//   hide|<папка>/           все .vmdl из папки -> невидимая модель
-//   <путь>|keep             исключение из hide
-// Лог: %APPDATA%\dota-skins\model_swap.log
+// The swap table is written by the launcher: %APPDATA%\dota-skins\model_swap.cfg
+// (re-read when it changes, applies to resources loaded after that)
+//   <original>|<replacement>  paths without the _c suffix
+//   hide|<folder>/          every .vmdl of the folder -> an invisible model
+//   <path>|keep             an exception to hide
+// Log: %APPDATA%\dota-skins\model_swap.log
 //
-// Сборка (MinGW): g++ -O2 -shared -static -o changer.dll changer.cpp -lpsapi
+// Build (MinGW): g++ -O2 -shared -static -o changer.dll changer.cpp -lpsapi
 
 #include <windows.h>
 #include <psapi.h>
@@ -23,6 +23,7 @@
 #include <string>
 #include <vector>
 #include <set>
+#include <map>
 #include <fstream>
 #include <unordered_map>
 #include <algorithm>
@@ -47,8 +48,8 @@ static void Log(const char* fmt, ...) {
 }
 
 // --- CBufferString (tier0) ---
-// +0: uint32 length (биты 0..29), +4: uint32 allocated (биты 0..29) | 0x40000000 = данные inline на +8
-// +8: char* или inline-буфер
+// +0: uint32 length (bits 0..29), +4: uint32 allocated (bits 0..29) | 0x40000000 = data inline at +8
+// +8: char* or the inline buffer
 static const char* BufStr_Get(void* s) {
     uint32_t alloc = *(uint32_t*)((char*)s + 4);
     if (alloc & 0x40000000) return (const char*)s + 8;
@@ -59,7 +60,7 @@ static const char* BufStr_Get(void* s) {
 using PurgeFn = void (*)(void* self, int allocatedSize);
 static PurgeFn g_Purge = nullptr;
 
-// CBufferString со встроенным буфером на 200 байт, как его создаёт сам движок
+// CBufferString with a built-in 200-byte buffer, as the engine itself creates it
 struct StackBufferString {
     uint32_t length = 0;
     uint32_t alloc = 0xC00000C8;
@@ -67,16 +68,16 @@ struct StackBufferString {
     ~StackBufferString() { g_Purge(this, 0); }
 };
 
-// --- Таблица подмен ---
-// Лаунчер перезаписывает конфиг на ходу: таблица собирается заново и подменяется
-// целиком под эксклюзивной блокировкой, хук читает её под разделяемой.
+// --- Swap table ---
+// The launcher rewrites the config on the fly: the table is built anew and replaced
+// as a whole under an exclusive lock; the hook reads it under a shared one.
 struct Rules {
     std::unordered_map<std::string, std::string> replacements;
     std::vector<std::string> hiddenPrefixes;
     std::set<std::string> keep;
 };
 static Rules* g_rules = new Rules();
-static std::string g_lang = "ru";  // язык кнопок интерфейса
+static std::string g_lang = "ru";  // language of the interface buttons
 static SRWLOCK g_rulesLock = SRWLOCK_INIT;
 static const char* kHiddenModel = "models/development/invisiblebox.vmdl";
 
@@ -97,17 +98,21 @@ static void AddRule(Rules& rules, const std::string& from, const std::string& to
     } else if (t == "keep") {
         rules.keep.insert(f);
     } else {
-        rules.replacements.emplace(f, t);  // первая подмена файла побеждает, как в файловом режиме
+        rules.replacements.emplace(f, t);  // the first swap of a file wins, as in the file mode
     }
 }
 
 static void QueuePreloads(const Rules& rules);
-// Свечения предметов для матча (строки glow|npc|particle|cp:type:attachment;...):
-// JS-массив, который скрипт интерфейса получает через DSLSetGlows
+// Item glows for a match (lines glow|npc|particle|cp:type:attachment;...):
+// a JS array the interface script gets through DSLSetGlows
 static std::string g_glowsJs = "[]";
-// Предметы для пустых слотов, которые запущенная Dota ещё не прочитала (строка
-// restart|имя\tимя): их кнопка пишет «после перезапуска»
+// Items for empty slots the running Dota has not read yet (line
+// restart|name\tname): their button says «after restart»
 static std::string g_restartJs = "[]";
+// Taunts (lines taunt|npc_dota_hero_x|sequence;sequence): played on your own hero
+// in a match, client-side only
+static std::map<std::string, std::string> g_taunts;
+static SRWLOCK g_tauntLock = SRWLOCK_INIT;
 static volatile LONG g_glowsVersion = 0;
 static SRWLOCK g_glowsLock = SRWLOCK_INIT;
 
@@ -144,18 +149,24 @@ static std::string GlowJs(const std::string& line) {
     }
     return "{npc:" + JsString(f[1]) + ",fx:" + JsString(f[2]) + ",cps:[" + cps + "]}";
 }
-static volatile LONG g_refreshPending = 0;  // конфиг сменился: обновить предпросмотр после предзагрузки
+static volatile LONG g_refreshPending = 0;  // the config changed: refresh the preview after preloading
 
 static bool LoadConfig(const std::string& path) {
     std::ifstream file(path);
     if (!file.is_open()) return false;
     Rules* fresh = new Rules();
     std::string line, glows, restart;
+    std::map<std::string, std::string> taunts;
     std::string lang = "ru";
     while (std::getline(file, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty() || line[0] == '#') continue;
         if (line.compare(0, 5, "lang|") == 0) { lang = line.substr(5); continue; }
+        if (line.compare(0, 6, "taunt|") == 0) {
+            size_t bar = line.find('|', 6);
+            if (bar != std::string::npos) taunts[line.substr(6, bar - 6)] = line.substr(bar + 1);
+            continue;
+        }
         if (line.compare(0, 8, "restart|") == 0) {
             size_t s = 8;
             while (s <= line.size()) {
@@ -183,6 +194,9 @@ static bool LoadConfig(const std::string& path) {
     g_glowsJs = "[" + glows + "]";
     g_restartJs = "[" + restart + "]";
     ReleaseSRWLockExclusive(&g_glowsLock);
+    AcquireSRWLockExclusive(&g_tauntLock);
+    g_taunts.swap(taunts);
+    ReleaseSRWLockExclusive(&g_tauntLock);
     InterlockedIncrement(&g_glowsVersion);
     static bool first = true;
     if (!first) InterlockedExchange(&g_refreshPending, 1);
@@ -201,7 +215,7 @@ static bool FileTime(const std::string& path, FILETIME& out) {
     return true;
 }
 
-// Лаунчер переписывает конфиг при смене пресета — перечитываем его
+// The launcher rewrites the config when the preset changes: re-read it
 static DWORD WINAPI WatchConfig(LPVOID) {
     std::string cfg = g_appDir + "model_swap.cfg";
     FILETIME last{};
@@ -211,15 +225,15 @@ static DWORD WINAPI WatchConfig(LPVOID) {
         FILETIME now;
         if (FileTime(cfg, now) && CompareFileTime(&now, &last) != 0) {
             last = now;
-            Sleep(10);  // лаунчер пишет через временный файл и переименование
+            Sleep(10);  // the launcher writes through a temp file and a rename
             LoadConfig(cfg);
         }
     }
 }
 
-// --- Хук InitForFileRead ---
+// --- InitForFileRead hook ---
 // void InitForFileRead(this, const ResourceBindingBase_t* binding, priority, bool, const char* fileName)
-// fileName обычно nullptr — тогда движок сам получает имя через ResourceSystem->vtable[0x180/8]
+// fileName is usually nullptr: then the engine gets the name itself through ResourceSystem->vtable[0x180/8]
 using InitForFileReadFn = void (*)(void* self, void* binding, uintptr_t priority, uintptr_t flag, const char* fileName);
 static InitForFileReadFn g_OrigInitForFileRead = nullptr;
 
@@ -276,10 +290,10 @@ static void HookedInitForFileRead(void* self, void* binding, uintptr_t priority,
     g_OrigInitForFileRead(self, binding, priority, flag, fileName);
 }
 
-// --- Предзагрузка замен для меню ---
-// Имя ресурса движка: CBufferString с буфером на 200 байт, затем хэш и тип.
-static volatile LONG g_inMenu = 0;  // скрипт интерфейса сообщает: меню, не матч
-static volatile LONG g_substituted = 0;     // сколько раз отдали замену вместо оригинала
+// --- Preloading replacements for the menu ---
+// The engine's resource name: a CBufferString with a 200-byte buffer, then a hash and a type.
+static volatile LONG g_inMenu = 0;  // the interface script reports: menu, not a match
+static volatile LONG g_substituted = 0;     // how many times a replacement was handed out instead of the original
 
 struct ResourceName {
     uint32_t length = 0;
@@ -299,11 +313,11 @@ static BlockingLoadFn g_BlockingLoad = nullptr;
 static const int kResourceResident = 3;
 static const size_t kGetStatusSlot = 0x198 / 8;
 
-static std::set<std::string> g_preloadQueue;  // замены, которые ещё надо загрузить
-static std::set<std::string> g_resident;      // замены, уже загруженные: их имя можно подставлять
+static std::set<std::string> g_preloadQueue;  // replacements still to load
+static std::set<std::string> g_resident;      // replacements already loaded: their name can be handed out
 static SRWLOCK g_preloadLock = SRWLOCK_INIT;
 
-// Ресурсы, которые в меню отдаём заменой по имени (обход кэша): модели и эффекты
+// Resources handed out as their replacement by name in the menu (bypassing the cache): models and effects
 static bool IsSwappableResource(const char* name) {
     size_t len = strlen(name);
     return len > 5 && (_stricmp(name + len - 5, ".vmdl") == 0 || _stricmp(name + len - 5, ".vpcf") == 0 ||
@@ -326,8 +340,8 @@ static bool PreloadsDone() {
     return r;
 }
 
-// Модели и материалы загружены (эффекты ещё могут грузиться): модель героя уже
-// можно перестроить, эффекты появятся вторым обновлением
+// Models and materials are loaded (effects may still be loading): the hero model
+// can be rebuilt already, the effects come with a second refresh
 static bool ModelsDone() {
     AcquireSRWLockShared(&g_preloadLock);
     bool r = true;
@@ -346,10 +360,10 @@ static bool IsResident(const std::string& model) {
     return r;
 }
 
-// Поток интерфейса (тик скрипта): синхронно грузим по несколько замен за тик
+// Interface thread (script tick): loads a few replacements per tick, synchronously
 static void RunPreloads() {
     if (!g_SetResourceName || !g_BlockingLoad || !g_ResourceSystem) return;
-    // сколько успеем за ~30 мс тика (тик каждые 50 мс): сет грузится за доли секунды
+    // as many as fit in ~30 ms of a tick (a tick every 50 ms): a set loads in a fraction of a second
     ULONGLONG start = GetTickCount64();
     while (GetTickCount64() - start < 30) {
         std::string model;
@@ -376,17 +390,17 @@ static void RunPreloads() {
 }
 
 
-// --- Подмена при поиске ресурса (меню) ---
+// --- Swap on resource lookup (menu) ---
 // CResourceSystem::FindOrRegisterResourceByName_Internal(rs, ResourceName*, bool):
-// по имени и хэшу отдаёт привязку ресурса. В меню для оригинала, у которого
-// загруженная замена, отдаём привязку замены — как при смене предмета кнопкой
-// «Надеть», панель получает другой ресурс и перерисовывает модель.
+// gives a resource's binding by name and hash. In the menu, for an original whose
+// replacement is loaded, the replacement's binding is given: as when an item is changed
+// with Dota's «Equip», the panel gets another resource and redraws the model.
 using FindOrRegisterFn = void* (*)(void* rs, ResourceName* name, uintptr_t flag);
 static FindOrRegisterFn g_OrigFindOrRegister = nullptr;
 
 static void* HookedFindOrRegister(void* rs, ResourceName* name, uintptr_t flag) {
-    // и в меню, и в матче: ресурс, загруженный до выбора (кольцо эмблемы, шейдер
-    // экрана), иначе остаётся в кэше со старой подменой
+    // in the menu and in a match: a resource loaded before the pick (emblem ring, screen
+    // shader) stays in the cache with the old swap otherwise
     if (name && g_SetResourceName) {
         const char* cur = BufStr_Get(name);
         size_t len = strlen(cur);
@@ -416,9 +430,9 @@ static const uint8_t kInitForFileReadSig[] = {
     0x48, 0x8B, 0x9D, 0x90, 0x00, 0x00, 0x00, 0x45, 0x33, 0xED,
     0x44, 0x89, 0x6C, 0x24, 0x70, 0x45, 0x0F, 0xB6, 0xE1
 };
-// Первые 17 байт (до sub rsp) не содержат RIP-relative инструкций — переносим их в трамплин
+// The first 17 bytes (up to sub rsp) have no RIP-relative instructions: they move into the trampoline
 static const size_t kStolenBytes = 17;
-// По смещению +0x58: lea rcx,[rip+disp32] — адрес глобального объекта ResourceSystem
+// At offset +0x58: lea rcx,[rip+disp32], the address of the global ResourceSystem object
 static const size_t kResourceSystemLeaOffset = 0x58;
 
 static uint8_t* FindPattern(HMODULE mod, const uint8_t* sig, size_t sigLen) {
@@ -428,7 +442,7 @@ static uint8_t* FindPattern(HMODULE mod, const uint8_t* sig, size_t sigLen) {
     uint8_t* found = nullptr;
     for (size_t i = 0; i + sigLen <= mi.SizeOfImage; i++) {
         if (memcmp(base + i, sig, sigLen) == 0) {
-            if (found) return nullptr;  // сигнатура неуникальна — не рискуем
+            if (found) return nullptr;  // the signature is not unique: do not risk it
             found = base + i;
         }
     }
@@ -442,7 +456,7 @@ static void WriteAbsJmp(uint8_t* at, void* dest) {
     *(void**)(at + 6) = dest;
 }
 
-// stolen — длина целых инструкций в начале функции (>= 14, без RIP-relative)
+// stolen: length of whole instructions at the function's start (>= 14, no RIP-relative)
 static bool InstallHook(uint8_t* target, size_t stolen, void* hook, void** original) {
     uint8_t* tramp = (uint8_t*)VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!tramp) return false;
@@ -461,9 +475,9 @@ static bool InstallHook(uint8_t* target, size_t stolen, void* hook, void** origi
     return true;
 }
 
-// --- Нажатия «ВЫБРАТЬ» ---
-// Записываются в equips.txt (`tick|class|from|def|labels`), лаунчер надевает предмет
-// по номеру или названию из строки.
+// --- «SELECT» presses ---
+// Written to equips.txt (`tick|class|from|def|labels`); the launcher puts the item on
+// by the row's item index or name.
 struct EquipEvent { ULONGLONG tick; uint32_t cls; ULONGLONG from; uint32_t def; std::string labels; };
 static std::vector<EquipEvent> g_equips;
 static SRWLOCK g_equipsLock = SRWLOCK_INIT;
@@ -486,12 +500,12 @@ static DWORD WINAPI WriteEquips(LPVOID) {
     }
 }
 
-// --- Кнопка «Выбрать» в окне предмета Dota (Panorama) ---
-// Перехватываем CUIEngine::RunScript (panorama.dll): из потока интерфейса, внутри
-// обычного вызова игры, раз в секунду выполняем свой JS. Он находит открытые окна
-// предмета (DOTAStoreItemDetailsPage) и добавляет кнопку «Выбрать». Нажатие
-// выполняет через RunScriptInPanelContext скрипт-метку /*DSL_PICK*/, которую видит
-// этот же хук и пишет в equips.txt: лаунчер надевает предмет из строки.
+// --- The «SELECT» button on Dota's item cards (Panorama) ---
+// Hooks CUIEngine::RunScript (panorama.dll): from the interface thread, inside
+// one of the game's own calls, runs our JS. It finds the open pages
+// with item cards and adds the «SELECT» button. A press
+// sends a DSL_PICK message (or runs the /*DSL_PICK*/ marker script), which
+// this DLL writes to equips.txt: the launcher puts on the item of the row.
 using RunScriptFn = void (*)(void* engine, void* panel, const char* script, const char* path, uint64_t lineCol);
 static RunScriptFn g_OrigRunScript = nullptr;
 static thread_local bool t_inOurScript = false;
@@ -505,12 +519,13 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
   var root = ctx;
   while (root.GetParent()) root = root.GetParent();
   var me = "" + Math.random();
-  // живой цикл (сердцебиение свежее 2 с) не заменяем
+  // a live loop (heartbeat newer than 2 s) is not replaced
   var hb = parseFloat(root.GetAttributeString("dsl_hb", "0")) || 0;
   if (Date.now() - hb < 2000) return;
   root.SetAttributeString("dsl_loop", me);
   var last = "";
   var lastMenu = null;
+  var lastHero = "";
   function tick() {
     try {
       if (!root.IsValid() || root.GetAttributeString("dsl_loop", "") !== me) return;
@@ -545,10 +560,10 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
       }
       for (var j = 0; j < pages.length; j++) {
         var hp = pages[j];
-        // любая открытая страница меню с карточками предметов: страница героя,
-        // «Окружение» (варды, крипы, башни, эмблемы…), арсенал
+        // any open menu page with item cards: the hero page,
+        // «Environment» (wards, creeps, towers, emblems…), the armory
         if (!hp.visible || hp.paneltype === "DOTAStoreItemDetailsPage") continue;
-        // карточки предметов: у каждой есть ItemInfoContainer (у недоступных нет кнопки покупки)
+        // item cards: each has an ItemInfoContainer (unavailable ones have no buy button)
         var stack = [hp];
         var infos = [];
         while (stack.length) {
@@ -566,7 +581,7 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
           var unavailable = card.BHasClass("Unavailable");
           var nativeStatus = box.FindChild("StatusLabelContainer");
           var statusText = nativeStatus && nativeStatus.FindChild("StatusLabel0") ? nativeStatus.FindChild("StatusLabel0").text : "";
-          // свой предмет: класс Owned; текст статуса («ЕСТЬ У ВАС») — только если карточка не «НЕДОСТУПНО»
+          // an owned item: class Owned; the status text («OWNED») counts only if the card is not «UNAVAILABLE»
           var owned = DSLOwned(box) || (!!statusText && !unavailable);
           var wrapHave = box.FindChild("DSLPickWrap");
           if (wrapHave) wrapHave.visible = !owned;
@@ -575,7 +590,7 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
             nativeStatus.SetAttributeString("dsl_hidden", "");
           }
           if (owned) continue;
-          // блок покупки с ценой прячем; у недоступных — родную надпись «НЕДОСТУПНО» и затемнение
+          // hide the buy block with the price; on unavailable cards Dota's own «UNAVAILABLE» and the dimming
           var multi = box.FindChild("AvailableItemPurchaseButton");
           if (multi) multi.visible = false;
           if (unavailable && nativeStatus) { nativeStatus.visible = false; nativeStatus.SetAttributeString("dsl_hidden", "1"); }
@@ -584,8 +599,8 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
           var chain = [row.paneltype + "#" + row.id];
           var have = box.FindChildTraverse("DSLPickButton");
           if (have) { DSLSetPicked(have, have.GetChild(0), !!picked[DSLKey(row)]); continue; }
-          // как у карточки Dota: внизу строка статуса; при наведении на карточку
-          // она гаснет и на её месте появляется кнопка «ВЫБРАТЬ» во всю ширину
+          // as on Dota's card: a status line at the bottom; on hover over the card
+          // it fades and a full-width «SELECT» button takes its place
           var wrap = $.CreatePanel("Panel", box, "DSLPickWrap");
           wrap.style.width = "100%";
           wrap.style.verticalAlign = "bottom";
@@ -628,8 +643,8 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
               var key = rowLabels.join("|");
               if (picked[key]) return;
               var def = DSLItemDef(row);
-              // остальные строки этого списка: снова «ВЫБРАТЬ» (в слоте один предмет)
-              // строки вложены в обёртки: поднимаемся до контейнера со всем списком
+              // the list's other rows go back to «SELECT» (one item per slot)
+              // rows are nested in wrappers: go up to the container of the whole list
               var list = row.GetParent(), others = [];
               for (var up = 0; list && up < 8; up++, list = list.GetParent()) {
                 others = DSLButtons(list);
@@ -655,8 +670,16 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
       var inMenu = false;
       try { inMenu = typeof Game !== "undefined" && Game.GetState() === 0; } catch (e2) {}
       if (inMenu !== lastMenu) { lastMenu = inMenu; $.Msg("DSL_MENU " + (inMenu ? 1 : 0)); }
-      // переключатель персоны (КЛАССИКА / ВЭЙ): у неимеющейся персоны кнопка Dota
-      // выключена — включаем и шлём лаунчеру «переключить персону героя»
+      // your hero in a match (for taunts): entity index and unit name
+      if (!inMenu) {
+        try {
+          var hero = Players.GetPlayerHeroEntityIndex(Players.GetLocalPlayer());
+          var heroKey = hero > 0 ? hero + "|" + Entities.GetUnitName(hero) : "";
+          if (heroKey && heroKey !== lastHero) { lastHero = heroKey; $.Msg("DSL_HERO " + heroKey); }
+        } catch (e3) {}
+      }
+      // the persona switch (CLASSIC / persona): for a persona you do not own Dota's button
+      // is disabled: enable it and tell the launcher «toggle the hero's persona»
       if (inMenu) {
         try {
           var hpp = root.FindChildrenWithClassTraverse("DashboardPage");
@@ -684,7 +707,7 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
           }
         } catch (e12) { $.Msg("DSL_LOG persona error " + e12); }
       }
-      // свечения предметов: в матче на своём герое, в меню на моделях героев
+      // item glows: on your own hero in a match, on the hero models in the menu
       $.Msg("DSL_GTICK");
       DSLGlowTick(inMenu);
       var log = types.filter(function (t) { return t.indexOf("DOTA") !== 0; }).join(", ");
@@ -694,7 +717,7 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
     }
     $.Schedule(0.5, tick);
   }
-  // номер предмета (item def) из строки: свойство элемента DOTAEconItem
+  // the row's item definition index: a property of the DOTAEconItem element
   DSLItemDef = function (row) {
     var stack = [row], seen = [];
     while (stack.length) {
@@ -710,8 +733,8 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
     $.Msg("DSL_LOG no item def in row: " + seen.join(" "));
     return 0;
   };
-  // тексты строки: среди них название предмета или сета
-  // тексты строки (без нашей кнопки): среди них название предмета или сета
+  // the row's texts: the item's or set's name among them
+  // the row's texts (without our button): the item's or set's name among them
   DSLLabels = function (row) {
     var out = [], stack = [row];
     while (stack.length) {
@@ -723,7 +746,7 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
     return out;
   };
   DSLKey = function (row) { return row && row.IsValid() ? DSLLabels(row).join("|") : ""; };
-  // все наши кнопки внутри панели
+  // all our buttons inside the panel
   DSLButtons = function (root) {
     var out = [], stack = [root];
     while (stack.length) {
@@ -733,7 +756,7 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
     }
     return out;
   };
-  // строка предмета кнопки: предок, родитель которого содержит ItemInfoContainer
+  // the button's item row: the ancestor whose parent holds the ItemInfoContainer
   DSLRowOf = function (btn) {
     var row = btn.GetParent();
     for (var u = 0; u < 6 && row; u++) {
@@ -742,11 +765,11 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
     }
     return null;
   };
-  var picked = {};  // ключ строки -> выбрано
-  // «ВЫБРАТЬ» — тёмно-серая кнопка, как у Dota; «ВЫБРАНО» — надпись без фона
-  // как в карточке Dota (ui_econ_item_animated): «ВЫБРАТЬ» — кнопка ButtonPrimary DarkGrey
-  // во всю ширину внизу карточки; «ВЫБРАНО» — строка статуса (белый текст со свечением)
-  // «ВЫБРАНО» — в строке статуса (белый текст со свечением), кнопки при наведении нет
+  var picked = {};  // row key -> picked
+  // «SELECT» is a dark grey button, as Dota's; «SELECTED» is a label without a background
+  // as on Dota's card (ui_econ_item_animated): «SELECT» is a ButtonPrimary DarkGrey button
+  // across the card's bottom; «SELECTED» is the status line (white text with a glow)
+  // «SELECTED» is in the status line (white text with a glow), no button on hover
   DSLSetPicked = function (b, l, on) {
     if (!b) return;
     var state = on ? "on" : "off";
@@ -759,9 +782,9 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
     st.FindChild("DSLStatusDone").visible = on;
     if (on) { b.visible = false; st.style.opacity = "1"; }
   };
-  // предметы для пустых слотов, которые появятся после перезапуска Dota: у выбранной
-  // карточки вместо «ВЫБРАНО» — «ПОСЛЕ ПЕРЕЗАПУСКА». DLL зовёт это изнутри своего
-  // вызова: здесь только запоминаем, надписи меняет тик
+  // items for empty slots that show after a Dota restart: a picked card says
+  // «AFTER RESTART» instead of «SELECTED». The DLL calls this from inside its own
+  // call: only remember here, the tick changes the labels
   var restartNames = {}, restartVer = 0, pendingRestart = null;
   DSLSetRestart = function (list) { pendingRestart = list || []; };
   function doneText(it) {
@@ -771,7 +794,7 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
     }
     return false;
   }
-  // наведение на карточку (как .Container:hover у Dota): кнопка вместо строки статуса
+  // hover over a card (like Dota's .Container:hover): the button instead of the status line
   var hoverItems = [];
   function hoverTick() {
     var alive = [];
@@ -803,12 +826,12 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
       sd.text = later ? DSLTxt.restart : DSLTxt.selected;
       sd.style.fontSize = later ? "14px" : "18px";
     }
-    // частый тик для DLL (в меню): подгрузка замен и обновление модели без ожидания
-    if (lastMenu && root.IsValid() && root.GetAttributeString("dsl_loop", "") === me) $.Msg("DSL_TICK");
+    // a frequent tick for the DLL (in the menu): preloading and model refresh without waiting
+    if (lastMenu !== null && root.IsValid() && root.GetAttributeString("dsl_loop", "") === me) $.Msg("DSL_TICK");
     $.Schedule(0.05, hoverTick);
   }
   hoverTick();
-  // класс Owned ставится на карточку (DOTAEconItemAnimated или её Container): ищем у предков
+  // the Owned class is set on the card (DOTAEconItemAnimated or its Container): look among the ancestors
   DSLOwned = function (p) {
     for (var u = 0; p && u < 8; u++, p = p.GetParent()) {
       if (p.BHasClass("Owned")) return true;
@@ -816,13 +839,13 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
     }
     return false;
   };
-  // --- Свечения предметов в матче ---
-  // Эффекты, которые предмет создаёт сам (particle_create), а файлами их не подменить:
-  // создаём на своём герое с точками привязки из файла эффекта. Список даёт DLL.
-  var glowList = [], glowFx = {};  // ключ "сущность|эффект" -> индекс эффекта
-  // Эффект убираем через API, только пока его сущность жива: при загрузке карты
-  // («Опробовать») модели меню удаляются, и вызов на мёртвой сущности роняет игру.
-  // Эффекты удалённой сущности игра убирает сама — их просто забываем.
+  // --- Item glows in a match ---
+  // Effects an item creates by itself (particle_create), which no file swap can place:
+  // create them on your own hero with the attachments from the effect's file. The DLL gives the list.
+  var glowList = [], glowFx = {};  // key "entity|effect" -> effect index
+  // An effect is removed through the API only while its entity is alive: when a map loads
+  // («Try out»), the menu models are deleted, and a call on a dead entity crashes the game.
+  // The game removes a deleted entity's effects itself: they are just forgotten.
   function dropGlow(k) {
     var ent = parseInt(k, 10);
     if (Entities.IsValidEntity(ent)) {
@@ -834,8 +857,8 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
     for (var k in glowFx) dropGlow(k);
     glowFx = {};
   };
-  // DLL вызывает это изнутри другого вызова JS: здесь только запоминаем список,
-  // эффекты меняет обычный тик (иначе игра падает, если модель как раз перестраивается)
+  // The DLL calls this from inside another JS call: only remember the list here,
+  // the regular tick changes the effects (otherwise the game crashes if a model is being rebuilt)
   var pendingGlows = null;
   DSLSetGlows = function (list) {
     pendingGlows = list || [];
@@ -847,7 +870,7 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
       glowList = pendingGlows;
       pendingGlows = null;
       $.Msg("DSL_LOG glows: " + glowList.length);
-      return;  // новые эффекты — на следующем тике
+      return;  // new effects on the next tick
     }
     var alive = {};
     if (glowList.length) {
@@ -855,7 +878,7 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
       for (var g0 = 0; g0 < glowList.length; g0++) wanted[glowList[g0].npc] = true;
       var targets = [];
       if (inMenu) {
-        // модели героев на страницах меню: клиентские сущности с именем героя
+        // hero models on the menu pages: client entities with the hero's name
         var ents = Entities.GetAllEntities();
         for (var i = 0; i < ents.length; i++) {
           if (!Entities.IsValidEntity(ents[i])) continue;
@@ -864,7 +887,7 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
           if (nm && wanted[nm]) targets.push([ents[i], nm]);
         }
       } else {
-        // в матче только свой герой: на чужих эффект мог бы выдать невидимого
+        // in a match only your own hero: on others an effect could give away an invisible one
         var hero = Players.GetPlayerHeroEntityIndex(Players.GetLocalPlayer());
         if (hero > 0 && Entities.IsValidEntity(hero)) targets.push([hero, Entities.GetUnitName(hero)]);
       }
@@ -893,16 +916,16 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
   };
   $.Msg("DSL_LOOP");
   $.Msg("DSL_LOG loop started in " + ctx.id);
-  // вызывается из DLL, когда замены загружены: перестроить модель героя
+  // called by the DLL when the replacements are loaded: rebuild the hero model
   DSLRefresh = function () {
     var pages = root.FindChildrenWithClassTraverse("DashboardPage");
     for (var i = 0; i < pages.length; i++) {
       var hp = pages[i];
       if (hp.paneltype !== "DOTAHeroPageNewV2" || !hp.visible) continue;
-      // то же событие, что Dota шлёт после «Надеть»: модель перестраивается без перезагрузки страницы
-      // примерка держит свою модель поверх набора: сначала снимаем её («ОТМЕНА»,
-      // DOTASetPreviewRevert). Снимаем и когда кнопка скрыта: после выхода из
-      // гардероба примерка остаётся, а панель с кнопкой не видна
+      // the same event Dota sends after «Equip»: the model is rebuilt without reloading the page
+      // a try-on keeps its model over the loadout: revert it first («REVERT»,
+      // DOTASetPreviewRevert). Also when the button is hidden: after leaving the
+      // wardrobe the try-on stays while the panel with the button is not shown
       var revert = hp.FindChildTraverse("RevertButton");
       var controls = hp.FindChildTraverse("SetPreviewControls");
       var shown = !!(revert && revert.visible);
@@ -916,8 +939,8 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
       }
       if (tryOn) $.DispatchEvent("Activated", revert, "mouse");
       $.Schedule(tryOn ? 0.15 : 0, function () { $.DispatchEvent("DOTALoadoutChanged"); });
-      // «ОТМЕНА» перестраивает модель асинхронно и может перекрыть первое обновление: повторяем;
-      // после примерки сета Dota возвращает прежнюю модель из кэша позже — ещё раз через 2 с
+      // «REVERT» rebuilds the model asynchronously and may override the first refresh: repeat;
+      // after a set try-on Dota brings back the old model from its cache later: once more after 2 s
       $.Schedule(0.8, function () { $.DispatchEvent("DOTALoadoutChanged"); });
       if (tryOn) $.Schedule(2.0, function () { $.DispatchEvent("DOTALoadoutChanged"); });
       $.Msg("DSL_LOG refresh: loadout changed (revert " + (revert ? (shown ? "shown" : "hidden") : "none") + ", controls " + (controls ? (controls.visible ? "shown" : "hidden") : "none") + ")");
@@ -928,7 +951,7 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
 })();
 )JS";
 
-// payload: "<def>|<label>\t<label>..." — номер предмета и подписи строки
+// payload: "<def>|<label>\t<label>...": the item index and the row's texts
 static void RecordPick(const char* payload) {
     uint32_t def = payload ? (uint32_t)strtoul(payload, nullptr, 10) : 0;
     std::string labels;
@@ -945,11 +968,11 @@ static void RecordPick(const char* payload) {
 }
 
 static void* g_uiEngine = nullptr;
-static void* g_injectPanel = nullptr;  // панель текущего внедрения скрипта
-static void* g_loopPanel = nullptr;    // контекст живого цикла скрипта
+static void* g_injectPanel = nullptr;  // panel of the current script injection
+static void* g_loopPanel = nullptr;    // context of the script's live loop
 
-// Поток интерфейса, из тика скрипта: замены загружены — просим скрипт перерисовать модель
-// Поток интерфейса, из тика скрипта в матче: новая таблица свечений -> DSLSetGlows
+// Interface thread, from the script tick: replacements loaded, ask the script to redraw the model
+// Interface thread, from the script tick: a new glow table -> DSLSetGlows
 static LONG g_glowsSent = -1;
 static void MaybeSendGlows() {
     LONG v = g_glowsVersion;
@@ -974,7 +997,7 @@ static void MaybeRefreshPreview() {
         lastSubs = subs;
         lastLog = GetTickCount64();
     }
-    // 1 — конфиг сменился; 2 — модель уже перестроена, ждём эффекты
+    // 1: the config changed; 2: the model is rebuilt already, waiting for the effects
     static bool modelsRefreshed = false;
     if (!g_refreshPending || !g_uiEngine || !g_loopPanel || !g_OrigRunScript) return;
     if (InterlockedCompareExchange(&g_refreshPending, 1, 1) == 1 && modelsRefreshed) modelsRefreshed = false;
@@ -1010,7 +1033,7 @@ static void HookedRunScript(void* engine, void* panel, const char* script, const
     t_inOurScript = true;
     g_uiEngine = engine;
     g_injectPanel = panel;
-    // тексты кнопок на выбранном языке — перед основным скриптом
+    // button texts in the chosen language, before the main script
     std::string lang;
     { AcquireSRWLockShared(&g_rulesLock); lang = g_lang; ReleaseSRWLockShared(&g_rulesLock); }
     const char* texts = (lang == "en")
@@ -1027,7 +1050,7 @@ static const uint8_t kRunScriptProlog[] = {
     0x4C, 0x89, 0x4C, 0x24, 0x20, 0x4C, 0x89, 0x44, 0x24, 0x18,
     0x48, 0x89, 0x54, 0x24, 0x10, 0x55, 0x53, 0x56, 0x57
 };
-static const size_t kRunScriptStolen = sizeof(kRunScriptProlog);  // 19 байт, без RIP-relative
+static const size_t kRunScriptStolen = sizeof(kRunScriptProlog);  // 19 bytes, no RIP-relative
 
 static uint8_t* FindRunScript(HMODULE mod) {
     static const char kName[] = "CUIEngine::RunScript (compile+run)";
@@ -1039,7 +1062,7 @@ static uint8_t* FindRunScript(HMODULE mod) {
     for (size_t i = 0; i + sizeof(kName) <= size; i++)
         if (memcmp(base + i, kName, sizeof(kName)) == 0) { str = base + i; break; }
     if (!str) return nullptr;
-    // lea rcx,[rip+disp32] -> строка; затем назад до пролога (функция ~0x70 байт до lea)
+    // lea rcx,[rip+disp32] -> the string; then back to the prologue (the function is ~0x70 bytes before the lea)
     for (size_t i = 0; i + 7 <= size; i++) {
         uint8_t* p = base + i;
         if (p[0] != 0x48 || p[1] != 0x8D || p[2] != 0x0D) continue;
@@ -1053,8 +1076,502 @@ static uint8_t* FindRunScript(HMODULE mod) {
     return nullptr;
 }
 
-// $.Msg из скрипта уходит в tier0 (Msg / LoggingSystem_Log*): перехватываем импорт
-// panorama.dll и ловим строки DSL_PICK / DSL_LOG.
+// $.Msg from a script goes to tier0 (Msg / LoggingSystem_Log*): hook panorama.dll's
+// imports and catch the DSL_* lines.
+// --- Taunts (client-side) ---
+// A taunt item is an activity modifier (ACT_DOTA_TAUNT + "loser") the game server
+// plays on your hero when your inventory has the taunt. Here Dota's taunt key plays the preset's
+// taunt on your own hero in this client only (nobody else sees it), the way the
+// game plays a gesture from the server:
+//  1. the taunt's modifier becomes the game's symbol (CUtlSymbolTable::AddString) and
+//     joins the hero's own activity modifiers, so the game's sequence choice
+//     (NPC vtable "select sequence") gives the taunt's own animation;
+//  2. CDOTAAnimState::AddGesture puts it into a gesture slot;
+//  3. gesture layers (CAnimationLayer) are networked: every frame the client takes
+//     them from the server, which knows nothing of the taunt, so the layer would be
+//     emptied at once. CDOTAAnimState::UpdateGestures (every frame, every gesture
+//     slot) is hooked: before and after it the taunt is written back into its slot,
+//     its cycle counted from the start, until the animation ends.
+// Every address is found at run time from strings and code shapes in client.dll,
+// so it survives game updates as long as that code keeps its shape.
+using StartGestureFn = void (*)(void* entity, void* args);
+using LookupActivityFn = int (*)(void* entity, const char* name);
+using AddGestureFn = void (*)(void* state, int slot, int activity, bool flag, int sequence, float fadeIn, float fadeOut, float rate);
+using SelectSeqFn = int* (*)(void* npc, int* out, int activity, const uint16_t* mods, int count);
+using AddSymbolFn = uint16_t* (*)(void* table, uint16_t* out, const char* name, bool* created);
+using UpdateGesturesFn = int (*)(void* state, void* arg);
+
+static bool g_tauntResolved = false;
+static void** g_entityList = nullptr;           // global holding the entity chunk array
+static LookupActivityFn g_LookupActivity = nullptr;
+static AddGestureFn g_AddGesture = nullptr;
+static uint32_t g_animStateOffset = 0;          // C_DOTA_BaseNPC -> CDOTAAnimState*
+static uint32_t g_selectSlot = 0;               // NPC vtable offset of the sequence choice
+static uint32_t g_modsCount = 0, g_modsData = 0; // NPC's activity modifiers (CUtlVector<CUtlSymbol>)
+static AddSymbolFn g_AddSymbol = nullptr;
+static void* g_modSymbols = nullptr;            // the activity modifier CUtlSymbolTable
+static UpdateGesturesFn g_OrigUpdateGestures = nullptr;
+static bool g_updateHooked = false;
+static int g_heroIndex = -1;
+static std::string g_heroUnit;
+
+static const int kTauntSlot = 2;                // the gesture slot the game uses for gestures
+// the taunt playing now (read by the per-frame hook)
+static void* volatile g_tauntState = nullptr;   // the hero's anim state while a taunt plays
+static uint8_t* g_tauntLayer = nullptr;
+static uint8_t g_tauntSnap[0x70];               // layer bytes +0x30..+0xA0 right after the start
+static int g_tauntSeq = -1;
+static ULONGLONG g_tauntStart = 0;
+static float g_tauntCycleRate = 0.0f;          // cycles per second (m_flCachedSequenceCycleRate)
+static float g_tauntPrevCycle = 0.0f;
+static volatile LONG g_tauntRestores = 0;
+// the taunt's modifier in the hero's own modifiers while it plays
+static void* g_addedModEnt = nullptr;
+static uint16_t g_addedMod = 0xFFFF;
+
+// CAnimationLayer fields (from the schema): m_op (+0x30) holds m_hSequence +0x38,
+// m_flPrevCycle +0x3c, m_flCycle +0x40, m_flWeight +0x44; m_nOrder +0x58,
+// m_flCachedSequenceCycleRate +0x70, m_bSequenceFinished +0x78.
+static void ApplyTaunt(void* state) {
+    if (!g_tauntState || state != g_tauntState || !g_tauntLayer) return;
+    double elapsed = (GetTickCount64() - g_tauntStart) / 1000.0;
+    float cycle = (float)(elapsed * g_tauntCycleRate);
+    if (cycle >= 1.0f || elapsed > 20.0) {
+        g_tauntState = nullptr;
+        return;
+    }
+    uint8_t* l = g_tauntLayer;
+    if (*(int*)(l + 0x38) != g_tauntSeq || *(int*)(l + 0x58) != *(int*)(g_tauntSnap + 0x28)) {
+        memcpy(l + 0x30, g_tauntSnap, sizeof(g_tauntSnap));
+        InterlockedIncrement(&g_tauntRestores);
+    }
+    *(float*)(l + 0x3c) = g_tauntPrevCycle;
+    *(float*)(l + 0x40) = cycle;
+    *(float*)(l + 0x44) = 1.0f;
+    *(uint8_t*)(l + 0x78) = 0;
+    g_tauntPrevCycle = cycle;
+}
+
+static int HookedUpdateGestures(void* state, void* arg) {
+    ApplyTaunt(state);
+    int r = g_OrigUpdateGestures(state, arg);
+    ApplyTaunt(state);
+    return r;
+}
+
+static void RemoveAddedModifier() {
+    if (!g_addedModEnt) return;
+    int* count = (int*)((uint8_t*)g_addedModEnt + g_modsCount);
+    uint16_t* data = *(uint16_t**)((uint8_t*)g_addedModEnt + g_modsData);
+    if (data && *count > 0 && data[*count - 1] == g_addedMod) (*count)--;
+    g_addedModEnt = nullptr;
+    g_addedMod = 0xFFFF;
+}
+
+struct Section { uint8_t* start; size_t size; };
+
+static bool ModuleSection(HMODULE mod, const char* name, Section& out) {
+    uint8_t* base = (uint8_t*)mod;
+    auto dos = (IMAGE_DOS_HEADER*)base;
+    auto nt = (IMAGE_NT_HEADERS64*)(base + dos->e_lfanew);
+    auto sec = IMAGE_FIRST_SECTION(nt);
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++) {
+        if (strncmp((const char*)sec->Name, name, 8) == 0) {
+            out.start = base + sec->VirtualAddress;
+            out.size = sec->Misc.VirtualSize;
+            return true;
+        }
+    }
+    return false;
+}
+
+// A string in .rdata (a whole one, or one starting with `s` when `prefix`).
+static uint8_t* FindString(const Section& rdata, const char* s, bool prefix = false) {
+    size_t n = strlen(s) + (prefix ? 0 : 1);
+    for (size_t i = 1; i + n <= rdata.size; i++)
+        if (rdata.start[i - 1] == 0 && memcmp(rdata.start + i, s, n) == 0) return rdata.start + i;
+    return nullptr;
+}
+
+// The first lea/mov reg,[rip+X] in .text with X == target.
+static uint8_t* FindRipRef(const Section& text, const uint8_t* target) {
+    if (!target) return nullptr;
+    for (size_t i = 0; i + 7 <= text.size; i++) {
+        uint8_t* p = text.start + i;
+        if ((p[0] == 0x48 || p[0] == 0x4C) && (p[1] == 0x8D || p[1] == 0x8B) && (p[2] & 0xC7) == 0x05 &&
+            p + 7 + *(int32_t*)(p + 3) == target)
+            return p;
+    }
+    return nullptr;
+}
+
+// The first call rel32 to `target`.
+static uint8_t* FindCallTo(const Section& text, const uint8_t* target) {
+    if (!target) return nullptr;
+    for (size_t i = 0; i + 5 <= text.size; i++) {
+        uint8_t* p = text.start + i;
+        if (p[0] == 0xE8 && p + 5 + *(int32_t*)(p + 1) == target) return p;
+    }
+    return nullptr;
+}
+
+// The start of the function holding `p` (back to its int3 padding).
+static uint8_t* FunctionStart(uint8_t* p, size_t limit = 0x1000) {
+    for (uint8_t* q = p; p && q > p - limit; q--)
+        if (q[-1] == 0xCC && q[-2] == 0xCC && q[0] != 0xCC) return q;
+    return nullptr;
+}
+
+// The target of the call that ends `pattern`, within `len` bytes from `from`.
+static uint8_t* CallAfter(uint8_t* from, size_t len, const uint8_t* pattern, size_t n) {
+    for (uint8_t* p = from; from && p < from + len; p++)
+        if (memcmp(p, pattern, n) == 0) return p + n + 4 + *(int32_t*)(p + n);
+    return nullptr;
+}
+
+static void ResolveTaunts() {
+    g_tauntResolved = true;
+    HMODULE cl = GetModuleHandleA("client.dll");
+    Section text{}, rdata{};
+    if (!cl || !ModuleSection(cl, ".text", text) || !ModuleSection(cl, ".rdata", rdata)) {
+        Log("[-] Taunts: client.dll sections not found");
+        return;
+    }
+    // The scene script binding StartGestureOverride: its impl looks activities up by
+    // name (LookupActivity), and the binding reads the entity list at its start.
+    uint8_t* bind = FindRipRef(text, FindString(rdata, "C_PortraitWorldUnit_API::StartGestureOverride"));
+    static const uint8_t kImpl[] = {0x48, 0x8D, 0x54, 0x24, 0x20, 0x48, 0x8B, 0xCE, 0x48, 0x89, 0x44, 0x24, 0x28, 0xE8};
+    uint8_t* impl = CallAfter(bind, 0xC0, kImpl, sizeof(kImpl));
+    static const uint8_t kLookup[] = {0x48, 0x0F, 0x45, 0xD1, 0x48, 0x8B, 0xCF, 0xE8};
+    g_LookupActivity = (LookupActivityFn)CallAfter(impl, 0x200, kLookup, sizeof(kLookup));
+    for (uint8_t* p = bind; bind && p > bind - 0x200; p--) {
+        if (p[0] == 0x4C && p[1] == 0x8B && p[2] == 0x15) { g_entityList = (void**)(p + 7 + *(int32_t*)(p + 3)); break; }
+    }
+    // CDOTAAnimState::AddToGestureSlot (assert string) -> its caller AddGesture; it
+    // also calls the sequence choice with the NPC's modifiers.
+    uint8_t* slotRef = FindRipRef(text, FindString(rdata, "CDOTAAnimState::AddToGestureSlot"));
+    uint8_t* slotFn = nullptr;
+    for (uint8_t* q = slotRef; slotRef && q > slotRef - 0x100; q--) {
+        if (q[0] == 0x44 && q[1] == 0x88 && q[2] == 0x4C && q[3] == 0x24 && q[4] == 0x20) { slotFn = q; break; }
+    }
+    uint8_t* addCall = FindCallTo(text, slotFn);
+    for (uint8_t* q = addCall; addCall && q > addCall - 0x600; q--) {
+        if (q[0] == 0x44 && q[1] == 0x88 && q[2] == 0x4C && q[3] == 0x24 && q[4] == 0x20 && q[-1] == 0xCC) {
+            g_AddGesture = (AddGestureFn)q;
+            break;
+        }
+    }
+    static const uint8_t kSel[] = {0x48, 0x8D, 0x94, 0x24, 0xA8, 0x00, 0x00, 0x00, 0x48, 0x8B, 0xCE, 0xE8};
+    uint8_t* sel = CallAfter(slotFn, 0x200, kSel, sizeof(kSel));
+    for (uint8_t* q = sel; sel && q < sel + 0x40; q++) {
+        if (q[0] == 0x8B && q[1] == 0x81) g_modsCount = *(uint32_t*)(q + 2);
+        if (q[0] == 0x4C && q[1] == 0x8B && q[2] == 0x89) g_modsData = *(uint32_t*)(q + 3);
+        if (q[0] == 0x41 && q[1] == 0xFF && q[2] == 0x92) { g_selectSlot = *(uint32_t*)(q + 3); break; }
+    }
+    // the anim state's offset in the NPC: mov rcx,[rcx+X] right before calls to AddGesture
+    for (size_t i = 0, votes = 0; g_AddGesture && i + 5 <= text.size && votes < 3; i++) {
+        uint8_t* p = text.start + i;
+        if (p[0] != 0xE8 || p + 5 + *(int32_t*)(p + 1) != (uint8_t*)g_AddGesture) continue;
+        for (uint8_t* q = p - 7; q > p - 0x40; q--) {
+            if (q[0] == 0x48 && q[1] == 0x8B && (q[2] == 0x89 || q[2] == 0x88)) {
+                uint32_t off = *(uint32_t*)(q + 3);
+                if (off > 0x100 && off < 0x10000) {
+                    if (!g_animStateOffset || g_animStateOffset == off) { g_animStateOffset = off; votes++; }
+                    break;
+                }
+            }
+        }
+    }
+    // the modifier symbol table: lea rcx,<table> right before a call to tier0's AddString
+    if (HMODULE t0 = GetModuleHandleA("tier0.dll"))
+        g_AddSymbol = (AddSymbolFn)GetProcAddress(t0, "?AddString@CUtlSymbolTable@@QEAA?AVCUtlSymbol@@PEBDPEA_N@Z");
+    static const uint8_t kTab[] = {0x45, 0x33, 0xC9, 0x48, 0x8D, 0x54, 0x24, 0x24, 0x4C, 0x8B, 0xC6, 0x48, 0x8D, 0x0D};
+    for (size_t i = 0; g_AddSymbol && i + sizeof(kTab) + 10 <= text.size; i++) {
+        uint8_t* p = text.start + i;
+        if (memcmp(p, kTab, sizeof(kTab)) != 0 || p[sizeof(kTab) + 4] != 0xFF || p[sizeof(kTab) + 5] != 0x15) continue;
+        uint8_t* next = p + sizeof(kTab) + 4;
+        if (*(void**)(next + 6 + *(int32_t*)(next + 2)) == (void*)g_AddSymbol) {
+            g_modSymbols = next + *(int32_t*)(p + sizeof(kTab));
+            break;
+        }
+    }
+    // UpdateGestureLayer (log string) -> its only caller, UpdateGestures: hooked
+    uint8_t* layerFn = FunctionStart(FindRipRef(text, FindString(rdata, "CDOTAAnimState::UpdateGestureLayer layer %d", true)));
+    uint8_t* gestures = FunctionStart(FindCallTo(text, layerFn));
+    // mov rax,rsp; mov [rax+10h],rdx; push rsi; sub rsp,70h; mov [rax+18h],rbx (16 bytes, no RIP-relative)
+    static const uint8_t kProlog[] = {0x48, 0x8B, 0xC4, 0x48, 0x89, 0x50, 0x10, 0x56,
+                                      0x48, 0x83, 0xEC, 0x70, 0x48, 0x89, 0x58, 0x18};
+    if (gestures && memcmp(gestures, kProlog, sizeof(kProlog)) == 0 &&
+        InstallHook(gestures, sizeof(kProlog), (void*)&HookedUpdateGestures, (void**)&g_OrigUpdateGestures))
+        g_updateHooked = true;
+
+    bool ok = g_entityList && g_LookupActivity && g_AddGesture && g_animStateOffset && g_selectSlot &&
+              g_modsCount && g_modsData && g_AddSymbol && g_modSymbols && g_updateHooked;
+    Log("[%c] Taunts: entity list %p, LookupActivity %p, AddGesture %p, anim state +0x%X, select +0x%X, "
+        "modifiers +0x%X/+0x%X, symbols %p, UpdateGestures %s",
+        ok ? '+' : '-', (void*)g_entityList, (void*)g_LookupActivity, (void*)g_AddGesture, g_animStateOffset,
+        g_selectSlot, g_modsCount, g_modsData, g_modSymbols, g_updateHooked ? "hooked" : "NOT hooked");
+}
+
+// Entity by index: chunks of 512 entries of 0x70 bytes, entry+0 = entity, entry+0x10 = handle.
+static void* EntityByIndex(int index) {
+    if (!g_entityList || index < 0) return nullptr;
+    uint8_t** chunks = (uint8_t**)*g_entityList;
+    if (!chunks) return nullptr;
+    int c = index >> 9;
+    if (c > 0x3f || !chunks[c]) return nullptr;
+    uint8_t* e = chunks[c] + (index & 0x1ff) * 0x70;
+    if ((*(uint32_t*)(e + 0x10) & 0x7fff) != (uint32_t)index) return nullptr;
+    return *(void**)e;
+}
+
+// "index|unit name" from the interface script
+static void SetLocalHero(const char* v) {
+    g_heroIndex = atoi(v);
+    const char* bar = strchr(v, '|');
+    g_heroUnit = bar ? std::string(bar + 1) : std::string();
+    while (!g_heroUnit.empty() && (g_heroUnit.back() == '\n' || g_heroUnit.back() == '\r' || g_heroUnit.back() == ' '))
+        g_heroUnit.pop_back();
+}
+
+static void StartTaunt() {
+    std::string cfg;
+    AcquireSRWLockShared(&g_tauntLock);
+    auto it = g_taunts.find(g_heroUnit);
+    if (it != g_taunts.end()) cfg = it->second;
+    ReleaseSRWLockShared(&g_tauntLock);
+    if (cfg.empty()) { Log("[*] Taunt: no taunt in the preset for %s", g_heroUnit.c_str()); return; }
+    // "name#index;name#index@modifier@ACTIVITY" (the activity defaults to ACT_DOTA_TAUNT)
+    std::string seqs = cfg, modifier, activityName = "ACT_DOTA_TAUNT";
+    size_t at = cfg.find('@');
+    if (at != std::string::npos) {
+        seqs = cfg.substr(0, at);
+        modifier = cfg.substr(at + 1);
+        size_t at2 = modifier.find('@');
+        if (at2 != std::string::npos) {
+            activityName = modifier.substr(at2 + 1);
+            modifier = modifier.substr(0, at2);
+        }
+    }
+    size_t hash = seqs.find('#');
+    int fallback = hash == std::string::npos ? -1 : atoi(seqs.c_str() + hash + 1);
+
+    void* ent = EntityByIndex(g_heroIndex);
+    if (!ent) { Log("[-] Taunt: hero entity %d not found", g_heroIndex); return; }
+    void* state = *(void**)((uint8_t*)ent + g_animStateOffset);
+    if (!state) return;
+    int activity = g_LookupActivity(ent, activityName.c_str());
+    if (activity < 0) { Log("[-] Taunt: %s has no %s", g_heroUnit.c_str(), activityName.c_str()); return; }
+
+    // the taunt's modifier joins the hero's own: the game then chooses the taunt's sequence
+    uint16_t sym = 0xFFFF;
+    if (!modifier.empty()) g_AddSymbol(g_modSymbols, &sym, modifier.c_str(), nullptr);
+    int* cnt = (int*)((uint8_t*)ent + g_modsCount);
+    uint16_t* data = *(uint16_t**)((uint8_t*)ent + g_modsData);
+    int alloc = *(int*)((uint8_t*)ent + g_modsData + 8);
+    uint32_t flags = *(uint32_t*)((uint8_t*)ent + g_modsData + 12);
+    std::vector<uint16_t> mods;
+    for (int k = 0; data && k < *cnt && k < 32; k++) mods.push_back(data[k]);
+    if (sym != 0xFFFF) mods.push_back(sym);
+    auto select = (SelectSeqFn)(*(void***)ent)[g_selectSlot / 8];
+    int seq = -1;
+    select(ent, &seq, activity, mods.empty() ? nullptr : mods.data(), (int)mods.size());
+    if (seq < 0) seq = fallback;
+    if (seq < 0) { Log("[-] Taunt: no sequence for %s/%s on %s", activityName.c_str(), modifier.c_str(), g_heroUnit.c_str()); return; }
+    if (sym != 0xFFFF && data && *cnt < alloc && !(flags & 0x40000000)) {
+        data[*cnt] = sym;
+        (*cnt)++;
+        g_addedModEnt = ent;
+        g_addedMod = sym;
+    }
+
+    uint8_t* layers = *(uint8_t**)((uint8_t*)state + 8);
+    uint8_t* layer = layers ? *(uint8_t**)(layers + kTauntSlot * 0x18 + 8) : nullptr;
+    g_AddGesture(state, kTauntSlot, activity, true, seq, 0.0f, 0.1f, 1.0f);
+    if (!layer || *(int*)(layer + 0x38) != seq) { Log("[-] Taunt: the game did not take sequence %d", seq); return; }
+    memcpy(g_tauntSnap, layer + 0x30, sizeof(g_tauntSnap));
+    g_tauntLayer = layer;
+    g_tauntSeq = seq;
+    g_tauntCycleRate = *(float*)(layer + 0x70);
+    if (!(g_tauntCycleRate > 0.01f && g_tauntCycleRate < 10.0f)) g_tauntCycleRate = 0.25f;
+    g_tauntPrevCycle = 0.0f;
+    g_tauntStart = GetTickCount64();
+    g_tauntRestores = 0;
+    g_tauntState = state;
+    Log("[*] Taunt: %s on %s (%s %s, sequence %d, %.1f s)", seqs.c_str(), g_heroUnit.c_str(), activityName.c_str(),
+        modifier.c_str(), seq, 1.0f / g_tauntCycleRate);
+}
+
+// --- The taunt key: Dota's own "HeroTaunt" binding ---
+// Steam\userdata\<account>\570\remote\cfg\dotakeys_personal.lst, block
+// "HeroTaunt" { "Key" "N" "Modifier" "ALT" }; the account is Steam's active user
+// (else the newest such file). Re-read when the file changes, so a key changed in
+// Dota's settings is picked up in the running game. No usable binding: F8.
+static int g_tauntVk = VK_F8;
+static int g_tauntMods = 0;  // 1 shift, 2 ctrl, 4 alt
+static std::string g_keysFile;
+static FILETIME g_keysTime{};
+static ULONGLONG g_keysChecked = 0;
+
+static int VkFromDotaKey(std::string k) {
+    if (k.empty()) return 0;
+    if (k.size() == 1) {
+        char c = k[0];
+        if (c >= 'a' && c <= 'z') return c - 'a' + 'A';
+        if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) return c;
+        switch (c) {
+            case '`': return VK_OEM_3;
+            case '-': return VK_OEM_MINUS;
+            case '=': return VK_OEM_PLUS;
+            case '[': return VK_OEM_4;
+            case ']': return VK_OEM_6;
+            case '\\': return VK_OEM_5;
+            case ';': return VK_OEM_1;
+            case '\'': return VK_OEM_7;
+            case ',': return VK_OEM_COMMA;
+            case '.': return VK_OEM_PERIOD;
+            case '/': return VK_OEM_2;
+        }
+        return 0;
+    }
+    for (auto& ch : k) ch = (char)toupper((unsigned char)ch);
+    if (k[0] == 'F' && k.size() <= 3 && isdigit((unsigned char)k[1])) {
+        int n = atoi(k.c_str() + 1);
+        if (n >= 1 && n <= 24) return VK_F1 + n - 1;
+    }
+    if (k.compare(0, 3, "KP_") == 0 && k.size() == 4 && isdigit((unsigned char)k[3])) return VK_NUMPAD0 + (k[3] - '0');
+    static const struct { const char* name; int vk; } kNames[] = {
+        {"SPACE", VK_SPACE}, {"TAB", VK_TAB}, {"ENTER", VK_RETURN}, {"ESCAPE", VK_ESCAPE},
+        {"BACKSPACE", VK_BACK}, {"CAPSLOCK", VK_CAPITAL}, {"INS", VK_INSERT}, {"DEL", VK_DELETE},
+        {"HOME", VK_HOME}, {"END", VK_END}, {"PGUP", VK_PRIOR}, {"PGDN", VK_NEXT},
+        {"UPARROW", VK_UP}, {"DOWNARROW", VK_DOWN}, {"LEFTARROW", VK_LEFT}, {"RIGHTARROW", VK_RIGHT},
+        {"MOUSE1", VK_LBUTTON}, {"MOUSE2", VK_RBUTTON}, {"MOUSE3", VK_MBUTTON},
+        {"MOUSE4", VK_XBUTTON1}, {"MOUSE5", VK_XBUTTON2},
+        {"KP_ENTER", VK_RETURN}, {"KP_PLUS", VK_ADD}, {"KP_MINUS", VK_SUBTRACT},
+        {"KP_MULTIPLY", VK_MULTIPLY}, {"KP_SLASH", VK_DIVIDE}, {"KP_DEL", VK_DECIMAL},
+        {"SHIFT", VK_SHIFT}, {"CTRL", VK_CONTROL}, {"ALT", VK_MENU},
+        {"SEMICOLON", VK_OEM_1}, {"APOSTROPHE", VK_OEM_7}, {"COMMA", VK_OEM_COMMA},
+        {"PERIOD", VK_OEM_PERIOD}, {"SLASH", VK_OEM_2}, {"BACKSLASH", VK_OEM_5},
+        {"MINUS", VK_OEM_MINUS}, {"EQUALS", VK_OEM_PLUS}, {"LBRACKET", VK_OEM_4}, {"RBRACKET", VK_OEM_6},
+    };
+    for (auto& n : kNames)
+        if (k == n.name) return n.vk;
+    return 0;  // MWHEELUP/MWHEELDOWN and the like: not a key state
+}
+
+static std::string ReadRegString(HKEY root, const char* path, const char* name) {
+    char buf[MAX_PATH] = {};
+    DWORD size = sizeof(buf);
+    if (RegGetValueA(root, path, name, RRF_RT_REG_SZ, nullptr, buf, &size) != ERROR_SUCCESS) return std::string();
+    return buf;
+}
+
+static std::string FindKeysFile() {
+    std::string steam = ReadRegString(HKEY_CURRENT_USER, "Software\\Valve\\Steam", "SteamPath");
+    if (steam.empty()) return std::string();
+    DWORD user = 0, size = sizeof(user);
+    RegGetValueA(HKEY_CURRENT_USER, "Software\\Valve\\Steam\\ActiveProcess", "ActiveUser", RRF_RT_REG_DWORD, nullptr, &user, &size);
+    const char* tail = "\\570\\remote\\cfg\\dotakeys_personal.lst";
+    if (user) {
+        std::string f = steam + "\\userdata\\" + std::to_string(user) + tail;
+        if (GetFileAttributesA(f.c_str()) != INVALID_FILE_ATTRIBUTES) return f;
+    }
+    // no active user: the newest bindings of any account
+    std::string best;
+    FILETIME bestTime{};
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA((steam + "\\userdata\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return std::string();
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == '.') continue;
+        std::string f = steam + "\\userdata\\" + fd.cFileName + tail;
+        FILETIME t;
+        if (FileTime(f, t) && CompareFileTime(&t, &bestTime) > 0) { bestTime = t; best = f; }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    return best;
+}
+
+// The value of "name" inside the block text.
+static std::string KvValue(const std::string& block, const char* name) {
+    std::string key = std::string("\"") + name + "\"";
+    size_t at = block.find(key);
+    if (at == std::string::npos) return std::string();
+    size_t q1 = block.find('"', at + key.size());
+    size_t q2 = q1 == std::string::npos ? q1 : block.find('"', q1 + 1);
+    return q2 == std::string::npos ? std::string() : block.substr(q1 + 1, q2 - q1 - 1);
+}
+
+static void RefreshTauntKey() {
+    ULONGLONG now = GetTickCount64();
+    if (g_keysChecked && now - g_keysChecked < 3000) return;
+    g_keysChecked = now;
+    if (g_keysFile.empty()) g_keysFile = FindKeysFile();
+    FILETIME t;
+    if (g_keysFile.empty() || !FileTime(g_keysFile, t) || CompareFileTime(&t, &g_keysTime) == 0) return;
+    g_keysTime = t;
+    std::ifstream f(g_keysFile, std::ios::binary);
+    std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    int vk = VK_F8, mods = 0;
+    std::string keyName = "F8 (no binding)";
+    size_t at = text.find("\"HeroTaunt\"");
+    size_t open = at == std::string::npos ? at : text.find('{', at);
+    size_t close = open == std::string::npos ? open : text.find('}', open);
+    if (close != std::string::npos) {
+        std::string block = text.substr(open, close - open);
+        std::string key = KvValue(block, "Key"), mod = KvValue(block, "Modifier");
+        for (auto& ch : mod) ch = (char)toupper((unsigned char)ch);
+        if (int v = VkFromDotaKey(key)) {
+            vk = v;
+            keyName = key;
+            if (mod.find("SHIFT") != std::string::npos) mods |= 1;
+            if (mod.find("CTRL") != std::string::npos) mods |= 2;
+            if (mod.find("ALT") != std::string::npos) mods |= 4;
+            if (mods) keyName = mod + "+" + key;
+        } else if (!key.empty()) {
+            keyName = "F8 (\"" + key + "\" is not a key)";
+        }
+    }
+    g_tauntVk = vk;
+    g_tauntMods = mods;
+    Log("[*] Taunt key: %s (from %s)", keyName.c_str(), g_keysFile.c_str());
+}
+
+static bool TauntKeyDown() {
+    auto held = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
+    if (!held(g_tauntVk)) return false;
+    if ((g_tauntMods & 1) && !held(VK_SHIFT)) return false;
+    if ((g_tauntMods & 2) && !held(VK_CONTROL)) return false;
+    if ((g_tauntMods & 4) && !held(VK_MENU)) return false;
+    return true;
+}
+
+// Interface thread, every tick in a match: Dota's taunt key (while Dota is the
+// active window) plays the hero's taunt; the modifier comes out again when it is over.
+static void MaybeTaunt() {
+    if (!g_tauntState && g_addedModEnt) {
+        RemoveAddedModifier();
+        Log("[*] Taunt: finished (layer put back %ld times)", g_tauntRestores);
+    }
+    RefreshTauntKey();
+    static bool wasDown = false;
+    bool down = TauntKeyDown();
+    bool pressed = down && !wasDown;
+    wasDown = down;
+    if (!pressed) return;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+    if (pid != GetCurrentProcessId()) return;
+    if (!g_tauntResolved) ResolveTaunts();
+    if (!g_updateHooked || !g_entityList || !g_LookupActivity || !g_AddGesture || !g_animStateOffset ||
+        !g_selectSlot || !g_modsCount || !g_modsData || !g_AddSymbol || !g_modSymbols)
+        return;
+    // a taunt playing already: from the start again
+    g_tauntState = nullptr;
+    RemoveAddedModifier();
+    StartTaunt();
+}
+
 static bool CheckDslMessage(const char* msg) {
     if (!msg) return false;
     const char* p = strstr(msg, "DSL_");
@@ -1062,7 +1579,11 @@ static bool CheckDslMessage(const char* msg) {
         if (strstr(msg, "SetPreview")) Log("[ui] %.600s", msg);
         return false;
     }
-    if (strncmp(p, "DSL_TICK", 8) == 0) { if (g_inMenu) { RunPreloads(); MaybeRefreshPreview(); } }
+    if (strncmp(p, "DSL_TICK", 8) == 0) {
+        if (g_inMenu) { RunPreloads(); MaybeRefreshPreview(); }
+        else MaybeTaunt();
+    }
+    else if (strncmp(p, "DSL_HERO ", 9) == 0) SetLocalHero(p + 9);
     else if (strncmp(p, "DSL_GTICK", 9) == 0) MaybeSendGlows();
     else if (strncmp(p, "DSL_LOOP", 8) == 0) { if (g_injectPanel) { g_loopPanel = g_injectPanel; g_glowsSent = -1; } }
     else if (strncmp(p, "DSL_PICK", 8) == 0) RecordPick(p[8] == ' ' ? p + 9 : nullptr);
@@ -1078,7 +1599,7 @@ static bool CheckDslMessage(const char* msg) {
 using Var8Fn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 static Var8Fn g_OrigMsg = nullptr, g_OrigLog = nullptr, g_OrigLogDirect = nullptr;
 
-// Сообщение по формату и аргументам (до 7 целых/указателей, как пришли в регистрах/стеке)
+// The message from its format and arguments (up to 7 integers/pointers, as they came in registers/stack)
 static void FormatInto(char* buf, size_t n, const char* fmt, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e) {
     buf[0] = 0;
     if (!fmt || IsBadReadPtr(fmt, 1)) return;

@@ -1,6 +1,6 @@
-﻿# Сборка Dota Skins Launcher одной командой:
+﻿# Builds Dota Skins Launcher with one command:
 #   powershell -ExecutionPolicy Bypass -File build.ps1
-# Результат: папка dist\ с лаунчером, gencatalog.exe и changer.dll.
+# Result: the dist\ folder with the launcher, gencatalog.exe and changer.dll.
 
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot

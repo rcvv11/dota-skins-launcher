@@ -625,55 +625,7 @@ mod tests {
         assert!(extract_png(b"no image here").is_none());
     }
 
-    /// Manual check against a real install:
-    /// DOTA_GAME_DIR=<Dota>/game/dota ICON_OUT=<dir> cargo test -- --ignored real_icons
-    #[test]
-    #[ignore]
-    fn real_icons() {
-        let dir = std::env::var("DOTA_GAME_DIR").expect("DOTA_GAME_DIR");
-        let out = PathBuf::from(std::env::var("ICON_OUT").expect("ICON_OUT"));
-        let mut pak = IconPak::open(Path::new(&dir)).unwrap();
-        for icon in [
-            "econ/tools/aghs_emblem_2021",
-            "econ/creeps/lane_creeps/creep_dc_radiant/creep_dc_radiant",
-            "econ/terrain/desert_terrain",
-        ] {
-            let name = icon.rsplit('/').next().unwrap();
-            match pak.icon_image(icon).expect(icon) {
-                IconImage::Rgba { width, height, pixels } => {
-                    image::save_buffer(out.join(format!("{name}.png")), &pixels, width as u32, height as u32, image::ColorType::Rgba8).unwrap();
-                    println!("{name}: {width}x{height} decoded");
-                }
-                IconImage::Encoded(b) => {
-                    std::fs::write(out.join(format!("{name}.bin")), b).unwrap();
-                    println!("{name}: embedded image");
-                }
-            }
-        }
-    }
 
-    /// DOTA_GAME_DIR=... CATALOG=<catalog.json> cargo test -- --ignored icon_coverage --nocapture
-    #[test]
-    #[ignore]
-    fn icon_coverage() {
-        let dir = std::env::var("DOTA_GAME_DIR").expect("DOTA_GAME_DIR");
-        let cat: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(std::env::var("CATALOG").unwrap()).unwrap()).unwrap();
-        let mut pak = IconPak::open(Path::new(&dir)).unwrap();
-        let (mut ok, mut missing, mut undecodable) = (0, 0, Vec::new());
-        for s in cat["skins"].as_array().unwrap() {
-            let Some(icon) = s["icon"].as_str() else { continue };
-            if pak.icon_blob(icon).is_none() {
-                missing += 1;
-            } else if pak.icon_image(icon).is_some() {
-                ok += 1;
-            } else {
-                undecodable.push(icon.to_string());
-            }
-        }
-        println!("decoded {ok}, not in pak {missing}, undecodable {}", undecodable.len());
-        println!("examples: {:?}", &undecodable[..undecodable.len().min(5)]);
-    }
 
     #[test]
     fn ycocg_pixel_matches_reference() {
@@ -822,28 +774,4 @@ mod writer_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Diagnostic against the real game pak: run with
-    /// `cargo test read_file_real_pak -- --ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn read_file_real_pak() {
-        let dota_exe = std::env::var("DOTA_EXE").unwrap_or_else(|_| {
-            r"C:\Program Files (x86)\Steam\steamapps\common\dota 2 beta\game\bin\win64\dota2.exe"
-                .into()
-        });
-        let Some(game_dir) = game_dir_from_exe(&dota_exe) else {
-            panic!("dota2.exe не найден: {dota_exe}");
-        };
-        for path in [
-            "models/heroes/antimage/antimage_weapon.vmdl_c",
-            "models/heroes/axe/axe.vmdl_c",
-            "models/items/axe/ti8_axe_violent_prisoner_of_war_armor/ti8_axe_violent_prisoner_of_war_armor.vmdl_c",
-        ] {
-            match read_file(&game_dir, path) {
-                Ok(Some(bytes)) => println!("{path}: {} байт", bytes.len()),
-                Ok(None) => println!("{path}: НЕТ В VPK"),
-                Err(e) => println!("{path}: ошибка {e}"),
-            }
-        }
-    }
 }

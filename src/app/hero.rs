@@ -34,7 +34,7 @@ fn slot_rank(slot: &str) -> (usize, usize, String) {
 
 use crate::catalog::is_persona_slot;
 
-/// Slot caption without the "(персона)" suffix — the tab already says it.
+/// Slot caption without the "(persona)" suffix — the tab already says it.
 fn tile_label(slot: &str) -> String {
     match slot.strip_suffix("_persona_1") {
         Some(base) => catalog::slot_label(base),

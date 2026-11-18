@@ -79,7 +79,7 @@ pub struct LauncherApp {
     confirm_restart: bool,
     profiles_dirty: bool,
     /// profiles.json write time after our own last load/save; a newer one
-    /// means a preset changed on disk (e.g. «ВЫБРАТЬ» in Dota).
+    /// means a preset changed on disk (e.g. «SELECT» in Dota).
     profiles_seen: Option<std::time::SystemTime>,
     view: View,
     /// Slot opened on the hero screen.
@@ -112,7 +112,7 @@ pub struct LauncherApp {
 enum PreviewRequest {
     /// "3D" on a card: the item on its hero, or alone for general items.
     Item(String),
-    /// "3D на герое": the hero wearing the active preset.
+    /// "3D on hero": the hero wearing the active preset.
     Hero { hero: String, persona: bool },
 }
 
@@ -186,7 +186,7 @@ impl LauncherApp {
         }
 
         crate::card::remove_legacy_companion();
-        // «ВЫБРАТЬ» в Dota надевает предмет (режим «в памяти»)
+        // «SELECT» in Dota puts an item on (memory mode)
         crate::card::start(cc.egui_ctx.clone());
         // style names of items (style switcher on the cards)
         crate::styles::load_in_background(config::load_config().dota_path, cc.egui_ctx.clone());
@@ -1473,7 +1473,7 @@ impl LauncherApp {
                 }
             });
 
-            // Язык интерфейса: авто (как в Windows) / русский / английский
+            // Interface language: auto (as in Windows) / Russian / English
             field_label(ui, crate::tr!("Язык", "Language"));
             let lang_label = |code: &str| match code {
                 "ru" => "Русский",
@@ -1960,7 +1960,7 @@ fn brand(ui: &mut egui::Ui) {
     ui.add_space(4.0);
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
-        // разрядка вручную: extra_letter_spacing с Segoe UI Bold рвёт пару «DO»
+        // manual letter spacing: extra_letter_spacing with Segoe UI Bold splits the pair «DO»
         spaced_label(ui, "DOTA SKINS", bold_font(16.0), theme::TEXT, 1.5);
         ui.label(
             egui::RichText::new(crate::tr!("лаунчер косметики", "cosmetics launcher"))
@@ -1987,12 +1987,12 @@ fn bold_outlines() -> Option<&'static ab_glyph::FontArc> {
 
 fn spaced_label(ui: &mut egui::Ui, text: &str, font: egui::FontId, color: Color32, spacing: f32) {
     use ab_glyph::Font as _;
-    // Оптическая разрядка: равный зазор между точными контурами букв (из файла шрифта)
-    // плюс кернинг пары; advance шрифта не используем — у Segoe UI Bold «D» с ним отрывается.
+    // Optical spacing: an even gap between the exact glyph outlines (from the font file)
+    // plus the pair's kerning; the font's advance is not used: with it Segoe UI Bold's «D» drifts apart.
     struct G {
         galley: std::sync::Arc<egui::Galley>,
         id: Option<ab_glyph::GlyphId>,
-        ink: Option<(f32, f32)>, // левый/правый край контура относительно начала глифа, pt
+        ink: Option<(f32, f32)>, // left/right edge of the outline from the glyph's origin, pt
         advance: f32,
     }
     let outlines = bold_outlines();
@@ -2019,7 +2019,7 @@ fn spaced_label(ui: &mut egui::Ui, text: &str, font: egui::FontId, color: Color3
             G { galley, id, ink, advance }
         })
         .collect();
-    // кернинг пары в pt (отрицательный для «TA», «AV»…)
+    // kerning of a pair in pt (negative for «TA», «AV»…)
     let kern = |a: &G, b: &G| -> f32 {
         match (outlines, a.id, b.id) {
             (Some(f), Some(x), Some(y)) if a.ink.is_some() && b.ink.is_some() => {
@@ -2029,10 +2029,10 @@ fn spaced_label(ui: &mut egui::Ui, text: &str, font: egui::FontId, color: Color3
             _ => 0.0,
         }
     };
-    // одиночный пробел egui раскладывает почти нулевой ширины — задаём сами
+    // egui lays out a lone space almost zero wide: set it ourselves
     let space_w = font.size * 0.35;
     let ppp = ui.ctx().pixels_per_point();
-    // раскладка: x — левый край контура очередной буквы
+    // layout: x is the left edge of the next letter's outline
     let mut placed = Vec::with_capacity(glyphs.len());
     let mut x = 0.0f32;
     for (i, g) in glyphs.iter().enumerate() {

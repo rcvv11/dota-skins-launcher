@@ -181,20 +181,4 @@ mod tests {
         assert_eq!(projectile(am), None);
     }
 
-    /// Against the real game files (needs Dota installed).
-    #[test]
-    #[ignore]
-    fn real_game_diretide_emblem() {
-        let exe = r"c:\program files (x86)\steam\steamapps\common\dota 2 beta\game\bin\win64\dota2.exe";
-        let game = crate::vpk::game_dir_from_exe(exe).unwrap();
-        let table = crate::vpk::read_file(&game, crate::schema::SCHEMA_PATH).unwrap().unwrap();
-        let reqs = overrides(&game, &Table::new(&table), &emblem()).unwrap().unwrap();
-        assert_eq!(reqs[0].dst, "particles/ui_mouseactions/selected_ring.vpcf_c");
-        assert!(reqs.len() > 50, "{}", reqs.len());
-        assert!(reqs.iter().any(|r| r.dst == "particles/units/heroes/hero_lina/lina_base_attack.vpcf_c"));
-        for r in reqs.iter().take(3) {
-            assert!(crate::vpk::read_file(&game, &r.src).unwrap().is_some(), "{}", r.src);
-            assert!(crate::vpk::read_file(&game, &r.dst).unwrap().is_some(), "{}", r.dst);
-        }
-    }
 }

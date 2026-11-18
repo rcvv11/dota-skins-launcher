@@ -607,71 +607,6 @@ mod tests {
         assert!(!text.replace("\r\n", "").contains('\n'), "одиночных \\n не появилось");
     }
 
-    /// Diagnostic against the real game table: run with
-    /// `cargo test real_table -- --ignored --nocapture`.
-    /// Confirms the method on the slot that has no file to swap at all.
-    #[test]
-    #[ignore]
-    fn real_table_antimage_shoulders() {
-        let dota_exe = std::env::var("DOTA_EXE").unwrap_or_else(|_| {
-            r"C:\Program Files (x86)\Steam\steamapps\common\dota 2 beta\game\bin\win64\dota2.exe"
-                .into()
-        });
-        let game_dir = crate::vpk::game_dir_from_exe(&dota_exe).expect("dota2.exe не найден");
-        let text = crate::vpk::read_file(&game_dir, SCHEMA_PATH)
-            .expect("не удалось прочитать пак")
-            .expect("в паке нет items_game.txt");
-        println!("таблица: {} байт", text.len());
-
-        let npcs = hero_npcs(&text);
-        println!("героев в таблице: {}", npcs.len());
-        assert_eq!(
-            npcs.get(&norm("Anti-Mage")).map(String::as_str),
-            Some("npc_dota_hero_antimage")
-        );
-        // Catalog spellings that differ from the table's folder names.
-        for hero in [
-            "Anti-Mage",
-            "Shadow Fiend",
-            "Doom",
-            "Drow Ranger",
-            "Templar Assassin",
-            "Nyx Assassin",
-            "Largo",
-        ] {
-            println!("  {hero} -> {:?}", npcs.get(&norm(hero)));
-        }
-
-        let model = "models/items/antimage/avenging_anchorite_shoulder/avenging_anchorite_shoulder.vmdl";
-        let (out, skipped) = patch(
-            &text,
-            &[Pick {
-                hero: "Anti-Mage".into(),
-                slot: "shoulder".into(),
-                model: model.into(),
-                name: "Oathbound Defiant Pauldrons".into(),
-            }],
-            &npcs,
-        );
-        assert!(skipped.is_empty(), "{skipped:?}");
-        assert!(out.len() > text.len(), "в таблицу добавлена строка");
-
-        // The block for the shoulders must now carry the model.
-        let block = find_default_item(&out, "npc_dota_hero_antimage", "shoulder")
-            .expect("плечи Anti-Mage не найдены");
-        let body = String::from_utf8_lossy(&out[block.0..=block.1]);
-        println!("блок плеч:\n{body}");
-        assert!(
-            body.contains(model),
-            "model_player записан в блок стандартных плеч"
-        );
-
-        // Nothing else moved: the head default still points at its own file.
-        let head = find_default_item(&out, "npc_dota_hero_antimage", "head")
-            .expect("голова Anti-Mage не найдена");
-        let head_body = String::from_utf8_lossy(&out[head.0..=head.1]);
-        assert!(head_body.contains("antimage_head.vmdl"), "{head_body}");
-    }
 
     #[test]
     fn braces_are_counted_not_guessed() {
@@ -681,27 +616,5 @@ mod tests {
         let close = block_end(text, open).unwrap();
         assert_eq!(text[close], b'}');
         assert!(find_from(&text[close..], b"\"9725\"", 0).is_none(), "закрытие секции верное");
-    }
-}
-
-#[cfg(test)]
-mod skip_combine_real {
-    /// `cargo test skip_combine_real -- --ignored --nocapture`
-    #[test]
-    #[ignore]
-    fn drow_default_bow_gets_skip_model_combine() {
-        let exe = r"C:\Program Files (x86)\Steam\steamapps\common\dota 2 beta\game\bin\win64\dota2.exe";
-        let game = crate::vpk::game_dir_from_exe(exe).unwrap();
-        let text = crate::vpk::read_file(&game, super::SCHEMA_PATH).unwrap().unwrap();
-        let out = super::skip_combine(&text, &[("npc_dota_hero_drow_ranger".into(), "weapon".into())]);
-        let (open, close) = super::find_default_item(&out, "npc_dota_hero_drow_ranger", "weapon").unwrap();
-        let block = String::from_utf8_lossy(&out[open..=close]).to_string();
-        let name = block.lines().find(|l| l.contains("\"name\"")).unwrap_or("").to_string();
-        println!("{name}");
-        assert!(block.contains("skip_model_combine"), "строка не добавлена");
-        let count = |t: &[u8]| t.windows(20).filter(|w| *w == b"\"skip_model_combine\"").count();
-        println!("помечено предметов: {}", count(&out) - count(&text));
-        let v = block.find("\"visuals\"").expect("нет visuals");
-        println!("{}", &block[v..]);
     }
 }

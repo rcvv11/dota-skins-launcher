@@ -27,6 +27,7 @@ mod schema_mount;
 mod sets;
 mod skins;
 mod styles;
+mod taunts;
 mod theme;
 mod visuals;
 mod vpk;
@@ -36,16 +37,16 @@ use eframe::egui;
 
 fn main() -> eframe::Result<()> {
     if std::env::args().any(|a| a == "--companion") {
-        // старый автозапуск компаньона: его больше нет
+        // the old companion's autostart: the companion is gone
         return Ok(());
     }
 
-    // changer.dll внедряется в dota2.exe: лаунчер сразу работает от администратора
+    // changer.dll is injected into dota2.exe: the launcher runs as administrator from the start
     if !win::is_elevated() {
         if win::relaunch_elevated() {
             return Ok(());
         }
-        // запрос UAC отклонён: работаем без прав (внедрение может не сработать)
+        // UAC prompt declined: run without the rights (injection may fail)
     }
 
     i18n::set(&config::load_config().language);

@@ -1,5 +1,5 @@
-//! Нажатия «ВЫБРАТЬ» в Dota: changer.dll пишет их в equips.txt (номер предмета и
-//! подписи строки), предмет кладётся в активный пресет и применяется в памяти.
+//! «SELECT» presses in Dota: changer.dll writes them to equips.txt (item definition
+//! index and the row's texts); the item goes into the active preset and is applied in memory.
 
 use crate::catalog::{Catalog, Skin};
 use crate::config::Profile;

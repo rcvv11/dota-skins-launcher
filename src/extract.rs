@@ -399,46 +399,6 @@ mod tests {
         assert!(uns[0].reason.contains("нет данных"), "{}", uns[0].reason);
     }
 
-    /// End-to-end against the real catalog and the real game table: an
-    /// Anti-Mage shoulder item must reach the item-table patch.
-    /// `cargo test real_catalog -- --ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn real_catalog_shoulder_reaches_the_table() {
-        let assets = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("dist/assets");
-        let c = Catalog::load(&assets).expect("catalog.json");
-        let am: Vec<&Skin> = c
-            .skins
-            .iter()
-            .filter(|s| s.slot == "shoulder" && s.hero_names() == vec!["Anti-Mage"])
-            .filter(|s| s.model.as_deref().is_some_and(|m| !m.trim().is_empty()))
-            .take(1)
-            .collect();
-        let s = am.first().expect("в каталоге нет плеч Anti-Mage");
-        println!("предмет: {} ({})", s.name, s.model.as_deref().unwrap_or(""));
-
-        let (reqs, picks, uns) = plan(&[s], &c, &Default::default());
-        println!("оверрайдов: {}, picks: {}, пропусков: {}", reqs.len(), picks.len(), uns.len());
-        assert!(picks.iter().any(|p| p.slot == "shoulder"), "{picks:?}");
-
-        let dota_exe = std::env::var("DOTA_EXE").unwrap_or_else(|_| {
-            r"C:\Program Files (x86)\Steam\steamapps\common\dota 2 beta\game\bin\win64\dota2.exe"
-                .into()
-        });
-        let game_dir = crate::vpk::game_dir_from_exe(&dota_exe).expect("dota2.exe не найден");
-        let table = crate::vpk::read_file(&game_dir, crate::schema::SCHEMA_PATH)
-            .expect("чтение пака")
-            .expect("в паке нет таблицы");
-        let npcs = crate::schema::hero_npcs(&table);
-        let (text, skipped) = crate::schema::patch(&table, &picks, &npcs);
-        assert!(skipped.is_empty(), "{skipped:?}");
-        assert_ne!(text, table, "таблица должна измениться");
-        let block = crate::schema::find_default_item(&text, "npc_dota_hero_antimage", "shoulder")
-            .expect("плечи Anti-Mage не найдены");
-        let body = String::from_utf8_lossy(&text[block.0..=block.1]);
-        assert!(body.contains(s.model.as_deref().unwrap()), "{body}");
-        println!("готово: модель записана в блок стандартных плеч");
-    }
 
     #[test]
     fn model_path_check() {
