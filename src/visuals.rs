@@ -169,6 +169,12 @@ impl<'a> Table<'a> {
     }
 
     /// Byte range (`{` .. `}`) of the item's block.
+    /// The item's inventory icon (`image_inventory`, e.g. "econ/items/x/y").
+    pub fn image_inventory(&self, item: &ItemRef) -> Option<String> {
+        let (open, close) = self.find(item)?;
+        scalar(&self.text[open..=close], b"image_inventory").filter(|s| !s.trim().is_empty())
+    }
+
     fn find(&self, item: &ItemRef) -> Option<(usize, usize)> {
         if let Some(i) = item.index {
             return self.items.get(&i.to_string()).copied();

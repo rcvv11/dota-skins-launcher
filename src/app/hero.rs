@@ -23,6 +23,9 @@ const SLOT_ORDER: &[&str] = &[
     "roshan", "tormentor",
 ];
 
+/// The "Sets" tile's key among the slots.
+const SETS: &str = "__sets";
+
 fn slot_rank(slot: &str) -> (usize, usize, String) {
     let (base, persona) = match slot.strip_suffix("_persona_1") {
         Some(b) => (b, 1),
@@ -36,6 +39,9 @@ use crate::catalog::is_persona_slot;
 
 /// Slot caption without the "(persona)" suffix — the tab already says it.
 fn tile_label(slot: &str) -> String {
+    if slot == SETS {
+        return crate::tr!("Наборы", "Sets").to_string();
+    }
     match slot.strip_suffix("_persona_1") {
         Some(base) => catalog::slot_label(base),
         None if slot == "persona_selector" => crate::tr!("Персона", "Persona").to_string(),
@@ -177,12 +183,46 @@ impl LauncherApp {
         slots.sort_by_key(|s| slot_rank(s));
         slots.dedup();
 
+        // the hero's sets, shown like items: (card, members); worked out once per
+        // hero and look (and again when the sets or the catalog change)
+        let sets_key = (hero.to_string(), persona, crate::bundles::all().len(), self.catalog.skins.len());
+        if self.hero_sets.as_ref().map(|(k, _)| k) != Some(&sets_key) {
+            let built = if hero == NO_HERO {
+                Vec::new()
+            } else {
+                crate::bundles::for_hero(&self.catalog, hero, persona)
+                .into_iter()
+                .map(|(b, members)| {
+                    let card = Skin {
+                        id: format!("set:{}", b.name),
+                        name: b.name.clone(),
+                        hero: hero.to_string(),
+                        slot: "set".into(),
+                        rarity: if b.rarity.is_empty() { "common".into() } else { b.rarity.clone() },
+                        icon: b.icon.clone(),
+                        index: b.index,
+                        ..Default::default()
+                    };
+                    (card, members.iter().map(|s| s.id.clone()).collect())
+                })
+                .collect()
+            };
+            self.hero_sets = Some((sets_key, built));
+        }
+        let sets: Vec<(Skin, Vec<String>)> = self.hero_sets.as_ref().map(|(_, s)| s.clone()).unwrap_or_default();
+        let set_worn = |members: &Vec<String>| members.iter().all(|m| selected.contains(m));
         let active_slot = self
             .hero_slot
             .clone()
-            .filter(|s| slots.contains(s))
+            .filter(|s| slots.contains(s) || (s == SETS && !sets.is_empty()))
             .or_else(|| slots.first().cloned())
             .unwrap_or_default();
+        let set_cards: Vec<&(Skin, Vec<String>)> = sets
+            .iter()
+            .filter(|_| active_slot == SETS)
+            .filter(|(c, _)| rarity.as_ref().map_or(true, |r| c.rarity == *r))
+            .filter(|(c, _)| query.is_empty() || query.split_whitespace().all(|w| c.name.to_lowercase().contains(w)))
+            .collect();
 
         let equipped = |slot: &str| -> Option<&Skin> {
             skins
@@ -217,6 +257,7 @@ impl LauncherApp {
         let mut events: Vec<(String, CardAction)> = Vec::new();
         let mut new_sort: Option<SortMode> = None;
         let mut open_hero_3d = false;
+        let mut set_events: Vec<(String, Vec<String>)> = Vec::new();
         let favorites = &self.config.favorites;
         let active_styles = self.profiles[self.active_index()].styles.clone();
         let has_cli = self.vrf_cli.is_some();
@@ -320,15 +361,24 @@ impl LauncherApp {
                     let avail = ui.available_width() - 8.0;
                     let cols = (((avail + GAP) / (TILE_W + GAP)).floor() as usize).max(1);
                     let w = (avail - GAP * (cols as f32 - 1.0)) / cols as f32;
-                    for row in slots.chunks(cols) {
+                    let mut tiles: Vec<String> = Vec::new();
+                    if !sets.is_empty() {
+                        tiles.push(SETS.to_string());
+                    }
+                    tiles.extend(slots.iter().cloned());
+                    for row in tiles.chunks(cols) {
                         ui.horizontal_top(|ui| {
                             ui.spacing_mut().item_spacing.x = GAP;
                             for slot in row {
-                                let item = equipped(slot);
+                                let item = if slot == SETS {
+                                    sets.iter().find(|(_, m)| set_worn(m)).map(|(c, _)| c)
+                                } else {
+                                    equipped(slot)
+                                };
                                 let tex = item.and_then(|s| {
                                     icons.get(&s.id, s.icon.as_deref(), s.preview.as_deref().map(|p| assets.join(p)))
                                 });
-                                let count = skins.iter().filter(|s| &s.slot == slot).count();
+                                let count = if slot == SETS { sets.len() } else { skins.iter().filter(|s| &s.slot == slot).count() };
                                 if slot_tile(ui, w, slot, item, tex.as_ref(), count, *slot == active_slot)
                                     .clicked()
                                 {
@@ -346,7 +396,7 @@ impl LauncherApp {
                             egui::RichText::new(crate::trf!(
                                 "{}  ·  вариантов: {}", "{}  ·  variants: {}",
                                 tile_label(&active_slot),
-                                options.len()
+                                if active_slot == SETS { set_cards.len() } else { options.len() }
                             ))
                             .font(bold_font(15.0))
                             .color(theme::TEXT),
@@ -382,6 +432,27 @@ impl LauncherApp {
                     });
                     ui.add_space(10.0);
 
+                    if active_slot == SETS {
+                        let avail = ui.available_width() - 8.0;
+                        let cols = (((avail + CARD_GAP) / (CARD_MIN_W + CARD_GAP)).floor() as usize).max(1);
+                        let card_w = (avail - CARD_GAP * (cols as f32 - 1.0)) / cols as f32;
+                        for row in set_cards.chunks(cols) {
+                            ui.horizontal_top(|ui| {
+                                ui.spacing_mut().item_spacing.x = CARD_GAP;
+                                for (card, members) in row.iter().map(|x| (&x.0, &x.1)) {
+                                    let probe = ui.available_rect_before_wrap();
+                                    let visible = ui.is_rect_visible(Rect::from_min_size(probe.min, egui::vec2(card_w, CARD_H)));
+                                    let tex = if visible { icons.get(&card.id, card.icon.as_deref(), None) } else { None };
+                                    let action = draw_card(ui, card, set_worn(members), false, tex.as_ref(), card_w, false, &[], 0);
+                                    if action == CardAction::Toggle {
+                                        set_events.push((card.name.clone(), members.clone()));
+                                    }
+                                }
+                            });
+                            ui.add_space(CARD_GAP);
+                        }
+                        return;
+                    }
                     if options.is_empty() {
                         ui.label(
                             egui::RichText::new(crate::tr!("Нет вариантов под текущие фильтры", "No variants for the current filters"))
@@ -453,6 +524,9 @@ impl LauncherApp {
         }
         for id in toggles {
             self.toggle_skin(&id);
+        }
+        for (name, members) in set_events {
+            self.wear_set(&name, &members);
         }
         self.handle_card_events(events);
         if let Some(s) = new_sort {

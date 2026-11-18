@@ -294,6 +294,7 @@ pub fn slot_label(slot: &str) -> String {
         return crate::trf!("{} (персона)", "{} (persona)", slot_label(base));
     }
     let known = match slot {
+        "set" => crate::tr!("Набор", "Set"),
         "terrain" => crate::tr!("Ландшафт", "Terrain"),
         "weather" => crate::tr!("Погода", "Weather"),
         "emblem" => crate::tr!("Эмблема", "Emblem"),

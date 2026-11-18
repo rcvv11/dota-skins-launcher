@@ -109,6 +109,9 @@ static std::string g_glowsJs = "[]";
 // Items for empty slots the running Dota has not read yet (line
 // restart|name\tname): their button says «after restart»
 static std::string g_restartJs = "[]";
+// Slot tile icons (lines slotdef|HERO|CAPTION|item|style): the preset's item shown
+// in the hero page's slot tiles; for the script {HERO: {CAPTION: [item, style]}}
+static std::string g_slotsJs = "{}";
 // Taunts (lines taunt|npc_dota_hero_x|sequence;sequence): played on your own hero
 // in a match, client-side only
 static std::map<std::string, std::string> g_taunts;
@@ -157,11 +160,30 @@ static bool LoadConfig(const std::string& path) {
     Rules* fresh = new Rules();
     std::string line, glows, restart;
     std::map<std::string, std::string> taunts;
+    std::map<std::string, std::string> slots;  // HERO -> "CAPTION":[item,style],...
     std::string lang = "ru";
     while (std::getline(file, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty() || line[0] == '#') continue;
         if (line.compare(0, 5, "lang|") == 0) { lang = line.substr(5); continue; }
+        if (line.compare(0, 8, "slotdef|") == 0) {
+            // slotdef|HERO|CAPTION|item|style
+            std::vector<std::string> f;
+            size_t s = 8;
+            while (true) {
+                size_t e = line.find('|', s);
+                f.push_back(line.substr(s, e == std::string::npos ? std::string::npos : e - s));
+                if (e == std::string::npos) break;
+                s = e + 1;
+            }
+            if (f.size() >= 3) {
+                std::string& entry = slots[f[0]];
+                entry += (entry.empty() ? "" : ",") + JsString(f[1]) + ":[" + std::to_string(atoi(f[2].c_str())) + "," +
+                         std::to_string(f.size() > 3 ? atoi(f[3].c_str()) : 0) + "," +
+                         JsString(f.size() > 4 ? f[4] : std::string()) + "]";
+            }
+            continue;
+        }
         if (line.compare(0, 6, "taunt|") == 0) {
             size_t bar = line.find('|', 6);
             if (bar != std::string::npos) taunts[line.substr(6, bar - 6)] = line.substr(bar + 1);
@@ -193,6 +215,11 @@ static bool LoadConfig(const std::string& path) {
     AcquireSRWLockExclusive(&g_glowsLock);
     g_glowsJs = "[" + glows + "]";
     g_restartJs = "[" + restart + "]";
+    {
+        std::string js = "{";
+        for (auto& s : slots) js += (js.size() > 1 ? "," : "") + JsString(s.first) + ":{" + s.second + "}";
+        g_slotsJs = js + "}";
+    }
     ReleaseSRWLockExclusive(&g_glowsLock);
     AcquireSRWLockExclusive(&g_tauntLock);
     g_taunts.swap(taunts);
@@ -710,6 +737,7 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
       // item glows: on your own hero in a match, on the hero models in the menu
       $.Msg("DSL_GTICK");
       DSLGlowTick(inMenu);
+      if (inMenu) DSLSlotTick();
       var log = types.filter(function (t) { return t.indexOf("DOTA") !== 0; }).join(", ");
       if (log && log !== last) { last = log; $.Msg("DSL_LOG " + log); }
     } catch (e) {
@@ -794,6 +822,158 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
     }
     return false;
   }
+  // --- the preset's items in the hero page's slot tiles ---
+  // A tile (DOTAHeroSlotItemPicker[Loadout]: Header > SlotName, SlotEconItem) is known
+  // by its slot caption; the hero by the page's hero name. The DLL gives
+  // {HERO: {CAPTION: [item, style]}}; the tile's econ item is set to that item.
+  var slotMap = {}, pendingSlots = null, slotForceNext = false, slotHero = "", slotErr = false;
+  // Leaving or entering the wardrobe makes the game fill the tiles with the real
+  // loadout again, in the same panels (nothing to notice on them): a change of the
+  // page's view, seen on the fast tick, puts the icons back once, 0.1 s later.
+  var slotViewPage = null, slotViewPanels = [], slotView = "", slotViewPending = false;
+  function slotViewKey() {
+    return slotViewPanels.map(function (pn) {
+      return pn && pn.IsValid() ? (pn.visible ? 1 : 0) + "" + (pn.actuallayoutheight > 0 ? 1 : 0) : "-";
+    }).join(",");
+  }
+  function slotViewTick() {
+    if (!slotViewPage || !slotViewPage.IsValid() || slotViewPending) return;
+    var key = slotViewKey();
+    if (key === slotView) return;
+    slotView = key;
+    slotViewPending = true;
+    $.Schedule(0.05, function () { slotViewPending = false; slotRepair(); DSLSlotTick(); });
+  }
+  // called right after the game redrew the slot tiles (our loadout refresh)
+  // right after the game redrew the tiles (our loadout refresh): once, at once
+  DSLSlotRedrawn = function () { slotRepair(); };
+  DSLSetSlots = function (m) {
+    pendingSlots = m || {};
+    $.Schedule(0, function () { DSLSlotTick(); });
+  };
+  function slotKey(s) { return ("" + s).toUpperCase().replace(/[^A-Z0-9\u0400-\u04FF]/g, ""); }
+  function firstLabel(p) {
+    var stack = [p];
+    while (stack.length) {
+      var q = stack.pop();
+      if (q.paneltype === "Label" && q.text) return q.text;
+      for (var c = q.GetChildCount() - 1; c >= 0; c--) stack.push(q.GetChild(c));
+    }
+    return "";
+  }
+  // Is the tile showing our item still? The game re-creates the econ item's
+  // image (EconItemIcon) when it sets its own item: our mark on it is then gone.
+  function slotShows(econ, def) {
+    var img = econ.FindChildTraverse("EconItemIcon");
+    return econ.GetAttributeInt("dsl_def", 0) === def && (!img || img.GetAttributeInt("dsl_def", 0) === def);
+  }
+  // the tiles of the visible page with our item: their icons are put back on every
+  // fast tick (50 ms) and right after the game redrew them, with SetImage (the
+  // same path again changes nothing: no blink)
+  var slotTiles = [], slotTilesHero = "", slotHeroLabel = null;
+  // Another hero on the page: the game reuses the same tiles for that hero's
+  // items, so the old hero's tiles are dropped at once (the repair must not put
+  // them back), and the game is asked to redraw the page if we had changed it.
+  function slotHeroTick() {
+    if (!slotHeroLabel || !slotHeroLabel.IsValid()) return;
+    var name = slotHeroLabel.text;
+    if (name === slotTilesHero) return;
+    var had = slotTiles.length > 0;
+    slotTiles = [];
+    slotTilesHero = name;
+    if (had) $.DispatchEvent("DOTALoadoutChanged");
+    $.Schedule(0.05, function () { DSLSlotTick(); });
+  }
+  function slotRepair() {
+    for (var i = 0; i < slotTiles.length; i++) {
+      var s = slotTiles[i];
+      if (!s.icon || !s.econ.IsValid()) continue;
+      var img = s.econ.FindChildTraverse("EconItemIcon");
+      if (img) img.SetImage(s.icon);
+      // the game's own default item greys the tile (.IsDefaultItem: saturation 0)
+      if (s.econ.BHasClass("IsDefaultItem")) s.econ.RemoveClass("IsDefaultItem");
+    }
+  }
+  function slotSet(econ, def, style) {
+    if (style > 0 && econ.SetItemByDefinitionAndStyle) econ.SetItemByDefinitionAndStyle(def, style);
+    else econ.SetItemByDefinition(def);
+    econ.SetAttributeInt("dsl_def", def);
+    if (econ.BHasClass("IsDefaultItem")) econ.RemoveClass("IsDefaultItem");
+    var img = econ.FindChildTraverse("EconItemIcon");
+    if (img) img.SetAttributeInt("dsl_def", def);
+  }
+  DSLSlotTick = function () {
+    // Setting an icon reloads its image (a blink), so it is set only when needed:
+    // a new tile, a new pick, another hero, the game re-created the tile's image,
+    // or right after the game redrew the tiles (our loadout refresh: DSLSlotRedrawn)
+    var force = slotForceNext;
+    slotForceNext = false;
+    if (pendingSlots) { slotMap = pendingSlots; pendingSlots = null; force = true; }
+    var pages = root.FindChildrenWithClassTraverse("DashboardPage");
+    var shown = [];
+    for (var i = 0; i < pages.length; i++) {
+      var hp = pages[i];
+      if (hp.paneltype !== "DOTAHeroPageNewV2" || !hp.visible) continue;
+      var nameP = hp.FindChildTraverse("HeroName");
+      var heroName = nameP ? firstLabel(nameP) : "";
+      if (nameP && (!slotHeroLabel || !slotHeroLabel.IsValid() || slotHeroLabel.text !== heroName)) {
+        var st = [nameP];
+        slotHeroLabel = null;
+        while (st.length && !slotHeroLabel) {
+          var lp = st.pop();
+          if (lp.paneltype === "Label" && lp.text === heroName) slotHeroLabel = lp;
+          for (var lc = lp.GetChildCount() - 1; lc >= 0; lc--) st.push(lp.GetChild(lc));
+        }
+      }
+      var hero = slotMap[slotKey(heroName)];
+      if (heroName !== slotHero) { slotHero = heroName; force = true; }
+      // the panels whose look tells whether the wardrobe is open (watched by slotViewTick)
+      if (slotViewPage !== hp) {
+        slotViewPage = hp;
+        slotViewPanels = ["HeroCustomize", "CosmeticPicker", "EquippedSetDetailsContainer", "EquippedSetSlotsContainer"]
+          .map(function (id) { return hp.FindChildTraverse(id); });
+        slotView = slotViewKey();
+      }
+      // slot captions (wardrobe list) and every "equipped" row on the page
+      var labels = [], rows = [], stack = [hp];
+      while (stack.length) {
+        var q = stack.pop();
+        if (q.id === "SlotName" && q.paneltype === "Label") { labels.push(q); continue; }
+        if (q.id === "EquippedSetSlotsContainer") rows.push(q);
+        for (var c = 0; c < q.GetChildCount(); c++) stack.push(q.GetChild(c));
+      }
+      var set = 0, rowSet = 0;
+      for (var k = 0; hero && k < labels.length; k++) {
+        var tile = labels[k].GetParent() ? labels[k].GetParent().GetParent() : null;
+        var econ = tile ? tile.FindChildTraverse("SlotEconItem") : null;
+        var m = hero[slotKey(labels[k].text)];
+        if (!econ || !m) continue;
+        shown.push({ econ: econ, icon: m[2] });
+        if (slotShows(econ, m[0])) continue;
+        try { slotSet(econ, m[0], m[1]); set++; }
+        catch (e) { if (!slotErr) { slotErr = true; $.Msg("DSL_LOG slot icon error " + e); } }
+      }
+      // the "equipped" row: DOTAEconItem tiles without captions, in the hero
+      // script's slot order (only when the count matches, e.g. not with a persona)
+      var rowInfo = [];
+      for (var w = 0; hero && hero["#LEN"] && w < rows.length; w++) {
+        var tiles = [];
+        for (var c2 = 0; c2 < rows[w].GetChildCount(); c2++)
+          if (rows[w].GetChild(c2).paneltype === "DOTAEconItem") tiles.push(rows[w].GetChild(c2));
+        rowInfo.push((rows[w].visible ? "visible " : "hidden ") + tiles.length);
+        if (tiles.length !== hero["#LEN"][0]) continue;
+        for (var r = 0; r < tiles.length; r++) {
+          var mr = hero["#" + r];
+          if (mr) shown.push({ econ: tiles[r], icon: mr[2] });
+          if (!mr || slotShows(tiles[r], mr[0])) continue;
+          try { slotSet(tiles[r], mr[0], mr[1]); rowSet++; }
+          catch (e5) { if (!slotErr) { slotErr = true; $.Msg("DSL_LOG slot icon error " + e5); } }
+        }
+      }
+    }
+    slotTiles = shown;
+    slotTilesHero = slotHeroLabel && slotHeroLabel.IsValid() ? slotHeroLabel.text : "";
+  };
   // hover over a card (like Dota's .Container:hover): the button instead of the status line
   var hoverItems = [];
   function hoverTick() {
@@ -828,6 +1008,7 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
     }
     // a frequent tick for the DLL (in the menu): preloading and model refresh without waiting
     if (lastMenu !== null && root.IsValid() && root.GetAttributeString("dsl_loop", "") === me) $.Msg("DSL_TICK");
+    if (lastMenu) { slotHeroTick(); slotViewTick(); slotRepair(); }
     $.Schedule(0.05, hoverTick);
   }
   hoverTick();
@@ -938,11 +1119,12 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
         $.Msg("DSL_LOG refresh info: model=" + (model ? model.paneltype : "-") + " api=[" + api.join(",") + "] controls=" + (controls ? controls.visible : "-"));
       }
       if (tryOn) $.DispatchEvent("Activated", revert, "mouse");
-      $.Schedule(tryOn ? 0.15 : 0, function () { $.DispatchEvent("DOTALoadoutChanged"); });
+      var redrawn = function () { if (typeof DSLSlotRedrawn === "function") DSLSlotRedrawn(); };
+      $.Schedule(tryOn ? 0.15 : 0, function () { $.DispatchEvent("DOTALoadoutChanged"); redrawn(); });
       // «REVERT» rebuilds the model asynchronously and may override the first refresh: repeat;
       // after a set try-on Dota brings back the old model from its cache later: once more after 2 s
-      $.Schedule(0.8, function () { $.DispatchEvent("DOTALoadoutChanged"); });
-      if (tryOn) $.Schedule(2.0, function () { $.DispatchEvent("DOTALoadoutChanged"); });
+      $.Schedule(0.8, function () { $.DispatchEvent("DOTALoadoutChanged"); redrawn(); });
+      if (tryOn) $.Schedule(2.0, function () { $.DispatchEvent("DOTALoadoutChanged"); redrawn(); });
       $.Msg("DSL_LOG refresh: loadout changed (revert " + (revert ? (shown ? "shown" : "hidden") : "none") + ", controls " + (controls ? (controls.visible ? "shown" : "hidden") : "none") + ")");
       return;
     }
@@ -980,11 +1162,15 @@ static void MaybeSendGlows() {
     g_glowsSent = v;
     AcquireSRWLockShared(&g_glowsLock);
     std::string script = "if (typeof DSLSetGlows === 'function') DSLSetGlows(" + g_glowsJs + ");"
-                         "if (typeof DSLSetRestart === 'function') DSLSetRestart(" + g_restartJs + ");";
+                         "if (typeof DSLSetRestart === 'function') DSLSetRestart(" + g_restartJs + ");"
+                         "if (typeof DSLSetSlots === 'function') DSLSetSlots(" + g_slotsJs + ");";
     ReleaseSRWLockShared(&g_glowsLock);
     Log("[*] Sending item glows to the game UI");
     t_inOurScript = true;
-    g_OrigRunScript(g_uiEngine, g_loopPanel, script.c_str(), "dota_skins_glows.js", 0);
+    // a new name every time: Panorama keeps a compiled script by its name, and the
+    // same name ran the first table's script again (the slot icons stayed old)
+    std::string name = "dota_skins_table_" + std::to_string(v) + ".js";
+    g_OrigRunScript(g_uiEngine, g_loopPanel, script.c_str(), name.c_str(), 0);
     t_inOurScript = false;
 }
 
@@ -1580,7 +1766,7 @@ static bool CheckDslMessage(const char* msg) {
         return false;
     }
     if (strncmp(p, "DSL_TICK", 8) == 0) {
-        if (g_inMenu) { RunPreloads(); MaybeRefreshPreview(); }
+        if (g_inMenu) { RunPreloads(); MaybeRefreshPreview(); MaybeSendGlows(); }
         else MaybeTaunt();
     }
     else if (strncmp(p, "DSL_HERO ", 9) == 0) SetLocalHero(p + 9);

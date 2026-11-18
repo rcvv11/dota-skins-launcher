@@ -150,6 +150,10 @@ fn run(plan: &Plan, step: &dyn Fn(&str)) -> Result<String, String> {
                     .collect();
                 glow_lines.extend(crate::taunts::config_lines(index, &plan.hero_items, npcs, units, &model_swaps, cli, &pak));
             }
+            // The picked items' icons in Dota's slot tiles.
+            if plan.memory_swap {
+                glow_lines.extend(crate::slot_icons::config_lines(data, &plan.hero_items));
+            }
             // Colourings that are another material group of the model.
             let wanted = crate::skins::wanted(&index, &plan.hero_items);
             if let (false, Some(cli)) = (wanted.is_empty(), &plan.vrf_cli) {

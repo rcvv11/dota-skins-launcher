@@ -107,6 +107,9 @@ pub struct LauncherApp {
     catalog_outdated: Option<String>,
     /// Override folder currently mounted in gameinfo.gi.
     mounted_mod_dir: PathBuf,
+    /// The Heroes tab's sets of one hero, as cards: (hero, persona, sets loaded,
+    /// catalog size) -> (card, members). Worked out once, not every frame.
+    hero_sets: Option<((String, bool, usize, usize), Vec<(Skin, Vec<String>)>)>,
 }
 
 enum PreviewRequest {
@@ -190,6 +193,8 @@ impl LauncherApp {
         crate::card::start(cc.egui_ctx.clone());
         // style names of items (style switcher on the cards)
         crate::styles::load_in_background(config::load_config().dota_path, cc.egui_ctx.clone());
+        // item sets (the Heroes tab's "Sets" tile)
+        crate::bundles::load_in_background(config::load_config().dota_path, cc.egui_ctx.clone());
 
         // The launcher always opens on the Heroes tab (last hero is restored).
         let view = View::Heroes;
@@ -235,6 +240,7 @@ impl LauncherApp {
             setup_started: false,
             catalog_outdated,
             mounted_mod_dir: mod_dir,
+            hero_sets: None,
         }
     }
 
@@ -788,6 +794,23 @@ impl LauncherApp {
 
     fn selected_ids(&self) -> BTreeSet<String> {
         self.profiles[self.active_index()].skins.iter().cloned().collect()
+    }
+
+    /// Puts a whole set on (replacing the items of the same slots), or takes it
+    /// off when every piece is worn already.
+    fn wear_set(&mut self, name: &str, members: &[String]) {
+        let idx = self.active_index();
+        let catalog = &self.catalog;
+        let profile = &mut self.profiles[idx];
+        if members.iter().all(|m| profile.skins.contains(m)) {
+            profile.skins.retain(|id| !members.contains(id));
+            self.set_status(StatusKind::Ok, crate::trf!("Набор «{name}» снят", "Set “{name}” taken off"));
+        } else {
+            let items: Vec<&Skin> = catalog.skins.iter().filter(|s| members.contains(&s.id)).collect();
+            crate::picks::wear(profile, catalog, &items);
+            self.set_status(StatusKind::Ok, crate::trf!("Надет набор «{name}»: предметов {}", "Set “{name}” put on: {} items", members.len()));
+        }
+        self.profiles_dirty = true;
     }
 
     /// Adds or removes an item; adding replaces items of the same hero and slot.
