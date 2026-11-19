@@ -575,7 +575,10 @@ static DWORD WINAPI WriteEquips(LPVOID) {
 using RunScriptFn = void (*)(void* engine, void* panel, const char* script, const char* path, uint64_t lineCol);
 static RunScriptFn g_OrigRunScript = nullptr;
 static thread_local bool t_inOurScript = false;
-static ULONGLONG g_lastInject = 0;
+// when the script was last offered to each panel's context: every 5 s per panel. (One
+// pause for all panels let the menu's frequent scripts take every turn, and the match
+// HUD, which runs scripts mostly while loading, got no loop: no hero for the taunts.)
+static std::unordered_map<void*, ULONGLONG> g_lastInject;
 
 static const char kPickJs[] = R"JS(
 if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELECTED", have: "OWNED", restart: "AFTER RESTART" };
@@ -596,7 +599,32 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
               root.FindChildrenWithClassTraverse("DashboardPage").length > 0 || /dashboard/i.test(root.id || "")) ? "dash" : "hud";
   var last = "";
   var lastMenu = null;
-  var lastHero = "";
+  var lastHero = "", lastHeroWhy = "";
+  // Your hero's entity. In a regular match the game gives none for the player: the
+  // unit in the portrait, or a real hero of yours, stands in.
+  DSLLocalHero = function () {
+    var me = Players.GetLocalPlayer();
+    var hero = Players.GetPlayerHeroEntityIndex(me);
+    if (!(hero > 0) && Players.GetLocalPlayerPortraitUnit) {
+      var pu = Players.GetLocalPlayerPortraitUnit();
+      if (pu > 0 && Entities.IsRealHero(pu) && Entities.GetPlayerOwnerID(pu) === me) hero = pu;
+    }
+    if (!(hero > 0)) {
+      var hs = Entities.GetAllHeroEntities() || [];
+      for (var i = 0; i < hs.length && !(hero > 0); i++)
+        if (Entities.IsRealHero(hs[i]) && Entities.GetPlayerOwnerID(hs[i]) === me) hero = hs[i];
+    }
+    return hero;
+  };
+  // A hero's npc name. In a regular match the game gives no unit names (empty), so the
+  // player's picked hero or the entity's class name (npc_dota_hero_x) stands in.
+  DSLHeroName = function (ent, player) {
+    var n = "";
+    try { n = Entities.GetUnitName(ent) || ""; } catch (e) {}
+    if (!n && player >= 0 && Players.GetPlayerSelectedHero) { try { n = Players.GetPlayerSelectedHero(player) || ""; } catch (e2) {} }
+    if (!n) { try { n = Entities.GetClassname(ent) || ""; } catch (e3) {} }
+    return n.indexOf("npc_dota_hero_") === 0 ? n : "";
+  };
   function tick() {
     try {
       if (!root.IsValid() || root.GetAttributeString("dsl_loop", "") !== me) return;
@@ -743,11 +771,27 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
       if (inMenu !== lastMenu) { lastMenu = inMenu; $.Msg("DSL_MENU " + (inMenu ? 1 : 0)); }
       // your hero in a match (for taunts): entity index and unit name
       if (!inMenu) {
+        var heroWhy = "";
         try {
-          var hero = Players.GetPlayerHeroEntityIndex(Players.GetLocalPlayer());
-          var heroKey = hero > 0 ? hero + "|" + Entities.GetUnitName(hero) : "";
+          var me2 = Players.GetLocalPlayer();
+          var hero = Players.GetPlayerHeroEntityIndex(me2);
+          heroWhy = "player " + me2 + ", hero " + hero;
+          // not given (a regular match): the unit in the portrait, or a real hero of yours
+          if (!(hero > 0) && Players.GetLocalPlayerPortraitUnit) {
+            var pu = Players.GetLocalPlayerPortraitUnit();
+            heroWhy += ", portrait " + pu;
+            if (pu > 0 && Entities.IsRealHero(pu) && Entities.GetPlayerOwnerID(pu) === me2) hero = pu;
+          }
+          if (!(hero > 0)) {
+            var hs = Entities.GetAllHeroEntities() || [];
+            heroWhy += ", heroes " + hs.length;
+            for (var hi = 0; hi < hs.length && !(hero > 0); hi++)
+              if (Entities.IsRealHero(hs[hi]) && Entities.GetPlayerOwnerID(hs[hi]) === me2) hero = hs[hi];
+          }
+          var heroKey = hero > 0 ? hero + "|" + DSLHeroName(hero, me2) : "";
           if (heroKey && heroKey !== lastHero) { lastHero = heroKey; $.Msg("DSL_HERO " + heroKey); }
-        } catch (e3) {}
+        } catch (e3) { heroWhy += " error " + e3; }
+        if (!lastHero && heroWhy !== lastHeroWhy) { lastHeroWhy = heroWhy; $.Msg("DSL_LOG no hero yet (" + loopKind + "): " + heroWhy); }
       }
       // the persona switch (CLASSIC / persona): for a persona you do not own Dota's button
       // is disabled: enable it and tell the launcher «toggle the hero's persona»
@@ -1222,8 +1266,8 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
         }
       } else {
         // in a match only your own hero: on others an effect could give away an invisible one
-        var hero = Players.GetPlayerHeroEntityIndex(Players.GetLocalPlayer());
-        if (hero > 0 && Entities.IsValidEntity(hero)) targets.push([hero, Entities.GetUnitName(hero)]);
+        var hero = DSLLocalHero();
+        if (hero > 0 && Entities.IsValidEntity(hero)) targets.push([hero, DSLHeroName(hero, Players.GetLocalPlayer())]);
       }
       for (var t = 0; t < targets.length; t++) {
         var ent = targets[t][0], name = targets[t][1];
@@ -1397,8 +1441,14 @@ static void HookedRunScript(void* engine, void* panel, const char* script, const
     g_OrigRunScript(engine, panel, script, path, lineCol);
     if (t_inOurScript || !panel) return;
     ULONGLONG now = GetTickCount64();
-    if (now - g_lastInject < 5000) return;
-    g_lastInject = now;
+    auto last = g_lastInject.find(panel);
+    if (last != g_lastInject.end() && now - last->second < 5000) return;
+    if (g_lastInject.size() > 4096) {
+        // panels come and go: forget the ones not seen for a while
+        for (auto it = g_lastInject.begin(); it != g_lastInject.end();)
+            it = now - it->second > 60000 ? g_lastInject.erase(it) : std::next(it);
+    }
+    g_lastInject[panel] = now;
     t_inOurScript = true;
     g_uiEngine = engine;
     g_injectPanel = panel;
@@ -1933,6 +1983,7 @@ static void SetLocalHero(const char* v) {
     g_heroUnit = bar ? std::string(bar + 1) : std::string();
     while (!g_heroUnit.empty() && (g_heroUnit.back() == '\n' || g_heroUnit.back() == '\r' || g_heroUnit.back() == ' '))
         g_heroUnit.pop_back();
+    Log("[*] Your hero: %s (entity %d)", g_heroUnit.c_str(), g_heroIndex);
 }
 
 static void StartTaunt() {
