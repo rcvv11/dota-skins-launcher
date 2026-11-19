@@ -36,6 +36,12 @@ fn run(ctx: egui::Context) {
     }
     // the game's item table, parsed in advance: the first pick is fast too
     crate::gamedata::warm_up(config::load_config().dota_path);
+    // and every item's glows and colourings, read with Source2Viewer-CLI once (a pick
+    // of a new item otherwise waited ~2 s for those reads)
+    if let Some(cli) = crate::preview::find_cli(&config::load_config().vrf_cli_path) {
+        let all: Vec<&Skin> = catalog.skins.iter().collect();
+        crate::glow::warm_up(config::load_config().dota_path, cli, crate::visuals::hero_items(&all));
+    }
     let mut enabled = config::load_config().memory_swap;
     let mut slow_check = Instant::now();
     let mut equips_mtime: Option<SystemTime> = None;

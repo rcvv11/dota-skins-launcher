@@ -58,6 +58,16 @@ fn cfg_text() -> String {
     )
 }
 
+/// Takes the launcher's GSI config out of the game folder again.
+pub fn remove_cfg(game_dir: &Path) -> Result<(), String> {
+    let file = game_dir.join("cfg").join("gamestate_integration").join(CFG_NAME);
+    match std::fs::remove_file(&file) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("{}: {e}", file.display())),
+    }
+}
+
 /// Writes the GSI config into `<Dota>/game/dota/cfg/gamestate_integration/`.
 /// Returns true when the file was created or updated.
 pub fn install_cfg(game_dir: &Path) -> Result<bool, String> {

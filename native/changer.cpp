@@ -102,10 +102,13 @@ static void AddRule(Rules& rules, const std::string& from, const std::string& to
     }
 }
 
-static void QueuePreloads(const Rules& rules);
+static void QueuePreloads(const Rules& rules, const std::set<std::string>& extra);
 // Item glows for a match (lines glow|npc|particle|cp:type:attachment;...):
 // a JS array the interface script gets through DSLSetGlows
 static std::string g_glowsJs = "[]";
+// Item models the glows hang on (the 5th field of glow lines), with every model the
+// swap table turns into one of them: model in the game -> the item model
+static std::unordered_map<std::string, std::string> g_itemModels;
 // Items for empty slots the running Dota has not read yet (line
 // restart|name\tname): their button says «after restart»
 static std::string g_restartJs = "[]";
@@ -139,7 +142,9 @@ static std::vector<std::string> Split(const std::string& s, char sep) {
     }
 }
 
-// glow|npc|particle|cp:type:attachment;... -> {npc:"",fx:"",cps:[[cp,"type","att"],...]}
+// glow|npc|particle|cp:type:attachment;...|item model|part,part ->
+// {npc:"",fx:"",cps:[[cp,"type","att"],...],item:"",parts:["",...]}
+// (the effect hangs on the item model when it is found, else its parts on the hero)
 static std::string GlowJs(const std::string& line) {
     auto f = Split(line, '|');
     if (f.size() < 4) return std::string();
@@ -150,7 +155,15 @@ static std::string GlowJs(const std::string& line) {
         if (!cps.empty()) cps += ",";
         cps += "[" + std::to_string(atoi(p[0].c_str())) + "," + JsString(p[1]) + "," + JsString(p[2]) + "]";
     }
-    return "{npc:" + JsString(f[1]) + ",fx:" + JsString(f[2]) + ",cps:[" + cps + "]}";
+    std::string js = "{npc:" + JsString(f[1]) + ",fx:" + JsString(f[2]) + ",cps:[" + cps + "]";
+    if (f.size() > 4 && !f[4].empty()) js += ",item:" + JsString(Normalize(f[4]));
+    if (f.size() > 5) {
+        std::string parts;
+        for (auto& p : Split(f[5], ','))
+            if (!p.empty()) parts += (parts.empty() ? "" : ",") + JsString(p);
+        js += ",parts:[" + parts + "]";
+    }
+    return js + "}";
 }
 static volatile LONG g_refreshPending = 0;  // the config changed: refresh the preview after preloading
 
@@ -161,6 +174,8 @@ static bool LoadConfig(const std::string& path) {
     std::string line, glows, restart;
     std::map<std::string, std::string> taunts;
     std::map<std::string, std::string> slots;  // HERO -> "CAPTION":[item,style],...
+    std::set<std::string> itemKeys;            // item models the glows hang on
+    std::set<std::string> glowFiles;           // the glows' effects (preloaded)
     std::string lang = "ru";
     while (std::getline(file, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
@@ -177,10 +192,12 @@ static bool LoadConfig(const std::string& path) {
                 s = e + 1;
             }
             if (f.size() >= 3) {
+                // slotdef|HERO|CAPTION|item|style|icon|rarity -> CAPTION: [item, style, icon, rarity]
                 std::string& entry = slots[f[0]];
                 entry += (entry.empty() ? "" : ",") + JsString(f[1]) + ":[" + std::to_string(atoi(f[2].c_str())) + "," +
                          std::to_string(f.size() > 3 ? atoi(f[3].c_str()) : 0) + "," +
-                         JsString(f.size() > 4 ? f[4] : std::string()) + "]";
+                         JsString(f.size() > 4 ? f[4] : std::string()) + "," +
+                         JsString(f.size() > 5 ? f[5] : std::string()) + "]";
             }
             continue;
         }
@@ -202,11 +219,25 @@ static bool LoadConfig(const std::string& path) {
         if (line.compare(0, 5, "glow|") == 0) {
             std::string g = GlowJs(line);
             if (!g.empty()) glows += (glows.empty() ? "" : ",") + g;
+            auto f = Split(line, '|');
+            if (f.size() > 4 && !f[4].empty()) itemKeys.insert(Normalize(f[4]));
+            // the effects the script creates itself, loaded in the menu beforehand: a
+            // regular match loads nothing on demand (red crosses instead of them)
+            if (f.size() > 2 && !f[2].empty()) glowFiles.insert(Normalize(f[2]));
+            if (f.size() > 5)
+                for (auto& part : Split(f[5], ','))
+                    if (!part.empty()) glowFiles.insert(Normalize(part));
             continue;
         }
         size_t pos = line.find('|');
         if (pos != std::string::npos) AddRule(*fresh, line.substr(0, pos), line.substr(pos + 1));
     }
+    // an item model is worn under any model the swap table turns into it (the
+    // slot's default one, the player's own item)
+    std::unordered_map<std::string, std::string> itemModels;
+    for (auto& k : itemKeys) itemModels[k] = k;
+    for (auto& r : fresh->replacements)
+        if (itemKeys.count(r.second)) itemModels.emplace(r.first, r.second);
     AcquireSRWLockExclusive(&g_rulesLock);
     g_lang = (lang == "en") ? "en" : "ru";
     Rules* old = g_rules;
@@ -214,6 +245,7 @@ static bool LoadConfig(const std::string& path) {
     ReleaseSRWLockExclusive(&g_rulesLock);
     AcquireSRWLockExclusive(&g_glowsLock);
     g_glowsJs = "[" + glows + "]";
+    g_itemModels.swap(itemModels);
     g_restartJs = "[" + restart + "]";
     {
         std::string js = "{";
@@ -229,7 +261,7 @@ static bool LoadConfig(const std::string& path) {
     if (!first) InterlockedExchange(&g_refreshPending, 1);
     first = false;
     delete old;
-    QueuePreloads(*fresh);
+    QueuePreloads(*fresh, glowFiles);
     Log("[+] Config %s: %zu replacements, %zu hidden folders",
         path.c_str(), fresh->replacements.size(), fresh->hiddenPrefixes.size());
     return true;
@@ -351,12 +383,14 @@ static bool IsSwappableResource(const char* name) {
                        _stricmp(name + len - 5, ".vmat") == 0);
 }
 
-static void QueuePreloads(const Rules& rules) {
+static void QueuePreloads(const Rules& rules, const std::set<std::string>& extra) {
     AcquireSRWLockExclusive(&g_preloadLock);
     for (auto& r : rules.replacements) {
         const std::string& t = r.second;
         if (IsSwappableResource(t.c_str()) && !g_resident.count(t)) g_preloadQueue.insert(t);
     }
+    for (auto& t : extra)
+        if (IsSwappableResource(t.c_str()) && !g_resident.count(t)) g_preloadQueue.insert(t);
     ReleaseSRWLockExclusive(&g_preloadLock);
 }
 
@@ -388,11 +422,12 @@ static bool IsResident(const std::string& model) {
 }
 
 // Interface thread (script tick): loads a few replacements per tick, synchronously
-static void RunPreloads() {
+static void RunPreloads(ULONGLONG budget = 30) {
     if (!g_SetResourceName || !g_BlockingLoad || !g_ResourceSystem) return;
     // as many as fit in ~30 ms of a tick (a tick every 50 ms): a set loads in a fraction of a second
+    // (less in a match: a blocking load there is a hitch)
     ULONGLONG start = GetTickCount64();
-    while (GetTickCount64() - start < 30) {
+    while (GetTickCount64() - start < budget) {
         std::string model;
         AcquireSRWLockExclusive(&g_preloadLock);
         if (!g_preloadQueue.empty()) {
@@ -432,7 +467,11 @@ static void* HookedFindOrRegister(void* rs, ResourceName* name, uintptr_t flag) 
         const char* cur = BufStr_Get(name);
         size_t len = strlen(cur);
         std::string repl;
-        if (len > 5 && IsSwappableResource(cur) && FindReplacementFile(cur, repl) && IsResident(repl)) {
+        // not effects in a match: a regular match gives only what its manifest holds, and
+        // an item's effect asked for by its own name came back as the error effect (red
+        // crosses); its data is swapped in by InitForFileRead under the original name anyway
+        bool effect = len > 5 && _stricmp(cur + len - 5, ".vpcf") == 0;
+        if (len > 5 && IsSwappableResource(cur) && !(effect && !g_inMenu) && FindReplacementFile(cur, repl) && IsResident(repl)) {
             ResourceName other;
             if (g_SetResourceName(&other, repl.c_str())) {
                 void* r = g_OrigFindOrRegister(rs, &other, flag);
@@ -550,6 +589,11 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
   var hb = parseFloat(root.GetAttributeString("dsl_hb", "0")) || 0;
   if (Date.now() - hb < 2000) return;
   root.SetAttributeString("dsl_loop", me);
+  // The menu (dashboard) and the match HUD are separate panel trees, each with a loop
+  // of its own: the DLL sends each loop what it needs. (Once the HUD loop took every
+  // call, the menu loop never got the slot icons or the model refresh again.)
+  var loopKind = (root.paneltype === "DOTADashboard" || root.FindChildTraverse("DashboardCore") ||
+              root.FindChildrenWithClassTraverse("DashboardPage").length > 0 || /dashboard/i.test(root.id || "")) ? "dash" : "hud";
   var last = "";
   var lastMenu = null;
   var lastHero = "";
@@ -735,8 +779,10 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
         } catch (e12) { $.Msg("DSL_LOG persona error " + e12); }
       }
       // item glows: on your own hero in a match, on the hero models in the menu
-      $.Msg("DSL_GTICK");
-      DSLGlowTick(inMenu);
+      $.Msg("DSL_GTICK " + loopKind);
+      // glows from one loop: the menu's in the menu, the HUD's in a match (the other one
+      // forgets its effects: their models go away with the map change)
+      if ((loopKind === "dash") === inMenu) DSLGlowTick(inMenu); else DSLForgetGlows();
       if (inMenu) DSLSlotTick();
       var log = types.filter(function (t) { return t.indexOf("DOTA") !== 0; }).join(", ");
       if (log && log !== last) { last = log; $.Msg("DSL_LOG " + log); }
@@ -825,7 +871,7 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
   // --- the preset's items in the hero page's slot tiles ---
   // A tile (DOTAHeroSlotItemPicker[Loadout]: Header > SlotName, SlotEconItem) is known
   // by its slot caption; the hero by the page's hero name. The DLL gives
-  // {HERO: {CAPTION: [item, style]}}; the tile's econ item is set to that item.
+  // {HERO: {CAPTION: [item, style, icon, rarity]}}; the tile shows that item.
   var slotMap = {}, pendingSlots = null, slotForceNext = false, slotHero = "", slotErr = false;
   // Leaving or entering the wardrobe makes the game fill the tiles with the real
   // loadout again, in the same panels (nothing to notice on them): a change of the
@@ -842,11 +888,12 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
     if (key === slotView) return;
     slotView = key;
     slotViewPending = true;
+    slotWatch(800);
     $.Schedule(0.05, function () { slotViewPending = false; slotRepair(); DSLSlotTick(); });
   }
-  // called right after the game redrew the slot tiles (our loadout refresh)
-  // right after the game redrew the tiles (our loadout refresh): once, at once
-  DSLSlotRedrawn = function () { slotRepair(); };
+  // right after we asked the game to redraw the tiles (our model refresh): it does
+  // so a frame or two later, so the tiles are watched on every frame for a moment
+  DSLSlotRedrawn = function () { slotWatch(800); };
   DSLSetSlots = function (m) {
     pendingSlots = m || {};
     $.Schedule(0, function () { DSLSlotTick(); });
@@ -861,16 +908,100 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
     }
     return "";
   }
-  // Is the tile showing our item still? The game re-creates the econ item's
-  // image (EconItemIcon) when it sets its own item: our mark on it is then gone.
-  function slotShows(econ, def) {
-    var img = econ.FindChildTraverse("EconItemIcon");
-    return econ.GetAttributeInt("dsl_def", 0) === def && (!img || img.GetAttributeInt("dsl_def", 0) === def);
+  // Our item in a tile. Dota's econ item is set to it once (its tooltip, its style);
+  // our icon lies on Dota's image as a panel of our own, the default item's grey wash
+  // is cancelled and the rarity strip coloured, as inline styles. Dota redrawing the
+  // tile with the real loadout (after every model refresh, a frame or two later)
+  // then shows nothing: that redraw showing through, and the reload of the image when
+  // the item was set again, were the flicker.
+  var kRarityColors = { common: "#b0c3d9", uncommon: "#5e98d9", rare: "#4b69ff", mythical: "#8847ff",
+    legendary: "#d32ce6", ancient: "#eb4b4b", immortal: "#e4ae39", arcana: "#ade55c", seasonal: "#fff34f" };
+  function slotDress(econ, m) {
+    if (econ.GetAttributeString("dsl_dressed", "") !== "1") {
+      econ.SetAttributeString("dsl_dressed", "1");
+      // what the game's .IsDefaultItem changes (saturation 0, a blue wash)
+      econ.style.saturation = "1";
+      econ.style.washColor = "none";
+    }
+    var color = kRarityColors[m[3]];
+    var bottom = econ.FindChild("BottomLayer");
+    if (bottom && color && bottom.GetAttributeString("dsl_color", "") !== color) {
+      bottom.style.backgroundColor = color;
+      bottom.SetAttributeString("dsl_color", color);
+    }
+    var icon = m[2];
+    if (!icon) return;  // an item in a style: its own icon, Dota's image is left
+    var img = econ.FindChild("EconItemIcon");
+    var ov = econ.FindChild("DSLSlotIcon");
+    if (!ov) {
+      // as Dota's own image (#EconItemIcon in ui_econ_item.css)
+      ov = $.CreatePanel("Image", econ, "DSLSlotIcon");
+      ov.hittest = false;
+      ov.SetScaling("stretch-to-cover-preserve-aspect");
+      ov.style.width = "100%";
+      ov.style.height = "100%";
+      ov.style.horizontalAlign = "center";
+      ov.style.marginBottom = "2px";
+      ov.style.saturation = "0.7";
+    }
+    if (ov.GetAttributeString("dsl_icon", "") !== icon) {
+      ov.SetImage(icon);
+      ov.SetAttributeString("dsl_icon", icon);
+    }
+    if (!ov.visible) ov.visible = true;
+    // right over Dota's image: under the border, the style switch and the badges
+    // (kept there: an image Dota rebuilds may come after ours)
+    if (img) {
+      var indexed = typeof econ.GetChildIndex === "function";
+      if (indexed ? econ.GetChildIndex(ov) !== econ.GetChildIndex(img) + 1 : ov.GetAttributeString("dsl_moved", "") !== "1") {
+        econ.MoveChildAfter(ov, img);
+        ov.SetAttributeString("dsl_moved", "1");
+      }
+    }
   }
-  // the tiles of the visible page with our item: their icons are put back on every
-  // fast tick (50 ms) and right after the game redrew them, with SetImage (the
-  // same path again changes nothing: no blink)
+  // the tile shows the game's own item again (our image is hidden, not deleted: a
+  // deletion lands a frame later, after the next hero's icon may have reused it)
+  function slotUndress(econ) {
+    if (!econ || !econ.IsValid()) return;
+    var ov = econ.FindChild("DSLSlotIcon");
+    if (ov) ov.visible = false;
+    if (econ.GetAttributeString("dsl_dressed", "") === "1") {
+      econ.style.saturation = null;
+      econ.style.washColor = null;
+      econ.SetAttributeString("dsl_dressed", "");
+    }
+    var bottom = econ.FindChild("BottomLayer");
+    if (bottom && bottom.GetAttributeString("dsl_color", "")) {
+      bottom.style.backgroundColor = null;
+      bottom.SetAttributeString("dsl_color", "");
+    }
+    econ.SetAttributeInt("dsl_def", 0);
+  }
+  // Dota's econ item only when the item changes (setting it reloads the image)
+  function slotSet(econ, m) {
+    if (econ.GetAttributeInt("dsl_def", 0) !== m[0]) {
+      if (m[1] > 0 && econ.SetItemByDefinitionAndStyle) econ.SetItemByDefinitionAndStyle(m[0], m[1]);
+      else econ.SetItemByDefinition(m[0]);
+      econ.SetAttributeInt("dsl_def", m[0]);
+    }
+    slotDress(econ, m);
+  }
+  // the tiles of the visible page with our item: kept dressed on every fast tick
+  // (50 ms), and on every frame for a moment after the game redraws them (our model
+  // refresh, a pick, the wardrobe opening): a redraw that rebuilt the tile's panels
+  // is covered again within a frame
   var slotTiles = [], slotTilesHero = "", slotHeroLabel = null;
+  var slotWatchUntil = 0, slotWatching = false;
+  function slotWatch(ms) {
+    slotWatchUntil = Math.max(slotWatchUntil, Date.now() + ms);
+    if (slotWatching) return;
+    slotWatching = true;
+    (function frame() {
+      slotRepair();
+      if (Date.now() < slotWatchUntil) $.Schedule(0, frame);
+      else slotWatching = false;
+    })();
+  }
   // Another hero on the page: the game reuses the same tiles for that hero's
   // items, so the old hero's tiles are dropped at once (the repair must not put
   // them back), and the game is asked to redraw the page if we had changed it.
@@ -879,6 +1010,8 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
     var name = slotHeroLabel.text;
     if (name === slotTilesHero) return;
     var had = slotTiles.length > 0;
+    // the same panels show the new hero's items: ours come off them
+    for (var i = 0; i < slotTiles.length; i++) slotUndress(slotTiles[i].econ);
     slotTiles = [];
     slotTilesHero = name;
     if (had) $.DispatchEvent("DOTALoadoutChanged");
@@ -887,25 +1020,14 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
   function slotRepair() {
     for (var i = 0; i < slotTiles.length; i++) {
       var s = slotTiles[i];
-      if (!s.icon || !s.econ.IsValid()) continue;
-      var img = s.econ.FindChildTraverse("EconItemIcon");
-      if (img) img.SetImage(s.icon);
-      // the game's own default item greys the tile (.IsDefaultItem: saturation 0)
-      if (s.econ.BHasClass("IsDefaultItem")) s.econ.RemoveClass("IsDefaultItem");
+      if (!s.econ.IsValid()) continue;
+      try { slotDress(s.econ, s.m); }
+      catch (e) { if (!slotErr) { slotErr = true; $.Msg("DSL_LOG slot icon error " + e); } }
     }
   }
-  function slotSet(econ, def, style) {
-    if (style > 0 && econ.SetItemByDefinitionAndStyle) econ.SetItemByDefinitionAndStyle(def, style);
-    else econ.SetItemByDefinition(def);
-    econ.SetAttributeInt("dsl_def", def);
-    if (econ.BHasClass("IsDefaultItem")) econ.RemoveClass("IsDefaultItem");
-    var img = econ.FindChildTraverse("EconItemIcon");
-    if (img) img.SetAttributeInt("dsl_def", def);
-  }
   DSLSlotTick = function () {
-    // Setting an icon reloads its image (a blink), so it is set only when needed:
-    // a new tile, a new pick, another hero, the game re-created the tile's image,
-    // or right after the game redrew the tiles (our loadout refresh: DSLSlotRedrawn)
+    // Dota's econ item is set only when the tile's item changes (a new tile, a new
+    // pick, another hero); our icon and colours are kept on the tile all the time
     var force = slotForceNext;
     slotForceNext = false;
     if (pendingSlots) { slotMap = pendingSlots; pendingSlots = null; force = true; }
@@ -942,37 +1064,43 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
         if (q.id === "EquippedSetSlotsContainer") rows.push(q);
         for (var c = 0; c < q.GetChildCount(); c++) stack.push(q.GetChild(c));
       }
-      var set = 0, rowSet = 0;
-      for (var k = 0; hero && k < labels.length; k++) {
+      // a tile with no item of ours (left the preset) shows the game's own again
+      for (var k = 0; k < labels.length; k++) {
         var tile = labels[k].GetParent() ? labels[k].GetParent().GetParent() : null;
         var econ = tile ? tile.FindChildTraverse("SlotEconItem") : null;
-        var m = hero[slotKey(labels[k].text)];
-        if (!econ || !m) continue;
-        shown.push({ econ: econ, icon: m[2] });
-        if (slotShows(econ, m[0])) continue;
-        try { slotSet(econ, m[0], m[1]); set++; }
+        if (!econ) continue;
+        var m = hero ? hero[slotKey(labels[k].text)] : null;
+        if (!m) {
+          if (econ.GetAttributeInt("dsl_def", 0)) slotUndress(econ);
+          continue;
+        }
+        shown.push({ econ: econ, m: m });
+        try { slotSet(econ, m); }
         catch (e) { if (!slotErr) { slotErr = true; $.Msg("DSL_LOG slot icon error " + e); } }
       }
       // the "equipped" row: DOTAEconItem tiles without captions, in the hero
       // script's slot order (only when the count matches, e.g. not with a persona)
-      var rowInfo = [];
-      for (var w = 0; hero && hero["#LEN"] && w < rows.length; w++) {
+      for (var w = 0; w < rows.length; w++) {
         var tiles = [];
         for (var c2 = 0; c2 < rows[w].GetChildCount(); c2++)
           if (rows[w].GetChild(c2).paneltype === "DOTAEconItem") tiles.push(rows[w].GetChild(c2));
-        rowInfo.push((rows[w].visible ? "visible " : "hidden ") + tiles.length);
-        if (tiles.length !== hero["#LEN"][0]) continue;
+        var fits = !!(hero && hero["#LEN"] && tiles.length === hero["#LEN"][0]);
         for (var r = 0; r < tiles.length; r++) {
-          var mr = hero["#" + r];
-          if (mr) shown.push({ econ: tiles[r], icon: mr[2] });
-          if (!mr || slotShows(tiles[r], mr[0])) continue;
-          try { slotSet(tiles[r], mr[0], mr[1]); rowSet++; }
+          var mr = fits ? hero["#" + r] : null;
+          if (!mr) {
+            if (tiles[r].GetAttributeInt("dsl_def", 0)) slotUndress(tiles[r]);
+            continue;
+          }
+          shown.push({ econ: tiles[r], m: mr });
+          try { slotSet(tiles[r], mr); }
           catch (e5) { if (!slotErr) { slotErr = true; $.Msg("DSL_LOG slot icon error " + e5); } }
         }
       }
     }
     slotTiles = shown;
     slotTilesHero = slotHeroLabel && slotHeroLabel.IsValid() ? slotHeroLabel.text : "";
+    // Dota fills a new or re-picked tile a frame or two later: covered right away
+    if (force && shown.length) slotWatch(800);
   };
   // hover over a card (like Dota's .Container:hover): the button instead of the status line
   var hoverItems = [];
@@ -1007,7 +1135,7 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
       sd.style.fontSize = later ? "14px" : "18px";
     }
     // a frequent tick for the DLL (in the menu): preloading and model refresh without waiting
-    if (lastMenu !== null && root.IsValid() && root.GetAttributeString("dsl_loop", "") === me) $.Msg("DSL_TICK");
+    if (lastMenu !== null && root.IsValid() && root.GetAttributeString("dsl_loop", "") === me) $.Msg("DSL_TICK " + loopKind);
     if (lastMenu) { slotHeroTick(); slotViewTick(); slotRepair(); }
     $.Schedule(0.05, hoverTick);
   }
@@ -1023,14 +1151,34 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
   // --- Item glows in a match ---
   // Effects an item creates by itself (particle_create), which no file swap can place:
   // create them on your own hero with the attachments from the effect's file. The DLL gives the list.
-  var glowList = [], glowFx = {};  // key "entity|effect" -> effect index
+  var glowList = [], glowFx = {};  // key "entity|effect" -> {p: effect index, ent, handle}
+  // The item models the DLL found for the glows (the wearable the game hangs an item's
+  // effects on): item model -> [[entity, handle, parent entity, owner entity], ...]
+  var itemHosts = {};
+  DSLSetItemHosts = function (m) { itemHosts = m || {}; };
+  function hostListed(handle) {
+    for (var m in itemHosts) {
+      var l = itemHosts[m];
+      for (var i = 0; i < l.length; i++) if (l[i][1] === handle) return true;
+    }
+    return false;
+  }
+  // The target hero's own item model for a glow, or null.
+  function hostOf(gl, ent) {
+    var l = gl.item ? itemHosts[gl.item] : null;
+    for (var i = 0; l && i < l.length; i++) {
+      if ((l[i][2] === ent || l[i][3] === ent) && Entities.IsValidEntity(l[i][0])) return l[i];
+    }
+    return null;
+  }
   // An effect is removed through the API only while its entity is alive: when a map loads
   // («Try out»), the menu models are deleted, and a call on a dead entity crashes the game.
-  // The game removes a deleted entity's effects itself: they are just forgotten.
+  // The game removes a deleted entity's effects itself: they are just forgotten. (An item
+  // model lives while the DLL lists its handle: its index may belong to a new entity.)
   function dropGlow(k) {
-    var ent = parseInt(k, 10);
-    if (Entities.IsValidEntity(ent)) {
-      try { Particles.DestroyParticleEffect(glowFx[k], false); Particles.ReleaseParticleIndex(glowFx[k]); } catch (e6) {}
+    var g = glowFx[k];
+    if (g && Entities.IsValidEntity(g.ent) && (g.handle < 0 || hostListed(g.handle))) {
+      try { Particles.DestroyParticleEffect(g.p, false); Particles.ReleaseParticleIndex(g.p); } catch (e6) {}
     }
     delete glowFx[k];
   }
@@ -1038,6 +1186,10 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
     for (var k in glowFx) dropGlow(k);
     glowFx = {};
   };
+  // the other loop shows the glows now: ours are left to the game (it removes them with
+  // their models; a call on a removed model's effect crashes it)
+  DSLForgetGlows = function () { glowFx = {}; };
+  var glowHostLogged = {};
   // The DLL calls this from inside another JS call: only remember the list here,
   // the regular tick changes the effects (otherwise the game crashes if a model is being rebuilt)
   var pendingGlows = null;
@@ -1050,6 +1202,7 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
       DSLClearGlows();
       glowList = pendingGlows;
       pendingGlows = null;
+      glowHostLogged = {};
       $.Msg("DSL_LOG glows: " + glowList.length);
       return;  // new effects on the next tick
     }
@@ -1077,17 +1230,36 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
         for (var g = 0; g < glowList.length; g++) {
           var gl = glowList[g];
           if (gl.npc !== name) continue;
-          var key = ent + "|" + gl.fx;
-          alive[key] = true;
-          if (key in glowFx) continue;
-          var p = Particles.CreateParticle(gl.fx, ParticleAttachment_t.PATTACH_CUSTOMORIGIN, ent);
-          for (var c = 0; c < gl.cps.length; c++) {
-            var cp = gl.cps[c];
-            var kind = ParticleAttachment_t[cp[1]];
-            if (kind === undefined) kind = ParticleAttachment_t.PATTACH_ABSORIGIN_FOLLOW;
-            Particles.SetParticleControlEnt(p, cp[0], ent, kind, cp[2], [0, 0, 0], true);
+          // on the item's own model when the DLL found it: the whole effect, as the game
+          // creates it (a snapshot skinned to the item's bones, like Twilight Schism's blade
+          // outline, needs that skeleton); else on the hero, without such parts (on the
+          // hero's skeleton they landed on its body)
+          var host = hostOf(gl, ent);
+          var on = host ? host[0] : ent;
+          var fxs = host ? [gl.fx] : (gl.parts || [gl.fx]);
+          for (var f = 0; f < fxs.length; f++) {
+            var key = (host ? "h" + host[1] : ent) + "|" + fxs[f];
+            alive[key] = true;
+            if (key in glowFx) continue;
+            var p = Particles.CreateParticle(fxs[f], ParticleAttachment_t.PATTACH_CUSTOMORIGIN, on);
+            for (var c = 0; c < gl.cps.length; c++) {
+              var cp = gl.cps[c];
+              // a world-origin point is a value (its offset), not a place on the model
+              if (cp[1] === "PATTACH_WORLDORIGIN") {
+                var v = ("" + cp[2]).split(",").map(parseFloat);
+                if (v.length !== 3 || isNaN(v[0]) || isNaN(v[1]) || isNaN(v[2])) v = [0, 0, 0];
+                Particles.SetParticleControl(p, cp[0], v);
+                continue;
+              }
+              var kind = ParticleAttachment_t[cp[1]];
+              if (kind === undefined) kind = ParticleAttachment_t.PATTACH_ABSORIGIN_FOLLOW;
+              Particles.SetParticleControlEnt(p, cp[0], on, kind, cp[2], [0, 0, 0], true);
+            }
+            glowFx[key] = { p: p, ent: on, handle: host ? host[1] : -1 };
+            // once per glow and place (the wardrobe's cards re-create their models often)
+            var where = (host ? "item model" : "hero") + "|" + fxs[f];
+            if (!glowHostLogged[where]) { glowHostLogged[where] = true; $.Msg("DSL_LOG glow " + fxs[f] + " on the " + (host ? "item model" : "hero")); }
           }
-          glowFx[key] = p;
         }
       }
     }
@@ -1095,8 +1267,8 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
       if (!alive[k]) dropGlow(k);
     }
   };
-  $.Msg("DSL_LOOP");
-  $.Msg("DSL_LOG loop started in " + ctx.id);
+  $.Msg("DSL_LOOP " + loopKind);
+  $.Msg("DSL_LOG loop started in " + ctx.id + " (" + loopKind + ", root " + root.id + ")");
   // called by the DLL when the replacements are loaded: rebuild the hero model
   DSLRefresh = function () {
     var pages = root.FindChildrenWithClassTraverse("DashboardPage");
@@ -1120,6 +1292,8 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
       }
       if (tryOn) $.DispatchEvent("Activated", revert, "mouse");
       var redrawn = function () { if (typeof DSLSlotRedrawn === "function") DSLSlotRedrawn(); };
+      // «REVERT» redraws the open slot's tiles too
+      if (tryOn) redrawn();
       $.Schedule(tryOn ? 0.15 : 0, function () { $.DispatchEvent("DOTALoadoutChanged"); redrawn(); });
       // «REVERT» rebuilds the model asynchronously and may override the first refresh: repeat;
       // after a set try-on Dota brings back the old model from its cache later: once more after 2 s
@@ -1128,6 +1302,7 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
       $.Msg("DSL_LOG refresh: loadout changed (revert " + (revert ? (shown ? "shown" : "hidden") : "none") + ", controls " + (controls ? (controls.visible ? "shown" : "hidden") : "none") + ")");
       return;
     }
+    $.Msg("DSL_LOG refresh: no hero page open (" + loopKind + " loop)");
   };
   tick();
 })();
@@ -1151,26 +1326,30 @@ static void RecordPick(const char* payload) {
 
 static void* g_uiEngine = nullptr;
 static void* g_injectPanel = nullptr;  // panel of the current script injection
-static void* g_loopPanel = nullptr;    // context of the script's live loop
+// The script's live loops: the menu's (dashboard) and the match HUD's. They are separate
+// panel trees: menu pages (slot tiles, the hero model) are reached from the menu's only.
+enum LoopKind { kDash = 0, kHud = 1 };
+static const char* const kLoopNames[] = {"dash", "hud"};
+static void* g_loopPanels[2] = {nullptr, nullptr};
 
-// Interface thread, from the script tick: replacements loaded, ask the script to redraw the model
-// Interface thread, from the script tick: a new glow table -> DSLSetGlows
-static LONG g_glowsSent = -1;
-static void MaybeSendGlows() {
+// Interface thread, from a loop's tick: a new glow table -> DSLSetGlows (each loop gets it)
+static LONG g_glowsSent[2] = {-1, -1};
+static void MaybeSendGlows(int kind) {
     LONG v = g_glowsVersion;
-    if (v == g_glowsSent || !g_uiEngine || !g_loopPanel || !g_OrigRunScript) return;
-    g_glowsSent = v;
+    void* panel = g_loopPanels[kind];
+    if (v == g_glowsSent[kind] || !g_uiEngine || !panel || !g_OrigRunScript) return;
+    g_glowsSent[kind] = v;
     AcquireSRWLockShared(&g_glowsLock);
     std::string script = "if (typeof DSLSetGlows === 'function') DSLSetGlows(" + g_glowsJs + ");"
                          "if (typeof DSLSetRestart === 'function') DSLSetRestart(" + g_restartJs + ");"
                          "if (typeof DSLSetSlots === 'function') DSLSetSlots(" + g_slotsJs + ");";
     ReleaseSRWLockShared(&g_glowsLock);
-    Log("[*] Sending item glows to the game UI");
+    Log("[*] Sending item glows to the game UI (%s)", kLoopNames[kind]);
     t_inOurScript = true;
-    // a new name every time: Panorama keeps a compiled script by its name, and the
-    // same name ran the first table's script again (the slot icons stayed old)
-    std::string name = "dota_skins_table_" + std::to_string(v) + ".js";
-    g_OrigRunScript(g_uiEngine, g_loopPanel, script.c_str(), name.c_str(), 0);
+    // a new name every time (and per loop): Panorama keeps a compiled script by its name,
+    // and the same name ran the first table's script again (the slot icons stayed old)
+    std::string name = std::string("dota_skins_table_") + kLoopNames[kind] + "_" + std::to_string(v) + ".js";
+    g_OrigRunScript(g_uiEngine, panel, script.c_str(), name.c_str(), 0);
     t_inOurScript = false;
 }
 
@@ -1184,8 +1363,10 @@ static void MaybeRefreshPreview() {
         lastLog = GetTickCount64();
     }
     // 1: the config changed; 2: the model is rebuilt already, waiting for the effects
+    // (the hero page is the menu loop's: called from its ticks only)
     static bool modelsRefreshed = false;
-    if (!g_refreshPending || !g_uiEngine || !g_loopPanel || !g_OrigRunScript) return;
+    void* panel = g_loopPanels[kDash];
+    if (!g_refreshPending || !g_uiEngine || !panel || !g_OrigRunScript) return;
     if (InterlockedCompareExchange(&g_refreshPending, 1, 1) == 1 && modelsRefreshed) modelsRefreshed = false;
     bool all = PreloadsDone();
     if (!all && (modelsRefreshed || !ModelsDone())) return;
@@ -1197,8 +1378,10 @@ static void MaybeRefreshPreview() {
         modelsRefreshed = true;
         Log("[*] Models loaded, refreshing preview (effects still loading)");
     }
+    static int refreshes = 0;
+    std::string name = "dota_skins_refresh_" + std::to_string(++refreshes) + ".js";
     t_inOurScript = true;
-    g_OrigRunScript(g_uiEngine, g_loopPanel, "if (typeof DSLRefresh === 'function') DSLRefresh();", "dota_skins_refresh.js", 0);
+    g_OrigRunScript(g_uiEngine, panel, "if (typeof DSLRefresh === 'function') DSLRefresh();", name.c_str(), 0);
     t_inOurScript = false;
 }
 
@@ -1511,6 +1694,238 @@ static void* EntityByIndex(int index) {
     return *(void**)e;
 }
 
+// --- Item models in the world (the glows hang on them, as the game hangs them) ---
+// An item's effect is created by the game on the item's own model (its wearable):
+// a particle skinning a model snapshot to the item's bones (Twilight Schism's blade
+// outline: `blade_02_JNT`) needs that skeleton. The DLL finds the wearables whose
+// model is a glow's item model (or a model the swap table turns into it) and gives
+// the interface script their entity indices with the hero they hang on.
+//
+// Field offsets come from the schema data client.dll carries for its classes, so they
+// follow game updates: a class description is {name, …, size (+0x18, int32), field
+// count (+0x1C, int16), …, fields (+0x28)}, a field {name, type, offset (+0x10)} in
+// 0x20 bytes.
+struct ItemHostOffsets {
+    int body = -1, sceneNode = -1, skeleton = -1, modelState = -1, modelName = -1, modelHandle = -1;
+    int parent = -1, owner = -1, entity = -1, ownerEntity = -1;
+};
+static ItemHostOffsets g_ih;
+static volatile LONG g_itemHostsReady = 0;
+
+struct SchemaField { const char* cls; const char* field; int* out; };
+
+static void ReadSchemaOffsets(const Section& rdata, const Section& data, SchemaField* want, size_t n) {
+    const uint8_t *rlo = rdata.start, *rhi = rdata.start + rdata.size;
+    const uint8_t *dlo = data.start, *dhi = data.start + data.size;
+    for (size_t i = 0; i + 0x30 <= data.size; i += 8) {
+        const uint8_t* h = data.start + i;
+        const uint8_t* name = *(const uint8_t* const*)h;
+        if (name < rlo || name >= rhi) continue;
+        int32_t size = *(const int32_t*)(h + 0x18);
+        uint16_t count = *(const uint16_t*)(h + 0x1C);
+        const uint8_t* fields = *(const uint8_t* const*)(h + 0x28);
+        if (size <= 0 || size > 0x100000 || count == 0 || count > 4096) continue;
+        if (fields < dlo || fields + (size_t)count * 0x20 > dhi) continue;
+        for (size_t w = 0; w < n; w++) {
+            if (*want[w].out >= 0 || strcmp((const char*)name, want[w].cls) != 0) continue;
+            for (uint16_t f = 0; f < count; f++) {
+                const uint8_t* fname = *(const uint8_t* const*)(fields + f * 0x20);
+                if (fname >= rlo && fname < rhi && strcmp((const char*)fname, want[w].field) == 0) {
+                    *want[w].out = *(const int32_t*)(fields + f * 0x20 + 0x10);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// Off the interface thread: the scans take a moment and client.dll may still be loading.
+static DWORD WINAPI ResolveItemHosts(LPVOID) {
+    HMODULE cl = nullptr;
+    for (int i = 0; i < 6000 && !(cl = GetModuleHandleA("client.dll")); i++) Sleep(100);
+    Section text{}, rdata{}, data{};
+    if (!cl || !ModuleSection(cl, ".text", text) || !ModuleSection(cl, ".rdata", rdata) || !ModuleSection(cl, ".data", data)) {
+        Log("[-] Item models: client.dll sections not found");
+        return 1;
+    }
+    ItemHostOffsets o;
+    SchemaField want[] = {
+        {"C_BaseEntity", "m_CBodyComponent", &o.body},
+        {"C_BaseEntity", "m_hOwnerEntity", &o.ownerEntity},
+        {"CBodyComponent", "m_pSceneNode", &o.sceneNode},
+        {"CBodyComponentSkeletonInstance", "m_skeletonInstance", &o.skeleton},
+        {"CSkeletonInstance", "m_modelState", &o.modelState},
+        {"CModelState", "m_ModelName", &o.modelName},
+        {"CModelState", "m_hModel", &o.modelHandle},
+        {"CGameSceneNode", "m_pParent", &o.parent},
+        {"CGameSceneNode", "m_pOwner", &o.owner},
+        {"CEntityInstance", "m_pEntity", &o.entity},
+    };
+    ReadSchemaOffsets(rdata, data, want, sizeof(want) / sizeof(want[0]));
+    // the entity chunk list, as the taunts find it
+    void** list = g_entityList;
+    uint8_t* bind = list ? nullptr : FindRipRef(text, FindString(rdata, "C_PortraitWorldUnit_API::StartGestureOverride"));
+    for (uint8_t* p = bind; bind && p > bind - 0x200; p--) {
+        if (p[0] == 0x4C && p[1] == 0x8B && p[2] == 0x15) { list = (void**)(p + 7 + *(int32_t*)(p + 3)); break; }
+    }
+    bool ok = list && o.body >= 0 && o.ownerEntity >= 0 && o.sceneNode >= 0 && o.skeleton >= 0 && o.modelState >= 0 &&
+              o.modelName >= 0 && o.parent >= 0 && o.owner >= 0 && o.entity >= 0;
+    Log("[%c] Item models: entity list %p, body +0x%X, scene node +0x%X, skeleton +0x%X, model state +0x%X, "
+        "model name +0x%X, model +0x%X, parent +0x%X, node owner +0x%X, identity +0x%X, owner entity +0x%X",
+        ok ? '+' : '-', (void*)list, o.body, o.sceneNode, o.skeleton, o.modelState, o.modelName, o.modelHandle,
+        o.parent, o.owner, o.entity, o.ownerEntity);
+    if (!ok) return 1;
+    g_ih = o;
+    if (!g_entityList) g_entityList = list;
+    InterlockedExchange(&g_itemHostsReady, 1);
+    return 0;
+}
+
+static int EntityIndexOf(const uint8_t* ent) {
+    if (!ent) return -1;
+    const uint8_t* id = *(const uint8_t* const*)(ent + g_ih.entity);
+    return id ? (int)(*(const uint32_t*)(id + 0x10) & 0x7fff) : -1;
+}
+
+// Whether an object with a vtable is a `cls` (MSVC RTTI type name, ".?AVCSkeletonInstance@@")
+// or derives from it: the complete object locator before its vtable lists the class and
+// all its bases (x64: RVAs from the module base, which the locator gives as its own RVA).
+// Answers are kept per vtable: there are few.
+static bool IsA(const void* obj, const char* cls, std::unordered_map<const void*, bool>& seen) {
+    if (!obj || IsBadReadPtr(obj, 8)) return false;
+    const uint8_t* vt = *(const uint8_t* const*)obj;
+    auto it = seen.find(vt);
+    if (it != seen.end()) return it->second;
+    bool is = false;
+    const uint8_t* col = (vt && !IsBadReadPtr(vt - 8, 8)) ? *(const uint8_t* const*)(vt - 8) : nullptr;
+    if (col && !IsBadReadPtr(col, 0x18) && *(const uint32_t*)col == 1) {
+        const uint8_t* base = col - *(const int32_t*)(col + 0x14);
+        const uint8_t* hier = base + *(const int32_t*)(col + 0x10);
+        if (!IsBadReadPtr(hier, 0x10)) {
+            uint32_t n = *(const uint32_t*)(hier + 8);
+            const int32_t* bases = (const int32_t*)(base + *(const int32_t*)(hier + 0xC));
+            for (uint32_t i = 0; i < n && i < 64 && !IsBadReadPtr(bases + i, 4); i++) {
+                const uint8_t* bcd = base + bases[i];
+                if (IsBadReadPtr(bcd, 4)) break;
+                const char* name = (const char*)(base + *(const int32_t*)bcd + 0x10);
+                if (!IsBadReadPtr(name, 1) && strcmp(name, cls) == 0) { is = true; break; }
+            }
+        }
+    }
+    seen.emplace(vt, is);
+    return is;
+}
+
+// The model of a model entity, lower case without "_c"; empty for others. Its scene node
+// must be a skeleton (CSkeletonInstance): a point entity's plain scene node sits at the
+// same place in its body component, and is smaller (reading the model state past its
+// end crashed the game).
+static std::string ModelOf(const uint8_t* ent, const uint8_t** nodeOut) {
+    static std::unordered_map<const void*, bool> entities, skeletons;
+    if (!IsA(ent, ".?AVC_BaseEntity@@", entities)) return std::string();
+    const uint8_t* body = *(const uint8_t* const*)(ent + g_ih.body);
+    if (!body || IsBadReadPtr(body, g_ih.sceneNode + 8)) return std::string();
+    const uint8_t* node = *(const uint8_t* const*)(body + g_ih.sceneNode);
+    if (!node || node != body + g_ih.skeleton || !IsA(node, ".?AVCSkeletonInstance@@", skeletons)) return std::string();
+    *nodeOut = node;
+    // (no fallback to the model handle's resource name: asking the resource system
+    // for it with that handle crashed the game)
+    const char* name = *(const char* const*)(node + g_ih.modelState + g_ih.modelName);
+    if (!name || IsBadReadPtr(name, 1)) return std::string();
+    std::string model = Normalize(std::string(name, strnlen(name, 260)));
+    if (model.size() > 2 && model.compare(model.size() - 2, 2, "_c") == 0) model.resize(model.size() - 2);
+    return model;
+}
+
+// The item models of the glows in the world, as the script's table:
+// {"item model":[[entity,handle,parent,owner],…],…}
+static std::string ScanItemHosts() {
+    std::unordered_map<std::string, std::string> wanted;
+    AcquireSRWLockShared(&g_glowsLock);
+    wanted = g_itemModels;
+    ReleaseSRWLockShared(&g_glowsLock);
+    std::map<std::string, std::string> found;  // item model -> "[entity,handle,parent,owner],…"
+    std::string attached;                      // models on other entities (for the log)
+    int attachedCount = 0;
+    uint8_t** chunks = wanted.empty() ? nullptr : (uint8_t**)*g_entityList;
+    for (int c = 0; chunks && c < 64; c++) {
+        uint8_t* chunk = chunks[c];
+        if (!chunk) continue;
+        for (int i = 0; i < 512; i++) {
+            uint8_t* e = chunk + i * 0x70;
+            const uint8_t* ent = *(const uint8_t* const*)e;
+            uint32_t handle = *(const uint32_t*)(e + 0x10);
+            int index = c * 512 + i;
+            if (!ent || (int)(handle & 0x7fff) != index) continue;
+            const uint8_t* node = nullptr;
+            std::string model = ModelOf(ent, &node);
+            if (model.empty()) continue;
+            // the hero it hangs on: its scene node's parent (a wearable follows the
+            // hero's bones), and its owner entity
+            const uint8_t* parentNode = *(const uint8_t* const*)(node + g_ih.parent);
+            auto it = wanted.find(model);
+            if (it == wanted.end()) {
+                if (parentNode && attachedCount++ < 40) attached += " " + std::to_string(index) + ":" + model;
+                continue;
+            }
+            int parent = parentNode ? EntityIndexOf(*(const uint8_t* const*)(parentNode + g_ih.owner)) : -1;
+            uint32_t ownerHandle = *(const uint32_t*)(ent + g_ih.ownerEntity);
+            int owner = ownerHandle == 0xFFFFFFFF ? -1 : (int)(ownerHandle & 0x7fff);
+            std::string& s = found[it->second];
+            s += (s.empty() ? "" : ",") + ("[" + std::to_string(index) + "," + std::to_string(handle) + "," +
+                                          std::to_string(parent) + "," + std::to_string(owner) + "]");
+        }
+    }
+    // no item model in the world while models hang on heroes: say which ones (once per
+    // glow table), so a name the swap table does not know shows in the log
+    static LONG diagVersion = -1;
+    if (found.empty() && attachedCount > 0 && diagVersion != g_glowsVersion) {
+        diagVersion = g_glowsVersion;
+        Log("[*] Item models for glows: none of %zu wanted; attached models:%.1500s", wanted.size(), attached.c_str());
+    }
+    std::string js = "{", summary;
+    for (auto& f : found) {
+        js += (js.size() > 1 ? "," : "") + JsString(f.first) + ":[" + f.second + "]";
+        size_t n = std::count(f.second.begin(), f.second.end(), '[');
+        summary += " " + f.first.substr(f.first.rfind('/') + 1) + " x" + std::to_string(n);
+    }
+    js += "}";
+    // the wardrobe's cards re-create their models all the time: the log says what is
+    // found when that changes, at most every 5 s
+    static std::string lastSummary;
+    static ULONGLONG lastLog = 0;
+    if (summary != lastSummary && GetTickCount64() - lastLog >= 5000) {
+        lastSummary = summary;
+        lastLog = GetTickCount64();
+        Log("[*] Item models for glows:%s", summary.empty() ? " none" : summary.c_str());
+    }
+    return js;
+}
+
+// Interface thread, from a loop's tick (right before its DSLGlowTick): the item models of
+// the glows -> DSLSetItemHosts of that loop, when they change. One scan serves both loops.
+static std::string g_itemHostsSent[2] = {"{}", "{}"};
+static void MaybeSendItemHosts(int kind) {
+    void* panel = g_loopPanels[kind];
+    if (!g_itemHostsReady || !g_entityList || !g_uiEngine || !panel || !g_OrigRunScript) return;
+    static std::string js = "{}";
+    static ULONGLONG lastScan = 0;
+    ULONGLONG now = GetTickCount64();
+    if (now - lastScan >= 200) {
+        js = ScanItemHosts();
+        lastScan = now;
+    }
+    if (js == g_itemHostsSent[kind]) return;
+    g_itemHostsSent[kind] = js;
+    std::string script = "if (typeof DSLSetItemHosts === 'function') DSLSetItemHosts(" + js + ");";
+    // a new name every time and per loop (Panorama keeps a compiled script by its name)
+    static LONG version = 0;
+    std::string name = std::string("dota_skins_hosts_") + kLoopNames[kind] + "_" + std::to_string(++version) + ".js";
+    t_inOurScript = true;
+    g_OrigRunScript(g_uiEngine, panel, script.c_str(), name.c_str(), 0);
+    t_inOurScript = false;
+}
+
 // "index|unit name" from the interface script
 static void SetLocalHero(const char* v) {
     g_heroIndex = atoi(v);
@@ -1765,17 +2180,33 @@ static bool CheckDslMessage(const char* msg) {
         if (strstr(msg, "SetPreview")) Log("[ui] %.600s", msg);
         return false;
     }
+    // ticks and loop starts name their loop: "dash" (the menu's) or "hud" (the match's)
+    int kind = strstr(p, " hud") ? kHud : kDash;
     if (strncmp(p, "DSL_TICK", 8) == 0) {
-        if (g_inMenu) { RunPreloads(); MaybeRefreshPreview(); MaybeSendGlows(); }
-        else MaybeTaunt();
+        if (g_inMenu) {
+            RunPreloads();
+            if (kind == kDash) MaybeRefreshPreview();
+            MaybeSendGlows(kind);
+        } else {
+            MaybeTaunt();
+        }
     }
     else if (strncmp(p, "DSL_HERO ", 9) == 0) SetLocalHero(p + 9);
-    else if (strncmp(p, "DSL_GTICK", 9) == 0) MaybeSendGlows();
-    else if (strncmp(p, "DSL_LOOP", 8) == 0) { if (g_injectPanel) { g_loopPanel = g_injectPanel; g_glowsSent = -1; } }
+    else if (strncmp(p, "DSL_GTICK", 9) == 0) { MaybeSendGlows(kind); MaybeSendItemHosts(kind); }
+    else if (strncmp(p, "DSL_LOOP", 8) == 0) {
+        // a new script context: it has neither the glow table nor the item models yet
+        if (g_injectPanel) {
+            g_loopPanels[kind] = g_injectPanel;
+            g_glowsSent[kind] = -1;
+            g_itemHostsSent[kind] = "{}";
+        }
+    }
     else if (strncmp(p, "DSL_PICK", 8) == 0) RecordPick(p[8] == ' ' ? p + 9 : nullptr);
     else if (strncmp(p, "DSL_MENU", 8) == 0) {
         LONG v = p[9] == '1';
-        if (InterlockedExchange(&g_inMenu, v) != v) Log("[*] %s", v ? "In menu: renaming swapped models" : "In game: file swap only");
+        if (InterlockedExchange(&g_inMenu, v) != v) {
+            Log("[*] %s", v ? "In menu: renaming swapped models" : "In game: file swap only");
+        }
     }
     else if (strncmp(p, "DSL_LOG", 7) == 0) Log("[js] %.3800s", p + 7);
     else return false;
@@ -1928,6 +2359,7 @@ static DWORD WINAPI MainThread(LPVOID) {
 
     CreateThread(nullptr, 0, HookPanorama, nullptr, 0, nullptr);
     CreateThread(nullptr, 0, WriteEquips, nullptr, 0, nullptr);
+    CreateThread(nullptr, 0, ResolveItemHosts, nullptr, 0, nullptr);
     return 0;
 }
 
@@ -1940,6 +2372,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
 
         const char* appdata = getenv("APPDATA");
         g_appDir = std::string(appdata ? appdata : ".") + "\\dota-skins\\";
+        // the last run's log is kept (a crash or a match is often looked at after a restart)
+        MoveFileExA((g_appDir + "model_swap.log").c_str(), (g_appDir + "model_swap.prev.log").c_str(), MOVEFILE_REPLACE_EXISTING);
         g_log = fopen((g_appDir + "model_swap.log").c_str(), "w");
 
         Log("[*] changer.dll attached (PID=%lu) t=%llu", GetCurrentProcessId(), GetTickCount64());

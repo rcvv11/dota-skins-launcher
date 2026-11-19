@@ -175,6 +175,13 @@ impl<'a> Table<'a> {
         scalar(&self.text[open..=close], b"image_inventory").filter(|s| !s.trim().is_empty())
     }
 
+    /// The item's rarity (`item_rarity`, lower case; "common" when it names none).
+    pub fn rarity(&self, item: &ItemRef) -> Option<String> {
+        let (open, close) = self.find(item)?;
+        let rarity = scalar(&self.text[open..=close], b"item_rarity").map(|r| r.trim().to_ascii_lowercase());
+        Some(rarity.filter(|r| !r.is_empty()).unwrap_or_else(|| "common".to_string()))
+    }
+
     fn find(&self, item: &ItemRef) -> Option<(usize, usize)> {
         if let Some(i) = item.index {
             return self.items.get(&i.to_string()).copied();
@@ -498,6 +505,10 @@ pub fn hero_overrides(
 pub struct Glow {
     pub npc: String,
     pub particle: String,
+    /// The item it belongs to (its name, as in the swap requests) and the item's
+    /// `model_player`: in the game the glow hangs on that model.
+    pub item: String,
+    pub model: Option<String>,
 }
 
 /// `hero_overrides`, plus the item glows left without a place.
@@ -531,28 +542,26 @@ pub fn hero_overrides_and_glows(
                 }
             }
         }
-        // An item that blanks out one of the hero's own effects (Twilight
-        // Schism turns Luna's luna_ambient_moon_glaive into null.vpcf) and
-        // brings its own glow: the glow goes where the blanked effect was.
-        let null = compiled_path(NULL_PARTICLE);
-        let mut spare = own.iter().skip(placed);
-        for r in reqs.iter_mut().filter(|r| r.id == h.item.name && r.src == null) {
-            let Some(glow) = spare.next() else { break };
-            r.src = compiled_path(glow);
-        }
-        for particle in spare {
+        // Glows no default item's effect stands in for: the DLL creates them on
+        // the hero, always, as the item does. (An item that blanks out a hero
+        // effect, like Twilight Schism turning Luna's luna_ambient_moon_glaive
+        // into null.vpcf, keeps that blank: putting its glow in that effect's
+        // place showed it only while Moon Glaive was learned, never in the menu.)
+        for particle in own.iter().skip(placed) {
             for hero in &h.heroes {
                 if let Some(npc) = npcs.get(&crate::schema::norm(hero)) {
-                    glows.push(Glow { npc: npc.clone(), particle: particle.to_string() });
+                    glows.push(Glow {
+                        npc: npc.clone(),
+                        particle: particle.to_string(),
+                        item: h.item.name.clone(),
+                        model: h.model.clone(),
+                    });
                 }
             }
         }
     }
     (reqs, glows)
 }
-
-/// What items swap a particle to when they switch it off.
-const NULL_PARTICLE: &str = "particles/error/null.vpcf";
 
 #[cfg(test)]
 mod tests {
@@ -833,7 +842,7 @@ mod tests {
     }
 
     #[test]
-    fn own_glow_replaces_a_blanked_hero_effect() {
+    fn blanked_hero_effect_stays_blank_and_the_glow_is_created() {
         let text = r#""items_game"
 {
 	"items"
@@ -869,13 +878,15 @@ mod tests {
             slot: "weapon".into(),
             model: None,
         };
-        let reqs = hero_overrides(&table, &[schism], &HashMap::new(), &HashMap::new());
+        let npcs: HashMap<String, String> = [("luna".to_string(), "npc_dota_hero_luna".to_string())].into();
+        let (reqs, glows) = hero_overrides_and_glows(&table, &[schism], &HashMap::new(), &npcs);
         assert_eq!(
             pairs(&reqs),
-            vec![(
-                "particles/econ/items/luna/ti9/weapon_ambient.vpcf_c",
-                "particles/units/heroes/hero_luna/luna_ambient_moon_glaive.vpcf_c"
-            )]
+            vec![("particles/error/null.vpcf_c", "particles/units/heroes/hero_luna/luna_ambient_moon_glaive.vpcf_c")]
+        );
+        assert_eq!(
+            glows.iter().map(|g| (g.npc.as_str(), g.particle.as_str())).collect::<Vec<_>>(),
+            vec![("npc_dota_hero_luna", "particles/econ/items/luna/ti9/weapon_ambient.vpcf")]
         );
     }
 

@@ -51,13 +51,20 @@ fn main() -> eframe::Result<()> {
         // UAC prompt declined: run without the rights (injection may fail)
     }
 
+    // one launcher at a time (checked in the process that stays: the one that asked
+    // for the rights has exited already)
+    const TITLE: &str = concat!("Dota Skins Launcher ", env!("CARGO_PKG_VERSION"));
+    if !win::single_instance(TITLE) {
+        return Ok(());
+    }
+
     i18n::set(&config::load_config().language);
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1240.0, 780.0])
             .with_min_inner_size([900.0, 560.0])
-            .with_title(concat!("Dota Skins Launcher ", env!("CARGO_PKG_VERSION")))
+            .with_title(TITLE)
             .with_icon(window_icon()),
         // the 3D preview needs a depth buffer
         depth_buffer: 24,

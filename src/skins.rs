@@ -84,6 +84,9 @@ pub fn material_groups(cli: &Path, pak: &Path, models: &[String]) -> Result<Grou
 /// (Source2Viewer-CLI takes a moment to start; the cache is reset when the
 /// game's pak changes, i.e. after a game update).
 pub fn material_groups_cached(cli: &Path, pak: &Path, models: &[String]) -> Groups {
+    // one at a time (a pick and the background warm-up): each writes the whole file
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let path = crate::config::app_dir().join("cache").join("material_groups.txt");
     let stamp = std::fs::metadata(pak).map(|m| format!("{}|{:?}", m.len(), m.modified().ok())).unwrap_or_default();
     let text = std::fs::read_to_string(&path).unwrap_or_default();

@@ -77,6 +77,8 @@ pub struct LauncherApp {
     game_state: (Instant, gsi::GameState),
     job: Option<Receiver<job::Msg>>,
     confirm_restart: bool,
+    /// The "revert everything" confirmation is open.
+    confirm_revert: bool,
     profiles_dirty: bool,
     /// profiles.json write time after our own last load/save; a newer one
     /// means a preset changed on disk (e.g. «SELECT» in Dota).
@@ -176,7 +178,7 @@ impl LauncherApp {
             ),
             None => (
                 StatusKind::Ok,
-                crate::trf!("Загружено предметов: {} · {}", "Items loaded: {} · {}", catalog.skins.len(), icons.source),
+                crate::trf!("Загружено предметов: {}, {}", "Items loaded: {}, {}", catalog.skins.len(), icons.source),
             ),
         };
         if let Err(e) = &mount_result {
@@ -219,6 +221,7 @@ impl LauncherApp {
             game_state: (Instant::now() - Duration::from_secs(60), gsi::GameState::Unknown),
             job: None,
             confirm_restart: false,
+            confirm_revert: false,
             profiles_dirty: false,
             profiles_seen: config::profiles_modified(),
             view,
@@ -373,7 +376,7 @@ impl LauncherApp {
         let mut pick_files = false;
         let mut pick_folder = false;
         let mut remove: Option<catalog::FileMap> = None;
-        egui::Window::new(egui::RichText::new(crate::trf!("Свои файлы · {name}", "Own files · {name}")).font(bold_font(13.5)))
+        egui::Window::new(egui::RichText::new(crate::trf!("Свои файлы – {name}", "Own files – {name}")).font(bold_font(13.5)))
             .id(egui::Id::new("own_files"))
             .open(&mut open)
             .collapsible(false)
@@ -672,7 +675,7 @@ impl LauncherApp {
                 });
                 Ok(match on_hero {
                     Some((hero, models)) => (
-                        format!("{hero} · {}", skin.name),
+                        format!("{hero} – {}", skin.name),
                         Subject::Hero {
                             hero,
                             persona,
@@ -695,7 +698,7 @@ impl LauncherApp {
                     .outfit(hero, *persona, &selected, None)
                     .ok_or_else(|| crate::trf!("Нет данных о модели героя {hero}: пересоберите каталог", "No hero model data for {hero}: rebuild the catalog"))?;
                 let title = if *persona {
-                    crate::trf!("{hero} · персона", "{hero} · persona")
+                    crate::trf!("{hero} – персона", "{hero} – persona")
                 } else {
                     hero.clone()
                 };
@@ -877,7 +880,7 @@ impl LauncherApp {
             Some(err) => self.set_status(StatusKind::Warn, crate::trf!("Перезагрузка: {err}", "Reload: {err}")),
             None => self.set_status(
                 StatusKind::Ok,
-                crate::trf!("Перезагружено предметов: {} · {}", "Items reloaded: {} · {}",
+                crate::trf!("Перезагружено предметов: {}, {}", "Items reloaded: {}, {}",
                     self.catalog.skins.len(),
                     self.icons.source
                 ),
@@ -1097,24 +1100,94 @@ impl LauncherApp {
         }
     }
 
-    fn clear_overrides(&mut self) {
+    /// Everything the launcher changed in the game, taken back: the in-memory swap
+    /// table (a running changer.dll stops swapping), the item table for empty slots
+    /// with its gameinfo/signature lines, file-mode overrides with their gameinfo
+    /// line, our autoexec.cfg lines and the GSI config. Presets stay.
+    fn revert_all(&mut self) {
+        let dota = self.config.dota_path.clone();
         let mod_dir = config::resolve_mod_dir(&self.config);
-        // Nothing is applied any more, so the emblem ring must go too.
-        if let Some(game_dir) = vpk::game_dir_from_exe(&self.config.dota_path) {
-            let _ = crate::autoexec::keep_ring(&game_dir, false);
+        let mut errors: Vec<String> = Vec::new();
+        // an empty table: the DLL drops its swaps, glows, taunts and slot icons
+        if let Err(e) = crate::inject::write_config(&[], &[]) {
+            errors.push(e);
         }
-        // Also take our line out of gameinfo.gi, so the game is back to its
-        // original files (Valve's own bytes from the backup when they match).
-        if let Err(e) = crate::mount::remove(&self.config.dota_path, &mod_dir) {
-            self.set_status(StatusKind::Error, crate::trf!("Ошибка очистки gameinfo.gi: {e}", "gameinfo.gi cleanup error: {e}"));
+        if !dota.is_empty() {
+            if let Err(e) = crate::schema_mount::remove(&dota) {
+                errors.push(e);
+            }
+            if let Err(e) = crate::mount::remove(&dota, &mod_dir) {
+                errors.push(e);
+            }
+        }
+        if let Err(e) = apply::clear_mod(&mod_dir) {
+            errors.push(e);
+        }
+        if let Some(game_dir) = vpk::game_dir_from_exe(&dota) {
+            for r in [
+                crate::autoexec::keep_ring(&game_dir, false).map(|_| ()),
+                crate::autoexec::keep_weather(&game_dir, None).map(|_| ()),
+                crate::autoexec::keep_combine_off(&game_dir, false).map(|_| ()),
+                crate::gsi::remove_cfg(&game_dir),
+            ] {
+                if let Err(e) = r {
+                    errors.push(e);
+                }
+            }
+        }
+        let _ = std::fs::remove_file(config::app_dir().join("schema_loaded.txt"));
+        if errors.is_empty() {
+            let mut msg = crate::tr!("Все изменения откатены, файлы игры в исходном виде", "Everything reverted, the game files are as Steam shipped them").to_string();
+            if self.running() {
+                msg.push_str(crate::tr!(" – в запущенной Dota модели вернутся со следующей загрузки, всё остальное — после перезапуска",
+                    " – in the running Dota models come back on their next load, the rest after a restart"));
+            }
+            self.set_status(StatusKind::Ok, msg);
+        } else {
+            self.set_status(StatusKind::Error, crate::trf!("Откат не полный: {}", "Revert incomplete: {}", errors.join("; ")));
+        }
+    }
+
+    fn revert_dialog(&mut self, ctx: &egui::Context) {
+        if !self.confirm_revert {
             return;
         }
-        match apply::clear_mod(&mod_dir) {
-            Ok(_) => self.set_status(
-                StatusKind::Ok,
-                crate::tr!("Оверрайды удалены, игра в исходном виде", "Overrides removed, the game is back to its original state").to_string(),
-            ),
-            Err(e) => self.set_status(StatusKind::Error, crate::trf!("Ошибка очистки: {e}", "Cleanup error: {e}")),
+        let mut close = false;
+        let mut go = false;
+        egui::Window::new(crate::tr!("Откатить все изменения?", "Revert everything?"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_max_width(400.0);
+                ui.label(crate::tr!(
+                    "Лаунчер уберёт всё, что менял в игре: подмены моделей и эффектов (в памяти и файлами), \
+                     таблицу предметов для пустых слотов и её строки в gameinfo и dota.signatures, \
+                     свои строки в autoexec.cfg и конфиг GSI.",
+                    "The launcher takes back everything it changed in the game: model and effect swaps (in memory \
+                     and as files), the item table for empty slots with its gameinfo and dota.signatures lines, \
+                     its autoexec.cfg lines and the GSI config."
+                ));
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(crate::tr!("Пресеты и настройки лаунчера останутся.", "Presets and launcher settings stay."))
+                        .color(theme::TEXT_DIM),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if theme::ghost_button(ui, crate::tr!("Откатить", "Revert"), egui::vec2(140.0, 34.0), theme::DANGER).clicked() {
+                        go = true;
+                    }
+                    if theme::ghost_button(ui, crate::tr!("Отмена", "Cancel"), egui::vec2(110.0, 34.0), theme::TEXT).clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if go {
+            self.confirm_revert = false;
+            self.revert_all();
+        } else if close {
+            self.confirm_revert = false;
         }
     }
 
@@ -1304,7 +1377,7 @@ impl LauncherApp {
                             let apply_label = if selected_count == 0 || busy {
                                 base.to_string()
                             } else {
-                                format!("{base}  ·  {selected_count}")
+                                format!("{base} – {selected_count}")
                             };
                             let hint = if running {
                                 crate::tr!("Dota запущена: лаунчер закроет её (только в меню), применит пресет и запустит снова через Steam", "Dota is running: the launcher will close it (menu only), apply the preset and start it again through Steam")
@@ -1369,7 +1442,7 @@ impl LauncherApp {
             self.launch_current(ctx);
         }
         if want_clear {
-            self.clear_overrides();
+            self.confirm_revert = true;
         }
         if want_reload {
             self.reload_catalog(ctx);
@@ -1593,14 +1666,15 @@ impl LauncherApp {
                 );
                 ui.checkbox(&mut self.config.pack_vpk, crate::tr!("Собирать в pak01_dir.vpk", "Pack into pak01_dir.vpk"))
                     .on_hover_text(crate::tr!("Иначе файлы копируются в папку оверрайдов как есть", "Otherwise files are copied into the overrides folder as they are"));
+            }
 
-                ui.add_space(8.0);
-                let w = ui.available_width();
-                if theme::ghost_button(ui, crate::tr!("Удалить оверрайды", "Remove overrides"), egui::vec2(w, 32.0), theme::DANGER)
-                    .clicked()
-                {
-                    clear = true;
-                }
+            ui.add_space(8.0);
+            let w = ui.available_width();
+            if theme::ghost_button(ui, crate::tr!("Откатить все изменения", "Revert everything"), egui::vec2(w, 32.0), theme::DANGER)
+                .on_hover_text(crate::tr!("Вернуть файлы игры в исходный вид (пресеты останутся)", "Put the game files back as Steam shipped them (presets stay)"))
+                .clicked()
+            {
+                clear = true;
             }
         });
 
@@ -1875,6 +1949,7 @@ impl eframe::App for LauncherApp {
             View::Heroes => self.heroes_central(ctx),
         }
         self.confirm_dialog(ctx);
+        self.revert_dialog(ctx);
         self.files_dialog(ctx);
         if self.catalog_job.is_some() {
             ctx.request_repaint_after(Duration::from_millis(500));
@@ -2411,7 +2486,7 @@ fn draw_card(
     let show_hint = is_selected || hover > 0.05;
     let hint_w = if show_hint { 80.0 } else { 0.0 };
     let meta = format!(
-        "{}  ·  {}",
+        "{} – {}",
         if skin.hero.is_empty() || skin.hero == "—" { crate::tr!("Общее", "General") } else { &skin.hero },
         catalog::slot_label(&skin.slot)
     );

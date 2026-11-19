@@ -307,7 +307,7 @@ impl LauncherApp {
                             .color(theme::TEXT),
                     );
                     ui.label(
-                        egui::RichText::new(crate::trf!("Выбрано в слотах: {equipped_count} из {} · {} предметов", "Selected in slots: {equipped_count} of {} · {} items",
+                        egui::RichText::new(crate::trf!("Выбрано в слотах: {equipped_count} из {}, {} предметов", "Selected in slots: {equipped_count} of {}, {} items",
                             slots.len(),
                             skins.len()
                         ))
@@ -394,7 +394,7 @@ impl LauncherApp {
                     ui.horizontal(|ui| {
                         ui.label(
                             egui::RichText::new(crate::trf!(
-                                "{}  ·  вариантов: {}", "{}  ·  variants: {}",
+                                "{}, вариантов: {}", "{}, variants: {}",
                                 tile_label(&active_slot),
                                 if active_slot == SETS { set_cards.len() } else { options.len() }
                             ))

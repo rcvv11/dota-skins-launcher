@@ -6,8 +6,9 @@
 //! letters and digits only; a caption in English and in Russian). The "equipped"
 //! row's tiles have no caption: they follow the hero script's slot order, given as
 //! `slotdef|<HERO>|#<position>|<item>|<style>` and `slotdef|<HERO>|#LEN|<count>|0`.
-//! A last field is the item's icon as a Panorama image path: the script puts it
-//! back cheaply when the game redraws a tile (empty for an item in a style).
+//! Then the item's icon as a Panorama image path (empty for an item in a style)
+//! and its rarity: the script lays the icon over the game's own and colours the
+//! rarity strip itself, so the game redrawing a tile does not show.
 
 use crate::visuals::HeroItem;
 
@@ -25,9 +26,12 @@ pub fn config_lines(data: &crate::gamedata::GameData, items: &[HeroItem]) -> Vec
         }
         data.index.image_inventory(&h.item).map(|i| format!("file://{{images}}/{}.png", i.trim())).unwrap_or_default()
     };
+    // the tile's rarity strip (the script colours it itself: Dota's redraws reset it)
+    let rarity = |h: &HeroItem| data.index.rarity(&h.item).unwrap_or_default();
     for h in items {
         let Some(def) = h.item.index else { continue };
         let icon = icon(h);
+        let rarity = rarity(h);
         for hero in &h.heroes {
             let Some(npc) = data.npcs.get(&crate::schema::norm(hero)) else { continue };
             let mut captions = data.slot_texts.get(&(npc.to_ascii_lowercase(), h.slot.to_ascii_lowercase())).cloned().unwrap_or_default();
@@ -35,7 +39,7 @@ pub fn config_lines(data: &crate::gamedata::GameData, items: &[HeroItem]) -> Vec
                 captions.push(h.slot.clone());
             }
             for caption in captions {
-                let line = format!("slotdef|{}|{}|{def}|{}|{icon}", key(hero), key(&caption), h.item.style);
+                let line = format!("slotdef|{}|{}|{def}|{}|{icon}|{rarity}", key(hero), key(&caption), h.item.style);
                 // one item per hero and caption: the first wins
                 if seen.insert((key(hero), key(&caption))) {
                     lines.push(line);
@@ -61,7 +65,7 @@ pub fn config_lines(data: &crate::gamedata::GameData, items: &[HeroItem]) -> Vec
             let picked = items.iter().find(|h| h.slot.eq_ignore_ascii_case(slot) && h.heroes.iter().any(|x| x == hero));
             if let Some(h) = picked {
                 if let Some(def) = h.item.index {
-                    lines.push(format!("slotdef|{}|#{pos}|{def}|{}|{}", key(hero), h.item.style, icon(h)));
+                    lines.push(format!("slotdef|{}|#{pos}|{def}|{}|{}|{}", key(hero), h.item.style, icon(h), rarity(h)));
                 }
             }
         }

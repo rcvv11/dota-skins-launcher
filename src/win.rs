@@ -40,6 +40,8 @@ extern "system" {
 #[link(name = "kernel32")]
 extern "system" {
     fn GetCurrentProcess() -> isize;
+    fn CreateMutexW(attributes: *const c_void, initial_owner: i32, name: *const u16) -> isize;
+    fn GetLastError() -> u32;
 }
 
 #[link(name = "shell32")]
@@ -104,6 +106,33 @@ extern "system" {
     fn IsWindowVisible(hwnd: HWND) -> i32;
     fn PostMessageW(hwnd: HWND, msg: u32, w: usize, l: isize) -> i32;
     fn FindWindowW(class: *const u16, title: *const u16) -> HWND;
+    fn ShowWindow(hwnd: HWND, cmd: i32) -> i32;
+    fn SetForegroundWindow(hwnd: HWND) -> i32;
+}
+
+/// Takes the launcher's named mutex for the life of the process. False when another
+/// launcher holds it: that one's window (`title`) is brought to the front instead.
+/// (Two launchers both put on every in-game pick and wrote the swap table twice.)
+pub fn single_instance(title: &str) -> bool {
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+    const SW_RESTORE: i32 = 9;
+    let name = wide("Local\\DotaSkinsLauncher");
+    let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    if handle == 0 {
+        // no answer (rights): better two launchers than none
+        return true;
+    }
+    if unsafe { GetLastError() } != ERROR_ALREADY_EXISTS {
+        // the handle stays open until the process ends
+        return true;
+    }
+    if let Some(hwnd) = find_window(title) {
+        unsafe {
+            ShowWindow(hwnd, SW_RESTORE);
+            SetForegroundWindow(hwnd);
+        }
+    }
+    false
 }
 
 #[link(name = "advapi32")]

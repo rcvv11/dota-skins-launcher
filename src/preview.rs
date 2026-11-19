@@ -926,7 +926,7 @@ impl Preview {
         self.last_frame = Instant::now();
 
         let mut open = self.open;
-        egui::Window::new(egui::RichText::new(format!("3D  ·  {}", self.title)).font(bold_font(13.5)))
+        egui::Window::new(egui::RichText::new(format!("3D – {}", self.title)).font(bold_font(13.5)))
             .id(egui::Id::new("model_preview"))
             .open(&mut open)
             .collapsible(false)
@@ -1029,7 +1029,7 @@ impl Preview {
 
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new(crate::tr!("ЛКМ: вращать · колесо: масштаб · двойной клик: сброс", "LMB: rotate · wheel: zoom · double click: reset"))
+                egui::RichText::new(crate::tr!("ЛКМ: вращать, колесо: масштаб, двойной клик: сброс", "LMB: rotate, wheel: zoom, double click: reset"))
                     .size(11.5)
                     .color(theme::TEXT_FAINT),
             );
@@ -1037,7 +1037,7 @@ impl Preview {
                 ui.checkbox(&mut self.auto_rotate, crate::tr!("Автоповорот", "Auto-rotate"));
                 if let Some((_, _, tris)) = self.model {
                     let text = if self.models.len() > 1 {
-                        crate::trf!("моделей: {} · {tris} треуг.", "models: {} · {tris} tris", self.models.len())
+                        crate::trf!("моделей: {}, {tris} треуг.", "models: {}, {tris} tris", self.models.len())
                     } else {
                         crate::trf!("{tris} треуг.", "{tris} tris")
                     };

@@ -135,9 +135,29 @@ fn run(plan: &Plan, step: &dyn Fn(&str)) -> Result<String, String> {
                 let pak = game_dir.join("pak01_dir.vpk");
                 let particles: Vec<&str> = glows.iter().map(|g| g.particle.as_str()).collect();
                 let drivers = crate::glow::drivers_cached(cli, &pak, &particles);
-                for g in &glows {
+                // the hero's skeleton (an arcana's when it swaps the model) decides
+                // which of a glow's children can hang on it
+                let swapped: std::collections::HashMap<String, String> = reqs
+                    .iter()
+                    .filter(|r| r.dst.ends_with(".vmdl_c"))
+                    .map(|r| (r.dst.to_ascii_lowercase(), r.src.clone()))
+                    .collect();
+                let models: Vec<String> = glows
+                    .iter()
+                    .map(|g| {
+                        let model = units.get(&g.npc).cloned().unwrap_or_default();
+                        let compiled = crate::extract::compiled_path(&model).to_ascii_lowercase();
+                        swapped.get(&compiled).map(|s| s.trim_end_matches("_c").to_string()).unwrap_or(model)
+                    })
+                    .collect();
+                let pairs: Vec<(&str, &str)> = glows.iter().zip(&models).map(|(g, m)| (g.particle.as_str(), m.as_str())).collect();
+                // (known ones only: the rest is worked out in the background)
+                let parts = crate::glow::parts_now(cli, &pak, &pairs);
+                for (g, model) in glows.iter().zip(&models) {
                     let d = drivers.get(&g.particle).cloned().unwrap_or_default();
-                    glow_lines.push(crate::glow::config_line(&g.npc, &g.particle, &d));
+                    let list = parts.get(&(model.clone(), g.particle.clone())).cloned().unwrap_or_else(|| vec![g.particle.clone()]);
+                    let item = item_model(&reqs, g);
+                    glow_lines.push(crate::glow::config_line(&g.npc, &g.particle, &d, item.as_deref(), &list));
                 }
             }
             // Taunts: their animation, played by changer.dll on your own hero (client-side).
@@ -275,6 +295,23 @@ fn run(plan: &Plan, step: &dyn Fn(&str)) -> Result<String, String> {
     Ok(summary)
 }
 
+/// The model an item's glow hangs on in the game: the item's model as the swap
+/// table has it (the DLL finds the wearable by it and by every model swapped to
+/// it). Its own `model_player` first; an item in an empty slot gets its stand-in
+/// swap later, its `model_player` is the swap's source all the same.
+fn item_model(reqs: &[crate::extract::Req], glow: &crate::visuals::Glow) -> Option<String> {
+    let own = glow.model.as_deref().map(str::trim).filter(|m| !m.is_empty()).map(crate::extract::compiled_path);
+    let mut first: Option<&str> = None;
+    for r in reqs.iter().filter(|r| r.id == glow.item && r.src.ends_with(".vmdl_c") && r.dst.ends_with(".vmdl_c")) {
+        if own.as_deref() == Some(r.src.as_str()) {
+            first = Some(&r.src);
+            break;
+        }
+        first.get_or_insert(&r.src);
+    }
+    first.map(str::to_string).or(own).map(|m| m.trim_end_matches("_c").to_string())
+}
+
 /// What the mounted item table changes, from the whole catalog (not the
 /// preset, so it stays the same and Dota needs no restart for a pick): every
 /// hero's wearable slots that items exist for (the empty ones get a stand-in),
@@ -350,7 +387,7 @@ fn run_in_memory(
         crate::inject::apply_to_running()?;
         let mut msg = String::from(crate::tr!("Пресет применён", "Preset applied"));
         if empty_slots > 0 {
-            msg.push_str(&crate::trf!(" · предметы для пустых слотов ({empty_slots}) появятся после перезапуска Dota", " · items for empty slots ({empty_slots}) appear after Dota restarts"));
+            msg.push_str(&crate::trf!(", предметы для пустых слотов ({empty_slots}) появятся после перезапуска Dota", ", items for empty slots ({empty_slots}) appear after Dota restarts"));
         }
         return Ok(msg);
     }
@@ -359,7 +396,7 @@ fn run_in_memory(
     Ok(crate::tr!("Dota 2 успешно запущена", "Dota 2 launched successfully").into())
 }
 
-/// " · not applied: A, B" (in the UI language) or `None` when nothing was skipped.
+/// " – not applied: A, B" (in the UI language) or `None` when nothing was skipped.
 fn skipped_note(skipped: &[crate::extract::Skip]) -> Option<String> {
     const SHOWN: usize = 4;
     let mut names: Vec<&str> = skipped.iter().map(|s| s.name.as_str()).collect();
@@ -368,7 +405,7 @@ fn skipped_note(skipped: &[crate::extract::Skip]) -> Option<String> {
     if names.is_empty() {
         return None;
     }
-    let mut note = crate::trf!(" · не применились: {}", " · not applied: {}", names[..names.len().min(SHOWN)].join(", "));
+    let mut note = crate::trf!(" – не применились: {}", " – not applied: {}", names[..names.len().min(SHOWN)].join(", "));
     if names.len() > SHOWN {
         note.push_str(&crate::trf!(" и ещё {}", " and {} more", names.len() - SHOWN));
     }
@@ -387,7 +424,30 @@ mod tests {
             Skip { name: "Taunt: Bring It On".into(), reason: "дубль".into() },
         ];
         let note = skipped_note(&s).unwrap();
-        assert_eq!(note, " · не применились: Taunt: Bring It On");
+        assert_eq!(note, " – не применились: Taunt: Bring It On");
         assert!(skipped_note(&[]).is_none());
+    }
+
+    #[test]
+    fn glow_hangs_on_the_item_model() {
+        let req = |id: &str, src: &str, dst: &str| crate::extract::Req { id: id.into(), src: src.into(), dst: dst.into() };
+        let glow = |model: Option<&str>| crate::visuals::Glow {
+            npc: "npc_dota_hero_luna".into(),
+            particle: "particles/a.vpcf".into(),
+            item: "Twilight Schism".into(),
+            model: model.map(str::to_string),
+        };
+        let reqs = vec![
+            req("Twilight Schism", "particles/a.vpcf_c", "particles/b.vpcf_c"),
+            req("Twilight Schism", "models/items/luna/ti9/arm.vmdl_c", "models/heroes/luna/arm.vmdl_c"),
+            req("Twilight Schism", "models/items/luna/ti9/glaive.vmdl_c", "models/heroes/luna/luna_weapon.vmdl_c"),
+        ];
+        // its own model wins over another model swap of the item
+        assert_eq!(item_model(&reqs, &glow(Some("models/items/luna/ti9/Glaive.vmdl"))).as_deref(), Some("models/items/luna/ti9/glaive.vmdl"));
+        // no model_player: the item's first model swap
+        assert_eq!(item_model(&reqs, &glow(None)).as_deref(), Some("models/items/luna/ti9/arm.vmdl"));
+        // an empty-slot item (its swap comes later): its model_player
+        assert_eq!(item_model(&[], &glow(Some("models/items/luna/ti9/glaive.vmdl"))).as_deref(), Some("models/items/luna/ti9/glaive.vmdl"));
+        assert_eq!(item_model(&[], &glow(None)), None);
     }
 }
