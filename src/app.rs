@@ -1109,7 +1109,7 @@ impl LauncherApp {
         let mod_dir = config::resolve_mod_dir(&self.config);
         let mut errors: Vec<String> = Vec::new();
         // an empty table: the DLL drops its swaps, glows, taunts and slot icons
-        if let Err(e) = crate::inject::write_config(&[], &[]) {
+        if let Err(e) = crate::inject::write_config(&[], &[], &std::collections::HashMap::new()) {
             errors.push(e);
         }
         if !dota.is_empty() {

@@ -90,6 +90,9 @@ fn run(plan: &Plan, step: &dyn Fn(&str)) -> Result<String, String> {
     let mut deferred_schema: Option<(&'static crate::gamedata::GameData, Layout)> = None;
     // empty-slot picks the running Dota shows only after a restart
     let mut need_restart: Vec<String> = Vec::new();
+    // hero items' names -> their heroes' npc names: in a match their swaps apply to
+    // the hero you play only
+    let mut hero_of: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
 
     // Everything below needs the game's item table: item effects and the
     // emblem are read from it. Items for slots the hero has no file for
@@ -115,6 +118,20 @@ fn run(plan: &Plan, step: &dyn Fn(&str)) -> Result<String, String> {
         // parsed once per game version (gamedata.rs)
         let data = crate::gamedata::load(game_dir)?;
         let (table, index, npcs) = (data.table, &data.index, &data.npcs);
+        for h in &plan.hero_items {
+            let list: Vec<String> = h.heroes.iter().filter_map(|x| npcs.get(&crate::schema::norm(x)).cloned()).collect();
+            if !list.is_empty() {
+                hero_of.insert(h.item.name.clone(), list);
+            }
+        }
+        for pick in &plan.schema_picks {
+            if let Some(npc) = npcs.get(&crate::schema::norm(&pick.hero)) {
+                let list = hero_of.entry(pick.name.clone()).or_default();
+                if !list.contains(npc) {
+                    list.push(npc.clone());
+                }
+            }
+        }
 
         if !plan.general.is_empty() || !plan.hero_items.is_empty() {
             step(crate::tr!("Подменяю эффекты предметов…", "Swapping item effects…"));
@@ -242,7 +259,7 @@ fn run(plan: &Plan, step: &dyn Fn(&str)) -> Result<String, String> {
         if let Some(line) = crate::schema_mount::restart_line(&need_restart) {
             glow_lines.push(line);
         }
-        let result = run_in_memory(plan, &reqs, &glow_lines, empty_slots, weather, no_combine, skipped, was_running, step);
+        let result = run_in_memory(plan, &reqs, &glow_lines, &hero_of, empty_slots, weather, no_combine, skipped, was_running, step);
         if let (Ok(_), Some((data, layout))) = (&result, deferred_schema) {
             step(crate::tr!("Записываю таблицу предметов для пустых слотов…", "Writing the item table for empty slots…"));
             let _ = crate::schema_mount::apply(&plan.dota_exe, data.table, &layout.0, &layout.1);
@@ -349,6 +366,7 @@ fn run_in_memory(
     plan: &Plan,
     reqs: &[crate::extract::Req],
     glows: &[String],
+    hero_of: &std::collections::HashMap<String, Vec<String>>,
     empty_slots: usize,
     weather: Option<u32>,
     no_combine: bool,
@@ -357,7 +375,7 @@ fn run_in_memory(
     step: &dyn Fn(&str),
 ) -> Result<String, String> {
     step(crate::tr!("Записываю таблицу подмен…", "Writing the swap table…"));
-    let rules = crate::inject::write_config(reqs, glows)?;
+    let rules = crate::inject::write_config(reqs, glows, hero_of)?;
     crate::picks::trace("  swap table written");
     if !plan.install.files.is_empty() {
         skipped.push(crate::extract::Skip::new(crate::tr!("Свои файлы", "Own files"), crate::tr!("в режиме «в памяти» не применяются", "do not apply in memory mode")));

@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdarg>
+#include <cfloat>
 #include <string>
 #include <vector>
 #include <set>
@@ -73,6 +74,9 @@ struct StackBufferString {
 // as a whole under an exclusive lock; the hook reads it under a shared one.
 struct Rules {
     std::unordered_map<std::string, std::string> replacements;
+    // a hero item's swap -> its heroes (npc names): in a match it applies to the hero you
+    // play only, the other heroes keep their own look (general swaps have none)
+    std::unordered_map<std::string, std::vector<std::string>> heroes;
     std::vector<std::string> hiddenPrefixes;
     std::set<std::string> keep;
 };
@@ -89,7 +93,9 @@ static std::string Normalize(std::string p) {
     return p;
 }
 
-static void AddRule(Rules& rules, const std::string& from, const std::string& to) {
+static std::vector<std::string> Split(const std::string& s, char sep);
+
+static void AddRule(Rules& rules, const std::string& from, const std::string& to, const std::string& heroes) {
     std::string f = Normalize(from), t = Normalize(to);
     if (f.empty() || t.empty() || f == t) return;
     if (f == "hide") {
@@ -97,9 +103,27 @@ static void AddRule(Rules& rules, const std::string& from, const std::string& to
         rules.hiddenPrefixes.push_back(t);
     } else if (t == "keep") {
         rules.keep.insert(f);
-    } else {
-        rules.replacements.emplace(f, t);  // the first swap of a file wins, as in the file mode
+    } else if (rules.replacements.emplace(f, t).second) {  // the first swap of a file wins, as in the file mode
+        for (auto& h : Split(heroes, ','))
+            if (!h.empty()) rules.heroes[f].push_back(Normalize(h));
     }
+}
+
+// The hero you play in this match (npc name), given by the interface script once picked;
+// empty in the menu and before the pick. Read and written under g_rulesLock.
+static std::string g_localNpc;
+static volatile LONG g_inMenu = 0;  // the interface script reports: menu, not a match
+
+// Whether a swap applies now: every swap in the menu; in a match a hero item's swap only
+// for the hero you play (an enemy or ally on another hero keeps their own items), the
+// general ones (couriers, wards, terrain...) always. Under g_rulesLock.
+static bool RuleActive(const Rules& rules, const std::string& dst) {
+    if (g_inMenu) return true;
+    auto h = rules.heroes.find(dst);
+    if (h == rules.heroes.end() || h->second.empty()) return true;
+    for (auto& npc : h->second)
+        if (npc == g_localNpc) return true;
+    return false;
 }
 
 static void QueuePreloads(const Rules& rules, const std::set<std::string>& extra);
@@ -109,6 +133,11 @@ static std::string g_glowsJs = "[]";
 // Item models the glows hang on (the 5th field of glow lines), with every model the
 // swap table turns into one of them: model in the game -> the item model
 static std::unordered_map<std::string, std::string> g_itemModels;
+// The glows as the DLL creates them itself in a match (the interface script cannot: a
+// regular match gives its scripts no entities, so their effects hung on nothing)
+struct GlowCp { int cp; int attach; std::string att; float vec[3]; bool world; };
+struct GlowDef { std::string npc, fx, item; std::vector<GlowCp> cps; std::vector<std::string> parts; bool hasParts; };
+static std::vector<GlowDef> g_glowDefs;
 // Items for empty slots the running Dota has not read yet (line
 // restart|name\tname): their button says «after restart»
 static std::string g_restartJs = "[]";
@@ -165,6 +194,46 @@ static std::string GlowJs(const std::string& line) {
     }
     return js + "}";
 }
+// ParticleAttachment_t by name (the game's enum: PATTACH_ABSORIGIN = 0 …)
+static int AttachType(const std::string& s) {
+    static const char* const names[] = {
+        "PATTACH_ABSORIGIN", "PATTACH_ABSORIGIN_FOLLOW", "PATTACH_CUSTOMORIGIN", "PATTACH_CUSTOMORIGIN_FOLLOW",
+        "PATTACH_POINT", "PATTACH_POINT_FOLLOW", "PATTACH_EYES_FOLLOW", "PATTACH_OVERHEAD_FOLLOW",
+        "PATTACH_WORLDORIGIN", "PATTACH_ROOTBONE_FOLLOW", "PATTACH_RENDERORIGIN_FOLLOW", "PATTACH_MAIN_VIEW",
+        "PATTACH_WATERWAKE", "PATTACH_CENTER_FOLLOW", "PATTACH_CUSTOM_GAME_STATE_1", "PATTACH_HEALTHBAR"};
+    for (int i = 0; i < (int)(sizeof(names) / sizeof(names[0])); i++)
+        if (s == names[i]) return i;
+    return 1;  // PATTACH_ABSORIGIN_FOLLOW
+}
+
+// glow|npc|particle|cp:type:attachment;...|item model|part,part (split already)
+static GlowDef GlowDefOf(const std::vector<std::string>& f) {
+    GlowDef d;
+    d.npc = f[1];
+    d.fx = Normalize(f[2]);
+    d.item = f.size() > 4 ? Normalize(f[4]) : std::string();
+    d.hasParts = f.size() > 5;
+    if (d.hasParts)
+        for (auto& p : Split(f[5], ','))
+            if (!p.empty()) d.parts.push_back(Normalize(p));
+    for (auto& s : Split(f[3], ';')) {
+        auto p = Split(s, ':');
+        if (p.size() < 3 || p[0].empty()) continue;
+        GlowCp c{};
+        c.cp = atoi(p[0].c_str());
+        c.attach = AttachType(p[1]);
+        c.world = p[1] == "PATTACH_WORLDORIGIN";
+        if (c.world) {
+            auto v = Split(p[2], ',');
+            for (int k = 0; k < 3; k++) c.vec[k] = v.size() == 3 ? (float)atof(v[k].c_str()) : 0.0f;
+        } else {
+            c.att = p[2];
+        }
+        d.cps.push_back(c);
+    }
+    return d;
+}
+
 static volatile LONG g_refreshPending = 0;  // the config changed: refresh the preview after preloading
 
 static bool LoadConfig(const std::string& path) {
@@ -176,6 +245,7 @@ static bool LoadConfig(const std::string& path) {
     std::map<std::string, std::string> slots;  // HERO -> "CAPTION":[item,style],...
     std::set<std::string> itemKeys;            // item models the glows hang on
     std::set<std::string> glowFiles;           // the glows' effects (preloaded)
+    std::vector<GlowDef> glowDefs;             // the glows for the DLL's own match effects
     std::string lang = "ru";
     while (std::getline(file, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
@@ -224,13 +294,15 @@ static bool LoadConfig(const std::string& path) {
             // the effects the script creates itself, loaded in the menu beforehand: a
             // regular match loads nothing on demand (red crosses instead of them)
             if (f.size() > 2 && !f[2].empty()) glowFiles.insert(Normalize(f[2]));
+            if (f.size() >= 4) glowDefs.push_back(GlowDefOf(f));
             if (f.size() > 5)
                 for (auto& part : Split(f[5], ','))
                     if (!part.empty()) glowFiles.insert(Normalize(part));
             continue;
         }
-        size_t pos = line.find('|');
-        if (pos != std::string::npos) AddRule(*fresh, line.substr(0, pos), line.substr(pos + 1));
+        // dst|src, or dst|src|npc,npc for a hero item's swap
+        auto rule = Split(line, '|');
+        if (rule.size() >= 2) AddRule(*fresh, rule[0], rule[1], rule.size() > 2 ? rule[2] : std::string());
     }
     // an item model is worn under any model the swap table turns into it (the
     // slot's default one, the player's own item)
@@ -246,6 +318,7 @@ static bool LoadConfig(const std::string& path) {
     AcquireSRWLockExclusive(&g_glowsLock);
     g_glowsJs = "[" + glows + "]";
     g_itemModels.swap(itemModels);
+    g_glowDefs.swap(glowDefs);
     g_restartJs = "[" + restart + "]";
     {
         std::string js = "{";
@@ -301,7 +374,7 @@ static void* g_ResourceSystem = nullptr;
 
 static bool FindReplacementFile(const Rules& rules, const std::string& base, bool compiled, std::string& out) {
     auto it = rules.replacements.find(base);
-    if (it != rules.replacements.end()) {
+    if (it != rules.replacements.end() && RuleActive(rules, base)) {
         out = compiled ? it->second + "_c" : it->second;
         return true;
     }
@@ -329,10 +402,29 @@ static bool FindReplacementFile(const char* fileName, std::string& out) {
     return found;
 }
 
+// Which item each model was read with: model -> the model whose file it holds (itself
+// when nothing was swapped). A match reads a model once; a pick made later changes the
+// wearables' model instead (see LiveModelTick).
+static SRWLOCK g_loadedAsLock = SRWLOCK_INIT;
+static std::unordered_map<std::string, std::string> g_loadedAs;
+
+static void RememberRead(const char* fileName, const std::string& replacement) {
+    std::string name = Normalize(fileName);
+    if (name.size() < 7 || name.compare(name.size() - 7, 7, ".vmdl_c") != 0) return;
+    name.resize(name.size() - 2);
+    std::string held = replacement.empty() ? name : Normalize(replacement);
+    if (held.size() > 2 && held.compare(held.size() - 2, 2, "_c") == 0) held.resize(held.size() - 2);
+    AcquireSRWLockExclusive(&g_loadedAsLock);
+    g_loadedAs[name] = held;
+    ReleaseSRWLockExclusive(&g_loadedAsLock);
+}
+
 static void HookedInitForFileRead(void* self, void* binding, uintptr_t priority, uintptr_t flag, const char* fileName) {
     std::string replacement;
     if (fileName && fileName[0]) {
-        if (FindReplacementFile(fileName, replacement)) {
+        bool swapped = FindReplacementFile(fileName, replacement);
+        RememberRead(fileName, swapped ? replacement : std::string());
+        if (swapped) {
             Log("[+] %s -> %s", fileName, replacement.c_str());
             return g_OrigInitForFileRead(self, binding, priority, flag, replacement.c_str());
         }
@@ -341,7 +433,9 @@ static void HookedInitForFileRead(void* self, void* binding, uintptr_t priority,
         auto getName = (*(GetFileNameFn**)g_ResourceSystem)[0x180 / 8];
         getName(g_ResourceSystem, binding, &name, 0);
         const char* cur = BufStr_Get(&name);
-        if (cur[0] && FindReplacementFile(cur, replacement)) {
+        bool swapped = cur[0] && FindReplacementFile(cur, replacement);
+        if (cur[0]) RememberRead(cur, swapped ? replacement : std::string());
+        if (swapped) {
             Log("[+] %s -> %s", cur, replacement.c_str());
             return g_OrigInitForFileRead(self, binding, priority, flag, replacement.c_str());
         }
@@ -351,7 +445,6 @@ static void HookedInitForFileRead(void* self, void* binding, uintptr_t priority,
 
 // --- Preloading replacements for the menu ---
 // The engine's resource name: a CBufferString with a 200-byte buffer, then a hash and a type.
-static volatile LONG g_inMenu = 0;  // the interface script reports: menu, not a match
 static volatile LONG g_substituted = 0;     // how many times a replacement was handed out instead of the original
 
 struct ResourceName {
@@ -470,8 +563,9 @@ static void* HookedFindOrRegister(void* rs, ResourceName* name, uintptr_t flag) 
         // not effects in a match: a regular match gives only what its manifest holds, and
         // an item's effect asked for by its own name came back as the error effect (red
         // crosses); its data is swapped in by InitForFileRead under the original name anyway
-        bool effect = len > 5 && _stricmp(cur + len - 5, ".vpcf") == 0;
-        if (len > 5 && IsSwappableResource(cur) && !(effect && !g_inMenu) && FindReplacementFile(cur, repl) && IsResident(repl)) {
+        // (models too: the match's strategy screen got error models the same way)
+        bool material = len > 5 && _stricmp(cur + len - 5, ".vmat") == 0;
+        if (len > 5 && IsSwappableResource(cur) && (g_inMenu || material) && FindReplacementFile(cur, repl) && IsResident(repl)) {
             ResourceName other;
             if (g_SetResourceName(&other, repl.c_str())) {
                 void* r = g_OrigFindOrRegister(rs, &other, flag);
@@ -599,7 +693,7 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
               root.FindChildrenWithClassTraverse("DashboardPage").length > 0 || /dashboard/i.test(root.id || "")) ? "dash" : "hud";
   var last = "";
   var lastMenu = null;
-  var lastHero = "", lastHeroWhy = "";
+  var lastHero = "", lastHeroWhy = "", lastPicked = "";
   // Your hero's entity. In a regular match the game gives none for the player: the
   // unit in the portrait, or a real hero of yours, stands in.
   DSLLocalHero = function () {
@@ -616,6 +710,25 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
     }
     return hero;
   };
+  // Every item in a cosmetic picker: its «available to buy» and «unavailable» filters are
+  // kept on (Dota shows owned items only, and every item is one of yours here). Kept, not
+  // set once: the strategy screen's picker is the same panel match after match, and Dota
+  // turns its filters back to «owned» for every new match.
+  DSLAllItems = function (picker) {
+    if (!picker || !picker.IsValid()) return;
+    var changed = null;
+    ["AvailableFilterButton", "UnavailableFilterButton"].forEach(function (id) {
+      var b = picker.FindChildTraverse(id);
+      if (b && !b.checked) { b.checked = true; changed = b; }
+    });
+    if (!changed) return;
+    // what the buttons' own onactivate sends
+    try { $.DispatchEvent("DOTACosmeticPickerFilterChanged", changed); } catch (e) { $.Msg("DSL_LOG filter error " + e); }
+    if (picker.GetAttributeString("dsl_filters", "") !== "1") {
+      picker.SetAttributeString("dsl_filters", "1");
+      $.Msg("DSL_LOG every item shown in " + picker.id);
+    }
+  };
   // A hero's npc name. In a regular match the game gives no unit names (empty), so the
   // player's picked hero or the entity's class name (npc_dota_hero_x) stands in.
   DSLHeroName = function (ent, player) {
@@ -630,6 +743,13 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
       if (!root.IsValid() || root.GetAttributeString("dsl_loop", "") !== me) return;
       root.SetAttributeString("dsl_hb", "" + Date.now());
       var pages = root.FindChildrenWithClassTraverse("DashboardPage");
+      // the strategy screen's «Loadout» tabs: the hero page's cosmetic picker in the HUD
+      if (loopKind === "hud") {
+        ["HeroCosmeticPicker", "GlobalCosmeticPicker"].forEach(function (id) {
+          var pk = root.FindChildTraverse(id);
+          if (pk) pages.push(pk);
+        });
+      }
       var types = [];
       for (var i = 0; i < pages.length; i++) {
         var page = pages[i];
@@ -662,6 +782,7 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
         // any open menu page with item cards: the hero page,
         // «Environment» (wards, creeps, towers, emblems…), the armory
         if (!hp.visible || hp.paneltype === "DOTAStoreItemDetailsPage") continue;
+        DSLAllItems(hp.paneltype === "DOTACosmeticPicker" ? hp : hp.FindChildTraverse("CosmeticPicker"));
         // item cards: each has an ItemInfoContainer (unavailable ones have no buy button)
         var stack = [hp];
         var infos = [];
@@ -826,8 +947,9 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
       $.Msg("DSL_GTICK " + loopKind);
       // glows from one loop: the menu's in the menu, the HUD's in a match (the other one
       // forgets its effects: their models go away with the map change)
-      if ((loopKind === "dash") === inMenu) DSLGlowTick(inMenu); else DSLForgetGlows();
-      if (inMenu) DSLSlotTick();
+      // (in a match the DLL creates them: the game gives scripts no entities there)
+      if (loopKind === "dash" && inMenu) DSLGlowTick(inMenu); else DSLForgetGlows();
+      if (inMenu || loopKind === "hud") DSLSlotTick();
       var log = types.filter(function (t) { return t.indexOf("DOTA") !== 0; }).join(", ");
       if (log && log !== last) { last = log; $.Msg("DSL_LOG " + log); }
     } catch (e) {
@@ -1075,13 +1197,26 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
     var force = slotForceNext;
     slotForceNext = false;
     if (pendingSlots) { slotMap = pendingSlots; pendingSlots = null; force = true; }
-    var pages = root.FindChildrenWithClassTraverse("DashboardPage");
+    // the hero page (menu), and the strategy screen's «Loadout» picker (match HUD)
+    var pages = root.FindChildrenWithClassTraverse("DashboardPage").filter(function (pg) {
+      return pg.paneltype === "DOTAHeroPageNewV2" && pg.visible;
+    });
+    if (loopKind === "hud") {
+      var pk = root.FindChildTraverse("HeroCosmeticPicker");
+      if (pk && pk.visible) pages.push(pk);
+    }
     var shown = [];
     for (var i = 0; i < pages.length; i++) {
       var hp = pages[i];
-      if (hp.paneltype !== "DOTAHeroPageNewV2" || !hp.visible) continue;
-      var nameP = hp.FindChildTraverse("HeroName");
+      var picker = hp.paneltype === "DOTACosmeticPicker";
+      var nameP = picker ? null : hp.FindChildTraverse("HeroName");
       var heroName = nameP ? firstLabel(nameP) : "";
+      if (picker) {
+        // the picker's title (customize_hero_title), else the strategy screen's hero name
+        var title = hp.FindChildrenWithClassTraverse("HeroTitle")[0];
+        heroName = title && title.text ? title.text : "";
+        if (!heroName) { var sel = root.FindChildTraverse("SelectedHeroName"); heroName = sel ? sel.text : ""; }
+      }
       if (nameP && (!slotHeroLabel || !slotHeroLabel.IsValid() || slotHeroLabel.text !== heroName)) {
         var st = [nameP];
         slotHeroLabel = null;
@@ -1094,7 +1229,7 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
       var hero = slotMap[slotKey(heroName)];
       if (heroName !== slotHero) { slotHero = heroName; force = true; }
       // the panels whose look tells whether the wardrobe is open (watched by slotViewTick)
-      if (slotViewPage !== hp) {
+      if (!picker && slotViewPage !== hp) {
         slotViewPage = hp;
         slotViewPanels = ["HeroCustomize", "CosmeticPicker", "EquippedSetDetailsContainer", "EquippedSetSlotsContainer"]
           .map(function (id) { return hp.FindChildTraverse(id); });
@@ -1142,7 +1277,7 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
       }
     }
     slotTiles = shown;
-    slotTilesHero = slotHeroLabel && slotHeroLabel.IsValid() ? slotHeroLabel.text : "";
+    if (loopKind === "dash") slotTilesHero = slotHeroLabel && slotHeroLabel.IsValid() ? slotHeroLabel.text : "";
     // Dota fills a new or re-picked tile a frame or two later: covered right away
     if (force && shown.length) slotWatch(800);
   };
@@ -1180,7 +1315,18 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
     }
     // a frequent tick for the DLL (in the menu): preloading and model refresh without waiting
     if (lastMenu !== null && root.IsValid() && root.GetAttributeString("dsl_loop", "") === me) $.Msg("DSL_TICK " + loopKind);
+    // the hero you picked, as soon as you pick: in the match the hero items' swaps apply
+    // to it only (its models load right away)
+    if (lastMenu === false) {
+      try {
+        var pickedHero = Players.GetPlayerSelectedHero ? Players.GetPlayerSelectedHero(Players.GetLocalPlayer()) : "";
+        if (pickedHero && pickedHero !== lastPicked && pickedHero.indexOf("npc_dota_hero_") === 0) { lastPicked = pickedHero; $.Msg("DSL_PICKED " + pickedHero); }
+      } catch (ePick) {}
+    } else if (lastMenu) {
+      lastPicked = "";
+    }
     if (lastMenu) { slotHeroTick(); slotViewTick(); slotRepair(); }
+    else if (loopKind === "hud") slotRepair();
     $.Schedule(0.05, hoverTick);
   }
   hoverTick();
@@ -1208,10 +1354,13 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
     return false;
   }
   // The target hero's own item model for a glow, or null.
+  // (In a regular match Entities.IsValidEntity says "not valid" even for your own live
+  // hero and its items: there the DLL's list, read from the entity list just now, decides.)
+  var glowInMatch = false;
   function hostOf(gl, ent) {
     var l = gl.item ? itemHosts[gl.item] : null;
     for (var i = 0; l && i < l.length; i++) {
-      if ((l[i][2] === ent || l[i][3] === ent) && Entities.IsValidEntity(l[i][0])) return l[i];
+      if ((l[i][2] === ent || l[i][3] === ent) && (glowInMatch || Entities.IsValidEntity(l[i][0]))) return l[i];
     }
     return null;
   }
@@ -1221,7 +1370,9 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
   // model lives while the DLL lists its handle: its index may belong to a new entity.)
   function dropGlow(k) {
     var g = glowFx[k];
-    if (g && Entities.IsValidEntity(g.ent) && (g.handle < 0 || hostListed(g.handle))) {
+    var alive = g && (g.handle >= 0 ? hostListed(g.handle) && (glowInMatch || Entities.IsValidEntity(g.ent))
+                                     : Entities.IsValidEntity(g.ent) || (glowInMatch && g.ent === DSLLocalHero()));
+    if (alive) {
       try { Particles.DestroyParticleEffect(g.p, false); Particles.ReleaseParticleIndex(g.p); } catch (e6) {}
     }
     delete glowFx[k];
@@ -1233,7 +1384,7 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
   // the other loop shows the glows now: ours are left to the game (it removes them with
   // their models; a call on a removed model's effect crashes it)
   DSLForgetGlows = function () { glowFx = {}; };
-  var glowHostLogged = {};
+  var glowHostLogged = {}, glowDiag = "";
   // The DLL calls this from inside another JS call: only remember the list here,
   // the regular tick changes the effects (otherwise the game crashes if a model is being rebuilt)
   var pendingGlows = null;
@@ -1250,6 +1401,7 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
       $.Msg("DSL_LOG glows: " + glowList.length);
       return;  // new effects on the next tick
     }
+    glowInMatch = !inMenu;
     var alive = {};
     if (glowList.length) {
       var wanted = {};
@@ -1267,7 +1419,18 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
       } else {
         // in a match only your own hero: on others an effect could give away an invisible one
         var hero = DSLLocalHero();
-        if (hero > 0 && Entities.IsValidEntity(hero)) targets.push([hero, DSLHeroName(hero, Players.GetLocalPlayer())]);
+        var heroValid = hero > 0 && Entities.IsValidEntity(hero);
+        var heroName = hero > 0 ? DSLHeroName(hero, Players.GetLocalPlayer()) : "";
+        if (hero > 0 && heroName) targets.push([hero, heroName]);
+        // what the match's glows see, once per change (a regular match differs from a lobby)
+        var mine = 0, hosted = 0;
+        for (var gd = 0; gd < glowList.length; gd++) {
+          if (glowList[gd].npc !== heroName) continue;
+          mine++;
+          if (hero > 0 && hostOf(glowList[gd], hero)) hosted++;
+        }
+        var diag = "hero " + hero + (heroValid ? "" : " (not valid)") + " " + heroName + ": " + mine + " glows, " + hosted + " on item models";
+        if (diag !== glowDiag) { glowDiag = diag; $.Msg("DSL_LOG match glows: " + diag); }
       }
       for (var t = 0; t < targets.length; t++) {
         var ent = targets[t][0], name = targets[t][1];
@@ -1790,6 +1953,11 @@ static void ReadSchemaOffsets(const Section& rdata, const Section& data, SchemaF
 }
 
 // Off the interface thread: the scans take a moment and client.dll may still be loading.
+static void ResolveParticles(const Section& text, const Section& rdata);
+// CSkeletonInstance::SetModel(skeleton, model binding): see LiveModelTick
+using SkeletonSetModelFn = void (*)(void* skeleton, void* binding);
+static SkeletonSetModelFn g_SkeletonSetModel = nullptr;
+
 static DWORD WINAPI ResolveItemHosts(LPVOID) {
     HMODULE cl = nullptr;
     for (int i = 0; i < 6000 && !(cl = GetModuleHandleA("client.dll")); i++) Sleep(100);
@@ -1824,6 +1992,10 @@ static DWORD WINAPI ResolveItemHosts(LPVOID) {
         "model name +0x%X, model +0x%X, parent +0x%X, node owner +0x%X, identity +0x%X, owner entity +0x%X",
         ok ? '+' : '-', (void*)list, o.body, o.sceneNode, o.skeleton, o.modelState, o.modelName, o.modelHandle,
         o.parent, o.owner, o.entity, o.ownerEntity);
+    ResolveParticles(text, rdata);
+    // the function asserting "CSkeletonInstance::SetModel"
+    g_SkeletonSetModel = (SkeletonSetModelFn)FunctionStart(FindRipRef(text, FindString(rdata, "CSkeletonInstance::SetModel")));
+    Log("[%c] Live models: CSkeletonInstance::SetModel %p", g_SkeletonSetModel ? '+' : '-', (void*)g_SkeletonSetModel);
     if (!ok) return 1;
     g_ih = o;
     if (!g_entityList) g_entityList = list;
@@ -1887,9 +2059,15 @@ static std::string ModelOf(const uint8_t* ent, const uint8_t** nodeOut) {
     return model;
 }
 
+// The item models of the glows found by the last scan (their entities: valid during the
+// tick that scanned only)
+struct ItemHost { std::string key; int index; uint32_t handle; int parent, owner; uint8_t* ent; };
+static std::vector<ItemHost> g_hosts;
+
 // The item models of the glows in the world, as the script's table:
 // {"item model":[[entity,handle,parent,owner],…],…}
 static std::string ScanItemHosts() {
+    g_hosts.clear();
     std::unordered_map<std::string, std::string> wanted;
     AcquireSRWLockShared(&g_glowsLock);
     wanted = g_itemModels;
@@ -1924,6 +2102,7 @@ static std::string ScanItemHosts() {
             std::string& s = found[it->second];
             s += (s.empty() ? "" : ",") + ("[" + std::to_string(index) + "," + std::to_string(handle) + "," +
                                           std::to_string(parent) + "," + std::to_string(owner) + "]");
+            g_hosts.push_back({it->second, index, handle, parent, owner, (uint8_t*)ent});
         }
     }
     // no item model in the world while models hang on heroes: say which ones (once per
@@ -1955,16 +2134,21 @@ static std::string ScanItemHosts() {
 // Interface thread, from a loop's tick (right before its DSLGlowTick): the item models of
 // the glows -> DSLSetItemHosts of that loop, when they change. One scan serves both loops.
 static std::string g_itemHostsSent[2] = {"{}", "{}"};
+static std::string g_itemHostsJs = "{}";
+// a scan at most every 200 ms (both loops tick)
+static void RefreshItemHosts() {
+    if (!g_itemHostsReady || !g_entityList) return;
+    static ULONGLONG lastScan = 0;
+    ULONGLONG now = GetTickCount64();
+    if (now - lastScan < 200) return;
+    lastScan = now;
+    g_itemHostsJs = ScanItemHosts();
+}
 static void MaybeSendItemHosts(int kind) {
     void* panel = g_loopPanels[kind];
     if (!g_itemHostsReady || !g_entityList || !g_uiEngine || !panel || !g_OrigRunScript) return;
-    static std::string js = "{}";
-    static ULONGLONG lastScan = 0;
-    ULONGLONG now = GetTickCount64();
-    if (now - lastScan >= 200) {
-        js = ScanItemHosts();
-        lastScan = now;
-    }
+    RefreshItemHosts();
+    const std::string& js = g_itemHostsJs;
     if (js == g_itemHostsSent[kind]) return;
     g_itemHostsSent[kind] = js;
     std::string script = "if (typeof DSLSetItemHosts === 'function') DSLSetItemHosts(" + js + ");";
@@ -1974,6 +2158,290 @@ static void MaybeSendItemHosts(int kind) {
     t_inOurScript = true;
     g_OrigRunScript(g_uiEngine, panel, script.c_str(), name.c_str(), 0);
     t_inOurScript = false;
+}
+
+// --- The glows in a match, created by the DLL itself ---
+// A regular match gives the interface scripts no entities: Panorama's Particles and
+// Entities bindings look an entity up only in the menu, a demo or a custom game (the
+// game mode check in client.dll), so the script's glows hung on nothing there. The DLL
+// calls what those bindings call, with the item's own model (found in the entity list)
+// as the effect's owner and its control points' entity: the item's own effect on your
+// own hero, as the game would show it.
+struct ParticleDesc {                // the binding's description of a new effect (0x70 bytes)
+    const char* name;                // 0x00
+    int32_t attach, pad0;            // 0x08
+    void* entity;                    // 0x10: the owner
+    uint64_t z18, z20;               // 0x18
+    int32_t z28, pad1;               // 0x28
+    uint64_t z30;                    // 0x30
+    uint16_t z38; uint8_t z3a, pad2; // 0x38
+    float m3c, m40;                  // 0x3c: -1
+    float f44, f48, f4c;             // 0x44: FLT_MAX
+    int32_t z50, pad3;               // 0x50
+    uint64_t z58;                    // 0x58
+    int32_t m60;                     // 0x60: -1
+    float f64, f68, f6c;             // 0x64: FLT_MAX
+};
+static_assert(sizeof(ParticleDesc) == 0x70, "ParticleDesc layout");
+
+using GetParticleMgrFn = void* (*)();
+using CreateParticleFn = void (*)(void* mgr, int32_t* out, ParticleDesc* desc);
+using SetControlFn = bool (*)(void* mgr, int32_t particle, int32_t cp, const float* vec, float unused);
+using SetControlEntFn = bool (*)(void* mgr, int32_t particle, int32_t cp, void* ent, int32_t attach, const char* attachment,
+                                 const float* offset, bool lockOrientation, void* zero);
+using DestroyParticleFn = void (*)(void* mgr, int32_t particle, bool immediate, bool flag);
+static GetParticleMgrFn g_ParticleMgr = nullptr;
+static CreateParticleFn g_CreateParticle = nullptr;
+static SetControlFn g_SetControl = nullptr;
+static SetControlEntFn g_SetControlEnt = nullptr;
+static DestroyParticleFn g_DestroyParticle = nullptr;
+static volatile LONG g_particlesReady = 0;
+
+// A Panorama binding's function: the binding table names it right after loading it
+// (lea rax,[function] ... lea rcx,["Name"]), in .text
+static uint8_t* BindingImpl(const Section& text, const Section& rdata, const char* name) {
+    const uint8_t* s = FindString(rdata, name);
+    for (size_t i = 0; s && i + 7 <= text.size; i++) {
+        uint8_t* p = text.start + i;
+        if (!((p[0] == 0x48 || p[0] == 0x4C) && p[1] == 0x8D && (p[2] & 0xC7) == 0x05 && p + 7 + *(int32_t*)(p + 3) == s)) continue;
+        for (uint8_t* q = p - 7; q >= p - 0x28; q--) {
+            if (q[0] != 0x48 || q[1] != 0x8D || q[2] != 0x05) continue;
+            uint8_t* impl = q + 7 + *(int32_t*)(q + 3);
+            if (impl >= text.start && impl < text.start + text.size) return impl;
+            break;
+        }
+    }
+    return nullptr;
+}
+
+// The target of the call or jump that ends `pattern` within `len` bytes of `from`
+static uint8_t* CallIn(uint8_t* from, size_t len, const uint8_t* pattern, size_t n) {
+    return from ? CallAfter(from, len, pattern, n) : nullptr;
+}
+
+static void ResolveParticles(const Section& text, const Section& rdata) {
+    uint8_t* create = BindingImpl(text, rdata, "CreateParticle");
+    uint8_t* setCp = BindingImpl(text, rdata, "SetParticleControl");
+    uint8_t* setCpEnt = BindingImpl(text, rdata, "SetParticleControlEnt");
+    uint8_t* destroy = BindingImpl(text, rdata, "DestroyParticleEffect");
+    uint8_t* release = BindingImpl(text, rdata, "ReleaseParticleIndex");
+    // push rbx; sub rsp,20h; mov ebx,edx; call <manager>
+    static const uint8_t kMgr[] = {0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x8B, 0xDA, 0xE8};
+    g_ParticleMgr = (GetParticleMgrFn)CallIn(release, 1, kMgr, sizeof(kMgr));
+    // mov dword [rsp+80h],-1; call <create>
+    static const uint8_t kCreate[] = {0xC7, 0x84, 0x24, 0x80, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xE8};
+    g_CreateParticle = (CreateParticleFn)CallIn(create, 0x140, kCreate, sizeof(kCreate));
+    // movss [rsp+20h],xmm0; mov edx,esi; mov rcx,rax; call <set>
+    static const uint8_t kSet[] = {0xF3, 0x0F, 0x11, 0x44, 0x24, 0x20, 0x8B, 0xD6, 0x48, 0x8B, 0xC8, 0xE8};
+    g_SetControl = (SetControlFn)CallIn(setCp, 0x80, kSet, sizeof(kSet));
+    // mov rcx,rax; movsd [rsp+60h],xmm0; call <set ent>
+    static const uint8_t kSetEnt[] = {0x48, 0x8B, 0xC8, 0xF2, 0x0F, 0x11, 0x44, 0x24, 0x60, 0xE8};
+    g_SetControlEnt = (SetControlEntFn)CallIn(setCpEnt, 0x140, kSetEnt, sizeof(kSetEnt));
+    // add rsp,20h; pop rdi; jmp <destroy>
+    static const uint8_t kDestroy[] = {0x48, 0x83, 0xC4, 0x20, 0x5F, 0xE9};
+    g_DestroyParticle = (DestroyParticleFn)CallIn(destroy, 0x40, kDestroy, sizeof(kDestroy));
+    bool ok = g_ParticleMgr && g_CreateParticle && g_SetControl && g_SetControlEnt && g_DestroyParticle;
+    Log("[%c] Match glows: manager %p, create %p, control %p, control ent %p, destroy %p", ok ? '+' : '-',
+        (void*)g_ParticleMgr, (void*)g_CreateParticle, (void*)g_SetControl, (void*)g_SetControlEnt, (void*)g_DestroyParticle);
+    if (ok) InterlockedExchange(&g_particlesReady, 1);
+}
+
+static int32_t CreateGlow(void* mgr, const std::string& fx, void* ent, const std::vector<GlowCp>& cps) {
+    ParticleDesc d{};
+    d.name = fx.c_str();
+    d.attach = 2;  // PATTACH_CUSTOMORIGIN: its control points place it
+    d.entity = ent;
+    d.m3c = d.m40 = -1.0f;
+    d.f44 = d.f48 = d.f4c = d.f64 = d.f68 = d.f6c = FLT_MAX;
+    d.m60 = -1;
+    int32_t out = -1;
+    g_CreateParticle(mgr, &out, &d);
+    if (out < 0) return -1;
+    static const float zero[3] = {0, 0, 0};
+    for (auto& c : cps) {
+        if (c.world) g_SetControl(mgr, out, c.cp, c.vec, 0.0f);
+        else g_SetControlEnt(mgr, out, c.cp, ent, c.attach, c.att.c_str(), zero, true, nullptr);
+    }
+    return out;
+}
+
+// key ("h<handle>|fx" on an item model, "e<index>|fx" on the hero) -> effect
+static std::map<std::string, int32_t> g_matchFx;
+static LONG g_matchFxVersion = -1;
+
+// the entity a glow hangs on still exists (destroying the effect of a removed entity
+// crashes the game: then it is only forgotten, the game removed it with the entity)
+static bool MatchHostAlive(const std::string& key) {
+    if (key.empty()) return false;
+    if (key[0] == 'h') {
+        uint32_t handle = (uint32_t)strtoul(key.c_str() + 1, nullptr, 10);
+        for (auto& h : g_hosts) if (h.handle == handle) return true;
+        return false;
+    }
+    return EntityByIndex(atoi(key.c_str() + 1)) != nullptr;
+}
+
+// Interface thread, after every scan in a match: your hero's glows on its item models
+// (or, an item model not found, the parts the hero's own skeleton can carry)
+static void MatchGlowTick() {
+    if (!g_particlesReady || !g_itemHostsReady) return;
+    if (g_inMenu) {
+        g_matchFx.clear();  // the match's entities are gone, and their effects with them
+        return;
+    }
+    void* mgr = g_ParticleMgr();
+    if (!mgr) return;
+    std::vector<GlowDef> defs;
+    AcquireSRWLockShared(&g_glowsLock);
+    defs = g_glowDefs;
+    LONG version = g_glowsVersion;
+    ReleaseSRWLockShared(&g_glowsLock);
+    std::set<std::string> alive;
+    void* hero = g_heroIndex > 0 ? EntityByIndex(g_heroIndex) : nullptr;
+    // a new glow table: all made again
+    bool fresh = version != g_matchFxVersion;
+    g_matchFxVersion = version;
+    if (hero && !g_heroUnit.empty() && !fresh) {
+        for (auto& d : defs) {
+            if (d.npc != g_heroUnit) continue;
+            const ItemHost* host = nullptr;
+            for (auto& h : g_hosts)
+                if (h.key == d.item && (h.parent == g_heroIndex || h.owner == g_heroIndex)) { host = &h; break; }
+            std::vector<std::string> fxs;
+            if (host || !d.hasParts) fxs.push_back(d.fx);
+            else fxs = d.parts;
+            void* on = host ? (void*)host->ent : hero;
+            std::string prefix = host ? "h" + std::to_string(host->handle) : "e" + std::to_string(g_heroIndex);
+            for (auto& fx : fxs) {
+                std::string key = prefix + "|" + fx;
+                alive.insert(key);
+                if (g_matchFx.count(key)) continue;
+                int32_t idx = CreateGlow(mgr, fx, on, d.cps);
+                g_matchFx[key] = idx;
+                Log("[*] Match glow %s on %s: effect %d", fx.c_str(), host ? "the item model" : "the hero", idx);
+            }
+        }
+    }
+    // the hero's model on the strategy screen (and the pick screen): a client-side entity
+    // (index from 16384, never another player's networked hero), its item models get
+    // their glows as well
+    if (!fresh) {
+        for (auto& h : g_hosts) {
+            int holder = h.parent >= 0 ? h.parent : h.owner;
+            if (holder < 0x4000) continue;
+            for (auto& d : defs) {
+                if (d.item.empty() || d.item != h.key) continue;
+                // an ally's model on the pick screen wears its own items
+                std::string local;
+                AcquireSRWLockShared(&g_rulesLock);
+                local = g_localNpc;
+                ReleaseSRWLockShared(&g_rulesLock);
+                if (d.npc != local && d.npc != g_heroUnit) continue;
+                std::string key = "h" + std::to_string(h.handle) + "|" + d.fx;
+                alive.insert(key);
+                if (g_matchFx.count(key)) continue;
+                int32_t idx = CreateGlow(mgr, d.fx, h.ent, d.cps);
+                g_matchFx[key] = idx;
+                Log("[*] Match glow %s on the preview's item model (entity %d): effect %d", d.fx.c_str(), h.index, idx);
+            }
+        }
+    }
+    for (auto it = g_matchFx.begin(); it != g_matchFx.end();) {
+        if (alive.count(it->first)) { ++it; continue; }
+        if (it->second >= 0 && MatchHostAlive(it->first)) g_DestroyParticle(mgr, it->second, true, true);
+        it = g_matchFx.erase(it);
+    }
+}
+
+// --- Item models changed in a match (a pick on the strategy screen) ---
+// A match reads each model once, with the item the preset had then (the default weapon's
+// file read as Twilight Schism's), and reads no file again while the model is in use. Nor
+// does it take an item model asked for by its own name instead of the default one: the
+// default one is then missing from the match's manifest (the error model). So a pick made
+// in the match changes the model on the wearables themselves: the new item's model is
+// loaded by its own name into the engine's just-in-time manifest (what the engine does for
+// an asset that was not precached) and set on the wearable's skeleton, as the game sets
+// the model of an item it equips. Only the strategy screen's model (a client-side entity,
+// index from 16384) and your own hero's wearables.
+static std::map<std::string, void*> g_liveBindings;  // item model -> its binding (loaded once)
+
+static void* LiveBinding(const std::string& model) {
+    auto it = g_liveBindings.find(model);
+    if (it != g_liveBindings.end()) return it->second;
+    ResourceName name;
+    void* binding = nullptr;
+    if (g_SetResourceName(&name, model.c_str())) binding = g_BlockingLoad(g_ResourceSystem, &name, 0);
+    auto status = (GetStatusFn)(*(void***)g_ResourceSystem)[kGetStatusSlot];
+    bool resident = binding && status(g_ResourceSystem, &name) == kResourceResident;
+    Log("[%c] Live model: %s loaded %s", resident ? '+' : '-', model.c_str(), resident ? "" : "(not resident)");
+    if (!resident) binding = nullptr;
+    g_liveBindings[model] = binding;
+    return binding;
+}
+
+struct LiveSwap { const uint8_t* node; int index; std::string model, desired; };
+
+static void LiveModelTick() {
+    if (g_inMenu) {
+        g_liveBindings.clear();  // the match's just-in-time manifest goes with it
+        return;
+    }
+    if (!g_itemHostsReady || !g_entityList || !g_SkeletonSetModel || !g_BlockingLoad || !g_SetResourceName || !g_ResourceSystem) return;
+    std::vector<LiveSwap> todo;
+    uint8_t** chunks = (uint8_t**)*g_entityList;
+    AcquireSRWLockShared(&g_rulesLock);
+    for (int c = 0; chunks && c < 64; c++) {
+        uint8_t* chunk = chunks[c];
+        if (!chunk) continue;
+        for (int i = 0; i < 512; i++) {
+            uint8_t* e = chunk + i * 0x70;
+            const uint8_t* ent = *(const uint8_t* const*)e;
+            uint32_t handle = *(const uint32_t*)(e + 0x10);
+            int index = c * 512 + i;
+            if (!ent || (int)(handle & 0x7fff) != index) continue;
+            const uint8_t* node = nullptr;
+            std::string model = ModelOf(ent, &node);
+            if (model.empty()) continue;
+            auto rule = g_rules->replacements.find(model);
+            if (rule == g_rules->replacements.end() || !RuleActive(*g_rules, model)) continue;
+            const std::string& desired = rule->second;
+            if (desired.size() < 5 || desired.compare(desired.size() - 5, 5, ".vmdl") != 0) continue;
+            // a wearable: on a hero's bones (its scene node's parent), the strategy screen's or yours
+            const uint8_t* parentNode = *(const uint8_t* const*)(node + g_ih.parent);
+            if (!parentNode) continue;
+            int holder = EntityIndexOf(*(const uint8_t* const*)(parentNode + g_ih.owner));
+            if (holder < 0x4000 && !(g_heroIndex > 0 && holder == g_heroIndex)) continue;
+            todo.push_back({node, index, model, desired});
+        }
+    }
+    ReleaseSRWLockShared(&g_rulesLock);
+    for (auto& s : todo) {
+        std::string held = s.model;
+        AcquireSRWLockShared(&g_loadedAsLock);
+        auto f = g_loadedAs.find(s.model);
+        if (f != g_loadedAs.end()) held = f->second;
+        ReleaseSRWLockShared(&g_loadedAsLock);
+        if (held == s.desired) continue;  // its file was read as that item already
+        void* binding = LiveBinding(s.desired);
+        if (!binding) continue;
+        void* current = g_ih.modelHandle >= 0 ? *(void* const*)(s.node + g_ih.modelState + g_ih.modelHandle) : nullptr;
+        if (current == binding) continue;
+        g_SkeletonSetModel((void*)s.node, binding);
+        Log("[*] Live model: entity %d %s (read as %s) -> %s", s.index, s.model.c_str(), held.c_str(), s.desired.c_str());
+    }
+}
+
+// The hero you picked (npc name) from the interface script: in this match the hero items'
+// swaps apply to it only
+static void SetLocalNpc(const char* v) {
+    std::string npc = Normalize(v);
+    while (!npc.empty() && (npc.back() == '\n' || npc.back() == '\r')) npc.pop_back();
+    if (npc.compare(0, 14, "npc_dota_hero_") != 0) return;
+    AcquireSRWLockExclusive(&g_rulesLock);
+    bool changed = npc != g_localNpc;
+    g_localNpc = npc;
+    ReleaseSRWLockExclusive(&g_rulesLock);
+    if (changed) Log("[*] You play %s: its items' swaps apply to it only", npc.c_str());
 }
 
 // "index|unit name" from the interface script
@@ -2242,8 +2710,18 @@ static bool CheckDslMessage(const char* msg) {
             MaybeTaunt();
         }
     }
-    else if (strncmp(p, "DSL_HERO ", 9) == 0) SetLocalHero(p + 9);
-    else if (strncmp(p, "DSL_GTICK", 9) == 0) { MaybeSendGlows(kind); MaybeSendItemHosts(kind); }
+    else if (strncmp(p, "DSL_HERO ", 9) == 0) {
+        SetLocalHero(p + 9);
+        if (!g_heroUnit.empty()) SetLocalNpc(g_heroUnit.c_str());
+    }
+    else if (strncmp(p, "DSL_PICKED ", 11) == 0) SetLocalNpc(p + 11);
+    else if (strncmp(p, "DSL_GTICK", 9) == 0) {
+        MaybeSendGlows(kind);
+        MaybeSendItemHosts(kind);
+        RefreshItemHosts();
+        LiveModelTick();
+        MatchGlowTick();
+    }
     else if (strncmp(p, "DSL_LOOP", 8) == 0) {
         // a new script context: it has neither the glow table nor the item models yet
         if (g_injectPanel) {
@@ -2257,6 +2735,10 @@ static bool CheckDslMessage(const char* msg) {
         LONG v = p[9] == '1';
         if (InterlockedExchange(&g_inMenu, v) != v) {
             Log("[*] %s", v ? "In menu: renaming swapped models" : "In game: file swap only");
+            // a new match: the hero you play is not known until you pick
+            AcquireSRWLockExclusive(&g_rulesLock);
+            g_localNpc.clear();
+            ReleaseSRWLockExclusive(&g_rulesLock);
         }
     }
     else if (strncmp(p, "DSL_LOG", 7) == 0) Log("[js] %.3800s", p + 7);
