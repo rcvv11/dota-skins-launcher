@@ -553,7 +553,30 @@ static void RunPreloads(ULONGLONG budget = 30) {
 using FindOrRegisterFn = void* (*)(void* rs, ResourceName* name, uintptr_t flag);
 static FindOrRegisterFn g_OrigFindOrRegister = nullptr;
 
+// The game's main thread (the interface scripts' messages come on it)
+static DWORD g_mainThread = 0;
+static thread_local bool t_inJitLoad = false;
+
+// An empty slot's stand-in model (our item table's): a regular match's server knows
+// nothing of it, so it is in no manifest of the match and the wearable got the error
+// model. Asked for in a match, it is loaded first into the engine's just-in-time manifest
+// (what the engine does for an asset that was not precached): another player's hero gets
+// the stand-in's own file (an invisible box: the slot stays empty), the hero you play the
+// picked item (the swap reads its file instead).
+static void LoadStandInNow(void* rs, ResourceName* name) {
+    if (g_inMenu || t_inJitLoad || !g_BlockingLoad || GetCurrentThreadId() != g_mainThread) return;
+    const char* cur = BufStr_Get(name);
+    if (_strnicmp(cur, "models/items/dota_skins_slots/", 30) != 0) return;
+    auto status = (GetStatusFn)(*(void***)rs)[kGetStatusSlot];
+    if (status(rs, name) == kResourceResident) return;
+    t_inJitLoad = true;
+    g_BlockingLoad(rs, name, 0);
+    t_inJitLoad = false;
+    Log("[%c] Stand-in %s loaded for the match", status(rs, name) == kResourceResident ? '+' : '-', cur);
+}
+
 static void* HookedFindOrRegister(void* rs, ResourceName* name, uintptr_t flag) {
+    if (name) LoadStandInNow(rs, name);
     // in the menu and in a match: a resource loaded before the pick (emblem ring, screen
     // shader) stays in the cache with the old swap otherwise
     if (name && g_SetResourceName) {
@@ -2699,6 +2722,8 @@ static bool CheckDslMessage(const char* msg) {
         if (strstr(msg, "SetPreview")) Log("[ui] %.600s", msg);
         return false;
     }
+    // the scripts' messages come on the game's main thread
+    if (!g_mainThread) g_mainThread = GetCurrentThreadId();
     // ticks and loop starts name their loop: "dash" (the menu's) or "hud" (the match's)
     int kind = strstr(p, " hud") ? kHud : kDash;
     if (strncmp(p, "DSL_TICK", 8) == 0) {
