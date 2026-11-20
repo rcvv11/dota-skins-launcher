@@ -3,16 +3,19 @@
 //! An emblem is an account item: the game spawns it only when it is really
 //! equipped, so there is no file of it to replace. Instead:
 //!
-//! - **effect**: the emblem's hero particle is copied over the selection ring
-//!   (`particles/ui_mouseactions/selected_ring.vpcf`). The client draws that
-//!   ring under the hero you control (with `r_draw_selected_ring 1`, see
-//!   `autoexec.rs`), whichever hero it is;
-//! - **attack colour**: Diretide emblems carry an `emblem_attack_effect` — a
-//!   complete tracking projectile (CP0 → CP1, speed from CP2, same layout as a
-//!   hero's `*_base_attack.vpcf`). It is copied over the `ProjectileModel` of
-//!   every ranged hero.
-
-use std::path::Path;
+//! - **effect**: with changer.dll (memory mode) the DLL creates the emblem's
+//!   hero particle on the hero you play, as a glow of "any hero" (see
+//!   [`glow_line`]). Without it (file mode) it is copied over the selection ring
+//!   (`particles/ui_mouseactions/selected_ring.vpcf`), which the client draws
+//!   under the selected unit (with `r_draw_selected_ring 1`, see `autoexec.rs`):
+//!   selecting a creep or a courier moved the emblem there;
+//! - **attack colour**: an emblem's `emblem_attack_effect` (Diretide, TI10, the
+//!   2021/2022 events alike) is no projectile of its own. The server names it in
+//!   an owner's projectile message and the client creates it as a child of the
+//!   projectile's effect, which gives it its points; copied over a hero's
+//!   `ProjectileModel` it showed nothing. With changer.dll the DLL adds it to the
+//!   attacks of the hero you play in the same way (see [`attack_line`]); file
+//!   mode has no way to show it.
 
 use crate::extract::{compiled_path, Req};
 use crate::visuals::{ItemRef, Table};
@@ -57,57 +60,29 @@ pub fn visuals(table: &Table, emblem: &ItemRef) -> Option<Visuals> {
     Some(out)
 }
 
-/// `ProjectileModel` of a ranged hero from its script, `None` for melee heroes.
-pub fn projectile(script: &str) -> Option<String> {
-    let mut ranged = false;
-    let mut model = None;
-    for line in script.lines() {
-        let line = line.split("//").next().unwrap_or("");
-        let mut parts = line.split('"').skip(1).step_by(2);
-        let (Some(key), Some(value)) = (parts.next(), parts.next()) else { continue };
-        if key.eq_ignore_ascii_case("AttackCapabilities") && value.contains("RANGED") {
-            ranged = true;
-        }
-        if model.is_none() && key.eq_ignore_ascii_case("ProjectileModel") && value.ends_with(".vpcf") {
-            model = Some(value.to_string());
-        }
-    }
-    model.filter(|_| ranged)
+/// The emblem's file swap in file mode: its effect over the selection ring.
+/// `None` = emblem not in the table.
+pub fn ring_override(table: &Table, emblem: &ItemRef) -> Option<Vec<Req>> {
+    let v = visuals(table, emblem)?;
+    Some(
+        v.effect
+            .iter()
+            .map(|effect| Req { id: emblem.name.clone(), src: compiled_path(effect), dst: compiled_path(RING) })
+            .collect(),
+    )
 }
 
-/// File overrides for the emblem: its effect over the selection ring and its
-/// projectile over every ranged hero's. `Ok(None)` = emblem not in the table.
-pub fn overrides(game_dir: &Path, table: &Table, emblem: &ItemRef) -> Result<Option<Vec<Req>>, String> {
-    let Some(v) = visuals(table, emblem) else { return Ok(None) };
-    let mut reqs = Vec::new();
-    if let Some(effect) = &v.effect {
-        reqs.push(Req {
-            id: emblem.name.clone(),
-            src: compiled_path(effect),
-            dst: compiled_path(RING),
-        });
-    }
-    if let Some(attack) = &v.attack {
-        const DIR: &str = "scripts/npc/heroes/";
-        let scripts = crate::vpk::read_matching(game_dir, |p| {
-            p.strip_prefix(DIR)
-                .and_then(|f| f.strip_suffix(".txt"))
-                .is_some_and(|f| f.starts_with("npc_dota_hero_") && !f.ends_with("_base"))
-        })?;
-        let mut paths: Vec<&String> = scripts.keys().collect();
-        paths.sort();
-        let src = compiled_path(attack);
-        for path in paths {
-            if let Some(own) = projectile(&String::from_utf8_lossy(&scripts[path])) {
-                reqs.push(Req {
-                    id: emblem.name.clone(),
-                    src: src.clone(),
-                    dst: compiled_path(&own),
-                });
-            }
-        }
-    }
-    Ok(Some(reqs))
+/// The DLL's line for the emblem's attack effect: added to the attacks of the
+/// hero you play, as the game adds an owned emblem's.
+pub fn attack_line(attack: &str) -> String {
+    format!("attack|{attack}")
+}
+
+/// The DLL's line for the emblem's effect on the hero you play (any hero):
+/// `drivers` from its particle file, or its origin on the hero when unknown.
+pub fn glow_line(effect: &str, drivers: Vec<crate::glow::Driver>) -> String {
+    let drivers = if drivers.is_empty() { vec![(0, "PATTACH_ABSORIGIN_FOLLOW".to_string(), String::new())] } else { drivers };
+    crate::glow::config_line(crate::glow::ANY_HERO, effect, &drivers, None, &[effect.to_string()])
 }
 
 #[cfg(test)]
@@ -171,14 +146,15 @@ mod tests {
     }
 
     #[test]
-    fn projectile_only_for_ranged() {
-        let lina = "\"npc_dota_hero_lina\"\n{\n\t\"AttackCapabilities\"\t\t\"DOTA_UNIT_CAP_RANGED_ATTACK\"\n\t\"ProjectileModel\"\t\t\"particles/units/heroes/hero_lina/lina_base_attack.vpcf\" // fire\n}";
+    fn ring_swap_and_attack_line() {
+        let table = Table::new(TABLE.as_bytes());
+        let ring = ring_override(&table, &emblem()).unwrap();
+        assert_eq!(ring.len(), 1);
+        assert_eq!(ring[0].dst, compiled_path(RING));
         assert_eq!(
-            projectile(lina).as_deref(),
-            Some("particles/units/heroes/hero_lina/lina_base_attack.vpcf")
+            attack_line("particles/econ/events/diretide_2020/attack_modifier/attack_modifier_fall20.vpcf"),
+            "attack|particles/econ/events/diretide_2020/attack_modifier/attack_modifier_fall20.vpcf"
         );
-        let am = "\"AttackCapabilities\"\t\"DOTA_UNIT_CAP_MELEE_ATTACK\"\n\"ProjectileModel\"\t\"\"";
-        assert_eq!(projectile(am), None);
     }
 
 }

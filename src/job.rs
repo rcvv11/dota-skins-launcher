@@ -27,8 +27,8 @@ pub struct Plan {
     pub hero_items: Vec<crate::visuals::HeroItem>,
     /// Source2Viewer-CLI, to read material groups of models (item colourings).
     pub vrf_cli: Option<std::path::PathBuf>,
-    /// The preset's emblem: its effect replaces the selection ring, its
-    /// projectile every ranged hero's.
+    /// The preset's emblem: its effect on the hero you play (the DLL; the
+    /// selection ring in file mode), its attack effect on that hero's attacks (the DLL).
     pub emblem: Option<crate::visuals::ItemRef>,
     pub dota_exe: String,
     pub launch_args: String,
@@ -243,9 +243,25 @@ fn run(plan: &Plan, step: &dyn Fn(&str)) -> Result<String, String> {
 
         if let Some(emblem) = &plan.emblem {
             step(crate::tr!("Применяю эмблему…", "Applying the emblem…"));
-            match crate::emblem::overrides(game_dir, &index, emblem)? {
-                Some(r) if !r.is_empty() => reqs.extend(r),
-                _ => skipped.push(crate::extract::Skip::new(&emblem.name, crate::tr!("нет эффектов", "no effects"))),
+            // memory mode: the DLL creates the effect on the hero you play (over the
+            // selection ring it moved to whatever unit was selected) and adds the attack
+            // effect to that hero's attacks; file mode has the ring only
+            let v = crate::emblem::visuals(&index, emblem).unwrap_or_default();
+            let (effect, attack) = if plan.memory_swap { (v.effect, v.attack) } else { (None, None) };
+            let r = if plan.memory_swap { Vec::new() } else { crate::emblem::ring_override(&index, emblem).unwrap_or_default() };
+            if r.is_empty() && effect.is_none() && attack.is_none() {
+                skipped.push(crate::extract::Skip::new(&emblem.name, crate::tr!("нет эффектов", "no effects")));
+            }
+            reqs.extend(r);
+            if let Some(attack) = attack {
+                glow_lines.push(crate::emblem::attack_line(&attack));
+            }
+            if let Some(effect) = effect {
+                let drivers = match &plan.vrf_cli {
+                    Some(cli) => crate::glow::drivers_cached(cli, &game_dir.join("pak01_dir.vpk"), &[effect.as_str()]).remove(&effect).unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                glow_lines.push(crate::emblem::glow_line(&effect, drivers));
             }
         }
     }
@@ -386,7 +402,8 @@ fn run_in_memory(
     }
 
     if let Some(game_dir) = vpk::game_dir_from_exe(&plan.dota_exe) {
-        if let Err(e) = crate::autoexec::keep_ring(&game_dir, plan.emblem.is_some()) {
+        // the DLL shows the emblem on your hero: the selection ring stays the game's own
+        if let Err(e) = crate::autoexec::keep_ring(&game_dir, false) {
             skipped.push(crate::extract::Skip::new(crate::tr!("Кольцо эмблемы", "Emblem ring"), e));
         }
         // Weather: no file to swap, the game turns it on by its type.

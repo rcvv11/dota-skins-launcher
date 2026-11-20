@@ -138,6 +138,9 @@ static std::unordered_map<std::string, std::string> g_itemModels;
 struct GlowCp { int cp; int attach; std::string att; float vec[3]; bool world; };
 struct GlowDef { std::string npc, fx, item; std::vector<GlowCp> cps; std::vector<std::string> parts; bool hasParts; };
 static std::vector<GlowDef> g_glowDefs;
+// The emblem's attack effect (line attack|particle): added to the attacks of the hero
+// you play, as the game adds an owned emblem's (see HookedCreateTracking)
+static std::string g_attackFx;
 // Items for empty slots the running Dota has not read yet (line
 // restart|name\tname): their button says «after restart»
 static std::string g_restartJs = "[]";
@@ -246,6 +249,7 @@ static bool LoadConfig(const std::string& path) {
     std::set<std::string> itemKeys;            // item models the glows hang on
     std::set<std::string> glowFiles;           // the glows' effects (preloaded)
     std::vector<GlowDef> glowDefs;             // the glows for the DLL's own match effects
+    std::string attackFx;                      // the emblem's attack effect
     std::string lang = "ru";
     while (std::getline(file, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
@@ -269,6 +273,12 @@ static bool LoadConfig(const std::string& path) {
                          JsString(f.size() > 4 ? f[4] : std::string()) + "," +
                          JsString(f.size() > 5 ? f[5] : std::string()) + "]";
             }
+            continue;
+        }
+        if (line.compare(0, 7, "attack|") == 0) {
+            // loaded in the menu beforehand, as the glows' effects
+            attackFx = Normalize(line.substr(7));
+            if (!attackFx.empty()) glowFiles.insert(attackFx);
             continue;
         }
         if (line.compare(0, 6, "taunt|") == 0) {
@@ -319,6 +329,7 @@ static bool LoadConfig(const std::string& path) {
     g_glowsJs = "[" + glows + "]";
     g_itemModels.swap(itemModels);
     g_glowDefs.swap(glowDefs);
+    g_attackFx = attackFx;
     g_restartJs = "[" + restart + "]";
     {
         std::string js = "{";
@@ -1977,6 +1988,7 @@ static void ReadSchemaOffsets(const Section& rdata, const Section& data, SchemaF
 
 // Off the interface thread: the scans take a moment and client.dll may still be loading.
 static void ResolveParticles(const Section& text, const Section& rdata);
+static void ResolveProjectiles(const Section& text, const Section& rdata);
 // CSkeletonInstance::SetModel(skeleton, model binding): see LiveModelTick
 using SkeletonSetModelFn = void (*)(void* skeleton, void* binding);
 static SkeletonSetModelFn g_SkeletonSetModel = nullptr;
@@ -2016,6 +2028,7 @@ static DWORD WINAPI ResolveItemHosts(LPVOID) {
         ok ? '+' : '-', (void*)list, o.body, o.sceneNode, o.skeleton, o.modelState, o.modelName, o.modelHandle,
         o.parent, o.owner, o.entity, o.ownerEntity);
     ResolveParticles(text, rdata);
+    ResolveProjectiles(text, rdata);
     // the function asserting "CSkeletonInstance::SetModel"
     g_SkeletonSetModel = (SkeletonSetModelFn)FunctionStart(FindRipRef(text, FindString(rdata, "CSkeletonInstance::SetModel")));
     Log("[%c] Live models: CSkeletonInstance::SetModel %p", g_SkeletonSetModel ? '+' : '-', (void*)g_SkeletonSetModel);
@@ -2269,6 +2282,98 @@ static void ResolveParticles(const Section& text, const Section& rdata) {
     if (ok) InterlockedExchange(&g_particlesReady, 1);
 }
 
+// --- The emblem's attack effect ---
+// An owned emblem's attack effect (Diretide, TI10, the 2021/2022 events) is not a file over
+// the hero's projectile: the server names it in the projectile's message
+// (CDOTAUserMsg_TE_Projectile.additional_particle_system_handle) and the client creates it
+// as a child of the projectile's own effect, which gives it its points (from the attacker
+// to the target, the speed). Copied over a hero's projectile file it showed nothing.
+// C_DOTA_ProjectileManager::CreateTrackingProjectile(manager, info) gets the message's
+// fields resolved: in this build info+0x08 the projectile's effect, +0x10 the additional
+// one, +0x20 the attacker's handle, +0x35 whether it is an attack (checked against the
+// function's code before it is hooked). An attack of the hero you play gets the preset
+// emblem's effect there.
+using CreateTrackingFn = int32_t (*)(void* manager, uint8_t* info);
+static CreateTrackingFn g_OrigCreateTracking = nullptr;
+static bool g_trackingHooked = false;
+static void* volatile g_attackBinding = nullptr;  // the attack effect's resource, loaded
+static std::string g_attackBound;                 // which effect it is (main thread)
+static ULONGLONG g_attackChecked = 0;             // when it was last seen loaded (main thread)
+static volatile LONG g_attacksMarked = 0;
+
+static int32_t HookedCreateTracking(void* manager, uint8_t* info) {
+    void* fx = g_attackBinding;
+    if (fx && info && info[0x35] && g_heroIndex > 0) {
+        uint32_t source = *(uint32_t*)(info + 0x20);
+        if (source != 0xFFFFFFFF && (int)(source & 0x7FFF) == g_heroIndex) {
+            *(void**)(info + 0x10) = fx;
+            if (InterlockedIncrement(&g_attacksMarked) == 1) Log("[*] Emblem: its attack effect is on your attacks");
+        }
+    }
+    return g_OrigCreateTracking(manager, info);
+}
+
+static bool HasBytes(const uint8_t* from, size_t len, const uint8_t* pattern, size_t n) {
+    for (const uint8_t* p = from; from && p + n <= from + len; p++)
+        if (memcmp(p, pattern, n) == 0) return true;
+    return false;
+}
+
+static void ResolveProjectiles(const Section& text, const Section& rdata) {
+    uint8_t* fn = FunctionStart(FindRipRef(text, FindString(rdata,
+        "CL:  C_DOTA_ProjectileManager::CreateTrackingProjectile - pSource is NULL without an override loc (handle entity %d)?\n")));
+    // mov [rsp+8],rcx; push rbp; push rbx; push r12; push r13; push r14; push r15 (15 bytes, no RIP-relative)
+    static const uint8_t kProlog[] = {0x48, 0x89, 0x4C, 0x24, 0x08, 0x55, 0x53, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57};
+    // the info's fields as this build reads them: mov r12,rdx; mov edx,[rdx+20h] (the attacker)
+    static const uint8_t kSource[] = {0x4C, 0x8B, 0xE2, 0x8B, 0x52, 0x20};
+    // movzx eax,byte [r12+35h]; mov [r15+35h],al (an attack, into the projectile)
+    static const uint8_t kAttack[] = {0x41, 0x0F, 0xB6, 0x44, 0x24, 0x35, 0x41, 0x88, 0x47, 0x35};
+    // mov rdx,[r12+10h]; lea rcx,[rbp-70h]; mov r8,r13; call (the additional effect, as the
+    // projectile's own at +0x08 a moment before)
+    static const uint8_t kExtra[] = {0x49, 0x8B, 0x54, 0x24, 0x10, 0x48, 0x8D, 0x4D, 0x90, 0x4D, 0x8B, 0xC5, 0xE8};
+    size_t span = fn ? (size_t)std::min<ptrdiff_t>(0x1000, text.start + text.size - fn) : 0;
+    bool layout = fn && span > sizeof(kProlog) && memcmp(fn, kProlog, sizeof(kProlog)) == 0 &&
+                  HasBytes(fn, 0x100, kSource, sizeof(kSource)) && HasBytes(fn, span, kAttack, sizeof(kAttack)) &&
+                  HasBytes(fn, span, kExtra, sizeof(kExtra));
+    if (layout && InstallHook(fn, sizeof(kProlog), (void*)&HookedCreateTracking, (void**)&g_OrigCreateTracking))
+        g_trackingHooked = true;
+    Log("[%c] Emblem attacks: CreateTrackingProjectile %p%s", g_trackingHooked ? '+' : '-', (void*)fn,
+        g_trackingHooked ? " hooked" : layout ? " NOT hooked" : fn ? " (another layout: not hooked)" : "");
+}
+
+// Main thread, every glow tick: the preset emblem's attack effect loaded for the hooked
+// projectiles (into the engine's just-in-time manifest, as the stand-ins: it was loaded in
+// the menu already, so this only gives its binding), looked at again every few seconds.
+static void AttackFxTick() {
+    if (!g_trackingHooked || g_inMenu) return;
+    std::string fx;
+    AcquireSRWLockShared(&g_glowsLock);
+    fx = g_attackFx;
+    ReleaseSRWLockShared(&g_glowsLock);
+    ULONGLONG now = GetTickCount64();
+    if (fx == g_attackBound && (fx.empty() || now - g_attackChecked < 3000)) return;
+    bool fresh = fx != g_attackBound;
+    g_attackBound = fx;
+    g_attackChecked = now;
+    if (fx.empty()) {
+        g_attackBinding = nullptr;
+        return;
+    }
+    if (!g_SetResourceName || !g_BlockingLoad || !g_ResourceSystem) return;
+    ResourceName name;
+    if (!g_SetResourceName(&name, fx.c_str())) {
+        g_attackBinding = nullptr;
+        return;
+    }
+    auto status = (GetStatusFn)(*(void***)g_ResourceSystem)[kGetStatusSlot];
+    if (!fresh && g_attackBinding && status(g_ResourceSystem, &name) == kResourceResident) return;
+    void* binding = g_BlockingLoad(g_ResourceSystem, &name, 0);
+    if (status(g_ResourceSystem, &name) != kResourceResident) binding = nullptr;
+    if (fresh || binding != g_attackBinding)
+        Log("[%c] Emblem attack effect %s: %s", binding ? '+' : '-', fx.c_str(), binding ? "ready" : "not loaded");
+    g_attackBinding = binding;
+}
+
 static int32_t CreateGlow(void* mgr, const std::string& fx, void* ent, const std::vector<GlowCp>& cps) {
     ParticleDesc d{};
     d.name = fx.c_str();
@@ -2326,7 +2431,8 @@ static void MatchGlowTick() {
     g_matchFxVersion = version;
     if (hero && !g_heroUnit.empty() && !fresh) {
         for (auto& d : defs) {
-            if (d.npc != g_heroUnit) continue;
+            // "*": an effect for whichever hero you play (the emblem)
+            if (d.npc != g_heroUnit && d.npc != "*") continue;
             const ItemHost* host = nullptr;
             for (auto& h : g_hosts)
                 if (h.key == d.item && (h.parent == g_heroIndex || h.owner == g_heroIndex)) { host = &h; break; }
@@ -2746,6 +2852,7 @@ static bool CheckDslMessage(const char* msg) {
         RefreshItemHosts();
         LiveModelTick();
         MatchGlowTick();
+        AttackFxTick();
     }
     else if (strncmp(p, "DSL_LOOP", 8) == 0) {
         // a new script context: it has neither the glow table nor the item models yet
@@ -2764,6 +2871,9 @@ static bool CheckDslMessage(const char* msg) {
             AcquireSRWLockExclusive(&g_rulesLock);
             g_localNpc.clear();
             ReleaseSRWLockExclusive(&g_rulesLock);
+            // the emblem's attack effect: its binding taken again in the match
+            g_attackBinding = nullptr;
+            g_attackBound.clear();
         }
     }
     else if (strncmp(p, "DSL_LOG", 7) == 0) Log("[js] %.3800s", p + 7);

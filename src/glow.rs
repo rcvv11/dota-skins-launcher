@@ -12,6 +12,9 @@ use std::sync::Mutex;
 /// One control point of a glow: `(cp, attach type, attachment)`.
 pub type Driver = (u32, String, String);
 
+/// A glow's "hero" for an effect on whichever hero you play (the emblem).
+pub const ANY_HERO: &str = "*";
+
 /// `(hero model, particle)` -> the particles the DLL creates on the hero.
 type Parts = HashMap<(String, String), Vec<String>>;
 
@@ -469,7 +472,19 @@ fn matching_close(text: &str) -> Option<usize> {
 /// whose model the swap table turns into `item`); where that is not found, it
 /// creates `parts` on the hero (see [`parts_cached`]).
 pub fn config_line(npc: &str, particle: &str, drivers: &[Driver], item: Option<&str>, parts: &[String]) -> String {
-    format!("glow|{npc}|{particle}|{}|{}|{}", drivers_text(drivers), item.unwrap_or(""), parts.join(","))
+    let drivers: Vec<Driver> = drivers.iter().cloned().map(on_entity).collect();
+    format!("glow|{npc}|{particle}|{}|{}|{}", drivers_text(&drivers), item.unwrap_or(""), parts.join(","))
+}
+
+/// Control point 0 is the effect's own place: on the entity, whatever its file's
+/// preview says (an emblem's preview puts it at the world origin, and on the hero
+/// it then hung in the middle of the map). Other world-origin points are values.
+fn on_entity(d: Driver) -> Driver {
+    if d.0 == 0 && d.1 == "PATTACH_WORLDORIGIN" {
+        (0, "PATTACH_ABSORIGIN_FOLLOW".to_string(), String::new())
+    } else {
+        d
+    }
 }
 
 #[cfg(test)]
@@ -589,5 +604,11 @@ mod tests {
         );
         // no item model, nothing left for the hero
         assert_eq!(config_line("npc", "p.vpcf", &d[..1], None, &[]), "glow|npc|p.vpcf|0:PATTACH_POINT_FOLLOW:attach_weapon_l||");
+        // an emblem: control point 0 at the world origin in its preview goes on the hero
+        let emblem = vec![(0, "PATTACH_WORLDORIGIN".to_string(), String::new()), (6, "PATTACH_WORLDORIGIN".to_string(), "1.0,0.0,0.0".to_string())];
+        assert_eq!(
+            config_line("*", "e.vpcf", &emblem, None, &["e.vpcf".to_string()]),
+            "glow|*|e.vpcf|0:PATTACH_ABSORIGIN_FOLLOW:;6:PATTACH_WORLDORIGIN:1.0,0.0,0.0||e.vpcf"
+        );
     }
 }
