@@ -37,6 +37,10 @@ pub struct Plan {
     /// Apply in memory (see inject.rs): no files in the game folder, Dota is
     /// started by the job with changer.dll injected.
     pub memory_swap: bool,
+    /// The items the account wears (owned.rs): their files take the preset's too.
+    pub owned: std::collections::HashSet<u32>,
+    /// The prismatic gems picked per item (gems.rs): the item and the colour's name.
+    pub gems: Vec<(crate::visuals::HeroItem, String)>,
 }
 
 pub fn spawn(plan: Plan, ctx: egui::Context) -> Receiver<Msg> {
@@ -145,7 +149,23 @@ fn run(plan: &Plan, step: &dyn Fn(&str)) -> Result<String, String> {
                     r.src = to.clone();
                 }
             }
-            let (hero_reqs, glows) = crate::visuals::hero_overrides_and_glows(&index, &plan.hero_items, &units, &npcs);
+            // A style with a model of its own (Lion's Gazing Eye «alternate»): that model
+            // in place of the item's usual one.
+            let styled: std::collections::HashMap<String, String> = plan
+                .hero_items
+                .iter()
+                .filter_map(|h| {
+                    let base = h.model.as_deref().map(str::trim).filter(|m| m.ends_with(".vmdl"))?;
+                    let style = index.style_model(&h.item)?;
+                    Some((crate::extract::compiled_path(base), crate::extract::compiled_path(&style)))
+                })
+                .collect();
+            for r in &mut reqs {
+                if let Some(to) = styled.get(&r.src) {
+                    r.src = to.clone();
+                }
+            }
+            let (hero_reqs, glows) = crate::visuals::hero_overrides_and_glows(&index, &plan.hero_items, &units, &npcs, &plan.owned);
             reqs.extend(hero_reqs);
             // Glows no file can place: the DLL creates them on the hero in a match.
             if let (false, Some(cli)) = (glows.is_empty(), &plan.vrf_cli) {
@@ -199,12 +219,50 @@ fn run(plan: &Plan, step: &dyn Fn(&str)) -> Result<String, String> {
                 let groups = crate::skins::material_groups_cached(cli, &game_dir.join("pak01_dir.vpk"), &models);
                 reqs.extend(crate::skins::overrides(&wanted, &groups));
             }
+            // the same styles switched on the models themselves by changer.dll (in the
+            // running game too: a model already loaded keeps the materials it took)
+            if plan.memory_swap {
+                glow_lines.extend(crate::skins::group_lines(&index, &plan.hero_items, &wanted));
+                // and the arcanas' levels: their pieces' meshes of the chosen style
+                let levels = crate::skins::arcana_levels(&index, &plan.hero_items);
+                if let (false, Some(cli)) = (levels.is_empty(), &plan.vrf_cli) {
+                    let models: Vec<String> = levels.keys().cloned().collect();
+                    let meshes = crate::skins::mesh_groups_cached(cli, &game_dir.join("pak01_dir.vpk"), &models);
+                    glow_lines.extend(crate::skins::mask_lines(&levels, &meshes));
+                }
+            }
             let (r, missed) = crate::visuals::overrides(&index, &plan.general, &units, true);
+            // A terrain (another map for the world) and a HUD skin have no file to swap:
+            // changer.dll tells the game the preset's, its terrain at every map load, its
+            // skin to the HUD (no restart for either)
+            let mut told: Vec<String> = Vec::new();
+            if plan.memory_swap {
+                for g in &plan.general {
+                    if let Some((from, to)) = index.map_override(g) {
+                        glow_lines.push(format!("terrain|{from}|{to}"));
+                        told.push(g.name.clone());
+                    }
+                    if let Some(skin) = index.hud_skin(g) {
+                        glow_lines.push(format!("hudskin|{skin}"));
+                        told.push(g.name.clone());
+                    }
+                    // a map effect: its materials set by the game's own setters (in
+                    // the running game too), not over the default post-process file
+                    for (kind, material) in index.map_effects(g) {
+                        glow_lines.push(format!("shader|{kind}|{material}"));
+                        told.push(g.name.clone());
+                    }
+                }
+            }
+            let default_shader = crate::extract::compiled_path(crate::visuals::DEFAULT_MAP_SHADER);
+            let r: Vec<_> = r.into_iter().filter(|q| !(plan.memory_swap && q.dst == default_shader)).collect();
             reqs.extend(r);
-            skipped.extend(missed);
+            skipped.extend(missed.into_iter().filter(|s| !told.contains(&s.name)));
         }
 
         if plan.memory_swap {
+            // Prismatic gems: the item page's colours, the ones picked for the heroes.
+            glow_lines.extend(crate::gems::lines(&index, &plan.gems, &plan.hero_items, &plan.owned, &data.units, npcs));
             // Items for empty slots: the slot's stand-in model is swapped for the item's.
             for pick in &plan.schema_picks {
                 let Some(npc) = npcs.get(&crate::schema::norm(&pick.hero)) else { continue };
@@ -391,7 +449,11 @@ fn run_in_memory(
     step: &dyn Fn(&str),
 ) -> Result<String, String> {
     step(crate::tr!("Записываю таблицу подмен…", "Writing the swap table…"));
-    let rules = crate::inject::write_config(reqs, glows, hero_of)?;
+    // the weather for the running game too (the DLL sets cl_weather): autoexec.cfg only
+    // gives it when Dota starts
+    let mut lines = glows.to_vec();
+    lines.push(format!("weather|{}", weather.unwrap_or(0)));
+    let rules = crate::inject::write_config(reqs, &lines, hero_of)?;
     crate::picks::trace("  swap table written");
     if !plan.install.files.is_empty() {
         skipped.push(crate::extract::Skip::new(crate::tr!("Свои файлы", "Own files"), crate::tr!("в режиме «в памяти» не применяются", "do not apply in memory mode")));

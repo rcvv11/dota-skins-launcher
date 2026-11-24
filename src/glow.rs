@@ -232,7 +232,7 @@ fn warm(dota_exe: &str, cli: &Path, items: &[crate::visuals::HeroItem]) {
         let Ok(data) = crate::gamedata::load(&dir) else { return };
         let pak = dir.join("pak01_dir.vpk");
         let started = std::time::Instant::now();
-        let (_, glows) = crate::visuals::hero_overrides_and_glows(&data.index, items, &data.units, &data.npcs);
+        let (_, glows) = crate::visuals::hero_overrides_and_glows(&data.index, items, &data.units, &data.npcs, &Default::default());
         let mut pairs: Vec<(String, String)> = glows
             .iter()
             .filter_map(|g| data.units.get(&g.npc).map(|m| (g.particle.clone(), m.clone())))

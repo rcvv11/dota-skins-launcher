@@ -156,6 +156,7 @@ impl LauncherApp {
                 name: crate::tr!("Основной", "Main").to_string(),
                 skins: Vec::new(),
                 styles: Default::default(),
+                gems: Default::default(),
             });
             // in-game picks read presets from disk
             let _ = config::save_profiles(&profiles);
@@ -938,11 +939,14 @@ impl LauncherApp {
             .iter()
             .filter(|s| ids.contains(&s.id))
             .collect();
+        // the items the account wears: their files take the preset's too
+        let owned = crate::vpk::game_dir_from_exe(&self.config.dota_path).map(|d| crate::owned::equipped(&d)).unwrap_or_default();
         let (overrides, schema_picks, unsupported) =
-            crate::extract::plan(&chosen, &self.catalog, &self.config.override_targets);
+            crate::extract::plan(&chosen, &self.catalog, &self.config.override_targets, &owned);
         let emblem = crate::emblem::from_preset(&chosen);
         let mut general = crate::visuals::general_items(&chosen);
         let mut hero_items = crate::visuals::hero_items(&chosen);
+        crate::visuals::with_siblings(&mut hero_items, &self.catalog, &owned);
         crate::visuals::with_styles(&mut general, &mut hero_items, &self.profiles[self.active_index()].styles);
         job::Plan {
             install: Install::new(
@@ -962,6 +966,8 @@ impl LauncherApp {
             launch_args: self.config.launch_args.clone(),
             restart,
             memory_swap: self.config.memory_swap,
+            owned,
+            gems: crate::gems::chosen(&self.catalog, &self.profiles[self.active_index()].gems),
         }
     }
 
@@ -1478,6 +1484,7 @@ impl LauncherApp {
                         name,
                         skins: Vec::new(),
                         styles: Default::default(),
+                        gems: Default::default(),
                     });
                     self.set_active(self.profiles.len() - 1);
                     self.profiles_dirty = true;

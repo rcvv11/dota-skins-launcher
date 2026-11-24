@@ -66,6 +66,33 @@ fn run(ctx: egui::Context) {
                 if !enabled {
                     continue;
                 }
+                // a prismatic gem picked on Dota's item page: «@gem», the colour's name
+                // («-»: the item's own gem again), the item's names on the page
+                if press.labels.first().map(String::as_str) == Some("@gem") {
+                    if !picks.is_empty() {
+                        let _ = wear(&ctx, &std::mem::take(&mut picks));
+                    }
+                    let color = press.labels.get(1).filter(|c| c.as_str() != "-").cloned().unwrap_or_default();
+                    let names_on_page: Vec<String> = press.labels.iter().skip(2).cloned().collect();
+                    // the item of that exact name, else as a press names it (a localized name)
+                    let item = names_on_page
+                        .iter()
+                        .find_map(|n| catalog.skins.iter().find(|s| s.name.eq_ignore_ascii_case(n.trim())))
+                        .or_else(|| {
+                            let at = crate::picks::Press { tick: press.tick, def: press.def, labels: names_on_page.clone() };
+                            crate::picks::items_at(&catalog, &at, names.get()).into_iter().next()
+                        })
+                        .map(|s| s.id.clone());
+                    crate::picks::trace(&format!(
+                        "  gem {} for {}",
+                        if color.is_empty() { "-" } else { &color },
+                        item.as_deref().unwrap_or("an unknown item")
+                    ));
+                    if let Some(id) = item {
+                        let _ = set_gem(&ctx, &id, &color);
+                    }
+                    continue;
+                }
                 // Dota's persona switch: «@persona», hero name
                 if press.labels.first().map(String::as_str) == Some("@persona") {
                     if !picks.is_empty() {
@@ -134,12 +161,44 @@ pub fn toggle_persona(ctx: &egui::Context, hero: &str) -> Result<bool, ()> {
     if ok == Some(true) { Ok(!worn) } else { Err(()) }
 }
 
+/// Gives the item (catalog id) the prismatic gem `color` in the active preset (an
+/// empty name: its own gem again) and applies the preset.
+pub fn set_gem(ctx: &egui::Context, id: &str, color: &str) -> Result<(), ()> {
+    let cfg = config::load_config();
+    if !cfg.memory_swap {
+        return Err(());
+    }
+    let assets = config::assets_dir();
+    let mut catalog = Catalog::load(&assets).unwrap_or_default();
+    catalog.merge_custom(&config::load_custom_files());
+    let mut profiles = config::load_profiles();
+    let index = cfg.active_profile.min(profiles.len().saturating_sub(1));
+    let profile = profiles.get_mut(index).ok_or(())?;
+    if color.trim().is_empty() {
+        profile.gems.remove(id);
+    } else {
+        profile.gems.insert(id.to_string(), color.trim().to_string());
+    }
+    let plan = plan_for(&cfg, &catalog, &assets, profile);
+    config::save_profiles(&profiles).map_err(|_| ())?;
+    let rx = job::spawn(plan, ctx.clone());
+    let ok = rx.iter().find_map(|m| match m {
+        job::Msg::Done(r) => Some(r.is_ok()),
+        job::Msg::Step(_) => None,
+    });
+    ctx.request_repaint();
+    if ok == Some(true) { Ok(()) } else { Err(()) }
+}
+
 /// Install plan for a preset, as the launcher's «Apply» builds it.
 fn plan_for(config: &Config, catalog: &Catalog, assets: &std::path::Path, profile: &Profile) -> job::Plan {
     let chosen: Vec<&Skin> = catalog.skins.iter().filter(|s| profile.skins.contains(&s.id)).collect();
-    let (overrides, schema_picks, unsupported) = crate::extract::plan(&chosen, catalog, &config.override_targets);
+    // the items the account wears: their files take the preset's too
+    let owned = crate::vpk::game_dir_from_exe(&config.dota_path).map(|d| crate::owned::equipped(&d)).unwrap_or_default();
+    let (overrides, schema_picks, unsupported) = crate::extract::plan(&chosen, catalog, &config.override_targets, &owned);
     let mut general = crate::visuals::general_items(&chosen);
     let mut hero_items = crate::visuals::hero_items(&chosen);
+    crate::visuals::with_siblings(&mut hero_items, catalog, &owned);
     crate::visuals::with_styles(&mut general, &mut hero_items, &profile.styles);
     job::Plan {
         install: Install::new(&chosen, assets, config::resolve_mod_dir(config), config.pack_vpk),
@@ -154,6 +213,8 @@ fn plan_for(config: &Config, catalog: &Catalog, assets: &std::path::Path, profil
         launch_args: config.launch_args.clone(),
         restart: false,
         memory_swap: config.memory_swap,
+        owned,
+        gems: crate::gems::chosen(catalog, &profile.gems),
     }
 }
 

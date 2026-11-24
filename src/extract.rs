@@ -98,10 +98,12 @@ fn persona_defaults(skins: &[&Skin], catalog: &Catalog) -> Vec<Req> {
 /// actually owned in that slot). That is the only way to change slots the game
 /// has no default file for — e.g. Anti-Mage's shoulders, baked into the body
 /// model: the item's model is written over the donor's file instead.
+/// `owned`: the definition indexes of the items the account wears (owned.rs).
 pub fn plan(
     skins: &[&Skin],
     catalog: &Catalog,
     targets: &std::collections::BTreeMap<String, String>,
+    owned: &HashSet<u32>,
 ) -> (Vec<Req>, Vec<crate::schema::Pick>, Vec<Skip>) {
     let mut reqs = persona_defaults(skins, catalog);
     let mut picks = Vec::new();
@@ -177,15 +179,18 @@ pub fn plan(
         };
         unsupported.push(Skip::new(&s.name, reason));
     }
-    reqs.extend(same_slot_items(skins, catalog));
+    reqs.extend(same_slot_items(skins, catalog, owned));
     (reqs, picks, unsupported)
 }
 
 /// The player may wear an own item in the slot instead of the default one (a
 /// bought bow on Drow): the game then loads that item's model, not the default
-/// file. So the picked skin also takes the files of every other catalog item of
-/// that hero and slot. These come after the default-file swaps.
-fn same_slot_items(skins: &[&Skin], catalog: &Catalog) -> Vec<Req> {
+/// file. So the picked skin also takes the files of the items of that hero and
+/// slot the account wears (`owned`). Only those: an item swapped for the picked
+/// one showed the picked one on its wardrobe card and its try-on too (every
+/// Anti-Mage weapon as Blade of the Survivor). These come after the default-file
+/// swaps.
+fn same_slot_items(skins: &[&Skin], catalog: &Catalog, owned: &HashSet<u32>) -> Vec<Req> {
     let chosen_models: std::collections::HashSet<String> = skins
         .iter()
         .filter_map(|s| s.model.as_deref())
@@ -200,6 +205,9 @@ fn same_slot_items(skins: &[&Skin], catalog: &Catalog) -> Vec<Req> {
         let src = compiled_path(model);
         for other in &catalog.skins {
             if other.id == s.id || other.slot != s.slot || !other.hero_names().iter().any(|h| s.fits_hero(h)) {
+                continue;
+            }
+            if !other.index.is_some_and(|i| owned.contains(&i)) {
                 continue;
             }
             let Some(m) = other.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) else { continue };
@@ -296,7 +304,7 @@ mod tests {
     fn wearable_uses_slot_default() {
         let c = catalog("Axe", "models/heroes/axe/axe.vmdl", &[("weapon", "models/heroes/axe/axe_weapon.vmdl")]);
         let s = skin("Axe", "weapon", "models/items/axe/arc/arc.vmdl");
-        let (reqs, _, uns) = plan(&[&s], &c, &Default::default());
+        let (reqs, _, uns) = plan(&[&s], &c, &Default::default(), &Default::default());
         assert!(uns.is_empty());
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0].src, "models/items/axe/arc/arc.vmdl_c");
@@ -307,7 +315,7 @@ mod tests {
     fn body_slot_uses_hero_model() {
         let c = catalog("Axe", "models/heroes/axe/axe.vmdl", &[]);
         let s = skin("Axe", "hero_base", "models/items/axe/arc/arc.vmdl");
-        let (reqs, _, uns) = plan(&[&s], &c, &Default::default());
+        let (reqs, _, uns) = plan(&[&s], &c, &Default::default(), &Default::default());
         assert!(uns.is_empty());
         assert_eq!(reqs[0].dst, "models/heroes/axe/axe.vmdl_c");
     }
@@ -318,7 +326,7 @@ mod tests {
         // the table gets a model_player instead of the item being dropped.
         let c = catalog("Axe", "models/heroes/axe/axe.vmdl", &[]);
         let s = skin("Axe", "weapon", "models/items/axe/arc/arc.vmdl");
-        let (reqs, picks, uns) = plan(&[&s], &c, &Default::default());
+        let (reqs, picks, uns) = plan(&[&s], &c, &Default::default(), &Default::default());
         assert!(reqs.is_empty());
         assert!(uns.is_empty(), "предмет не пропускается: {uns:?}");
         assert_eq!(picks.len(), 1);
@@ -331,7 +339,7 @@ mod tests {
     fn modelless_item_is_unsupported() {
         let c = catalog("Axe", "models/heroes/axe/axe.vmdl", &[("taunt", "models/x.vmdl")]);
         let s = skin("Axe", "taunt", "");
-        let (_, _, uns) = plan(&[&s], &c, &Default::default());
+        let (_, _, uns) = plan(&[&s], &c, &Default::default(), &Default::default());
         assert_eq!(uns.len(), 1);
         assert!(uns[0].reason.contains("насмешка"), "{}", uns[0].reason);
     }
@@ -341,7 +349,7 @@ mod tests {
         let c = catalog("Axe", "models/heroes/axe/axe.vmdl", &[]);
         let mut s = skin("Axe", "taunt", "");
         s.files = vec![crate::catalog::FileMap { from: "a.vpk".into(), to: String::new() }];
-        let (reqs, _, uns) = plan(&[&s], &c, &Default::default());
+        let (reqs, _, uns) = plan(&[&s], &c, &Default::default(), &Default::default());
         assert!(reqs.is_empty());
         assert!(uns.is_empty());
     }
@@ -361,7 +369,7 @@ mod tests {
             "id".to_string(),
             "models/items/antimage/worn_shoulder/worn_shoulder.vmdl".to_string(),
         );
-        let (reqs, _, uns) = plan(&[&s], &c, &targets);
+        let (reqs, _, uns) = plan(&[&s], &c, &targets, &Default::default());
         assert!(uns.is_empty(), "с выбранным донором предмет не пропускается");
         assert_eq!(reqs.len(), 1);
         assert_eq!(
@@ -380,7 +388,7 @@ mod tests {
         // model_player and no donor is needed any more.
         let c = catalog("Anti-Mage", "models/heroes/antimage/antimage.vmdl", &[]);
         let s = skin("Anti-Mage", "shoulder", "models/items/x/y.vmdl");
-        let (reqs, picks, uns) = plan(&[&s], &c, &Default::default());
+        let (reqs, picks, uns) = plan(&[&s], &c, &Default::default(), &Default::default());
         assert!(reqs.is_empty());
         assert!(uns.is_empty(), "{uns:?}");
         assert_eq!(picks.len(), 1);
@@ -392,7 +400,7 @@ mod tests {
         // A hero the catalog has no base model for cannot be patched either.
         let c = Catalog::default();
         let s = skin("Nobody", "weapon", "models/items/x/y.vmdl");
-        let (reqs, picks, uns) = plan(&[&s], &c, &Default::default());
+        let (reqs, picks, uns) = plan(&[&s], &c, &Default::default(), &Default::default());
         assert!(reqs.is_empty());
         assert!(picks.is_empty());
         assert_eq!(uns.len(), 1);

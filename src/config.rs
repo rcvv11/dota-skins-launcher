@@ -59,6 +59,10 @@ pub struct Profile {
     /// Chosen style per item id (absent = default style 0).
     #[serde(default)]
     pub styles: std::collections::BTreeMap<String, u32>,
+    /// Chosen prismatic gem per item id: the colour's name ("UnusualDungeonDoom"),
+    /// picked on Dota's item page (see gems.rs). Absent = the item's own gem.
+    #[serde(default)]
+    pub gems: std::collections::BTreeMap<String, String>,
 }
 
 /// %APPDATA%\dota-skins

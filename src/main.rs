@@ -13,6 +13,7 @@ mod downloads;
 mod emblem;
 mod extract;
 mod gamedata;
+mod gems;
 mod glow;
 mod gsi;
 #[macro_use]
@@ -21,6 +22,7 @@ mod icons;
 mod inject;
 mod job;
 mod mount;
+mod owned;
 mod picks;
 mod preview;
 mod schema;

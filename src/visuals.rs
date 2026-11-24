@@ -15,7 +15,9 @@ use crate::extract::{compiled_path, Req, Skip};
 use crate::schema::{block_end, find_from, items_section, scalar};
 
 /// The map's post-process material, used when no shader item is equipped.
-const DEFAULT_MAP_SHADER: &str = "materials/dev/deferred_post_process.vmat";
+pub const DEFAULT_MAP_SHADER: &str = "materials/dev/deferred_post_process.vmat";
+/// An effect that shows nothing (Twilight Schism's in place of Luna's glaive glow).
+const NULL_FX: &str = "particles/error/null.vpcf";
 /// The item whose courier models are the ones every player has by default.
 const DEFAULT_COURIER: &str = "Default Courier";
 
@@ -53,6 +55,8 @@ pub struct Modifier {
     pub modifier: Option<String>,
     /// Style the modifier belongs to (`"style"`), None = every style.
     pub style: Option<u32>,
+    /// An `arcana_level` modifier's level (`"level"`).
+    pub level: Option<u32>,
 }
 
 /// Items of the preset that belong to no hero (map items, emblem excluded):
@@ -74,6 +78,8 @@ pub struct HeroItem {
     pub slot: String,
     /// `model_player` from the catalog (for its material groups).
     pub model: Option<String>,
+    /// The catalog's other items of its hero and slot (see `with_siblings`).
+    pub siblings: Vec<ItemRef>,
 }
 
 /// Hero items of the preset: their effects are applied on top of the model.
@@ -86,8 +92,28 @@ pub fn hero_items(chosen: &[&Skin]) -> Vec<HeroItem> {
             heroes: s.hero_names().iter().map(|h| h.to_string()).collect(),
             slot: s.slot.clone(),
             model: s.model.clone(),
+            siblings: Vec::new(),
         })
         .collect()
+}
+
+/// Each hero item's siblings: the items of its hero and slot the account wears
+/// (`owned`, owned.rs). The game then loads that item's files, not the default
+/// ones, and those take the picked item's too. Not the others: they keep their
+/// own look on their wardrobe cards and try-ons.
+pub fn with_siblings(items: &mut [HeroItem], catalog: &crate::catalog::Catalog, owned: &std::collections::HashSet<u32>) {
+    for h in items.iter_mut() {
+        if crate::catalog::is_body_slot(&h.slot) {
+            continue;
+        }
+        h.siblings = catalog
+            .skins
+            .iter()
+            .filter(|o| o.name != h.item.name && o.slot == h.slot && o.hero_names().iter().any(|n| h.heroes.iter().any(|x| x == n)))
+            .filter(|o| o.index.is_some_and(|i| owned.contains(&i)))
+            .map(ItemRef::of)
+            .collect();
+    }
 }
 
 /// The quoted key right before the `{` at `open`.
@@ -121,6 +147,8 @@ pub struct Table<'a> {
     defaults: HashMap<(String, String), (usize, usize)>,
     /// `(type, asset) -> modifier` of the default courier: what a courier item replaces.
     couriers: HashMap<(String, String), String>,
+    /// `npc_dota_hero_*` (lowercase) -> the items it uses: definition index and block.
+    hero_items: HashMap<String, Vec<(u32, (usize, usize))>>,
 }
 
 impl<'a> Table<'a> {
@@ -134,14 +162,18 @@ impl<'a> Table<'a> {
                     .collect()
             })
             .unwrap_or_default();
-        let mut table = Self { text, items, defaults: HashMap::new(), couriers: HashMap::new() };
+        let mut table = Self { text, items, defaults: HashMap::new(), couriers: HashMap::new(), hero_items: HashMap::new() };
         let mut defaults = HashMap::new();
-        for &(open, close) in table.items.values() {
+        let mut hero_items: HashMap<String, Vec<(u32, (usize, usize))>> = HashMap::new();
+        for (key, &(open, close)) in &table.items {
             let block = &text[open..=close];
+            let Some(hero) = crate::schema::hero_of(block) else { continue };
+            if let Ok(index) = key.trim().parse::<u32>() {
+                hero_items.entry(hero.to_ascii_lowercase()).or_default().push((index, (open, close)));
+            }
             if !crate::schema::has_scalar(block, b"prefab", b"default_item") {
                 continue;
             }
-            let Some(hero) = crate::schema::hero_of(block) else { continue };
             // No `item_slot` means the schema default, "weapon".
             let slot = crate::schema::slot_of(block).unwrap_or_else(|| "weapon".into());
             let key = (hero.to_ascii_lowercase(), slot);
@@ -153,6 +185,10 @@ impl<'a> Table<'a> {
             }
         }
         table.defaults = defaults;
+        for blocks in hero_items.values_mut() {
+            blocks.sort_unstable();
+        }
+        table.hero_items = hero_items;
         let default = ItemRef { name: DEFAULT_COURIER.into(), index: None, style: 0 };
         table.couriers = table
             .modifiers(&default)
@@ -161,6 +197,52 @@ impl<'a> Table<'a> {
             .filter_map(|m| Some(((m.kind, m.asset?), m.modifier?)))
             .collect();
         table
+    }
+
+    /// The table's colours (top-level `colors`): key, `color_name`, `hex_color`, in
+    /// table order (the prismatic gems' are the `unusual_*` ones).
+    pub fn colors(&self) -> Vec<(String, String, String)> {
+        let text = self.text;
+        let Some(at) = find_from(text, b"\n\t\"colors\"", 0) else { return Vec::new() };
+        let Some(open) = find_from(text, b"{", at) else { return Vec::new() };
+        let Some(close) = block_end(text, open) else { return Vec::new() };
+        children(text, (open, close))
+            .into_iter()
+            .filter_map(|(key, o, c)| {
+                let body = &text[o..=c];
+                Some((key, scalar(body, b"color_name")?, scalar(body, b"hex_color")?))
+            })
+            .collect()
+    }
+
+    /// Items whose effects follow a prismatic gem (`affected_by_color_gems`), and the
+    /// bodies (`hero_base` with an `entity_model`) of their heroes: a gem colours its
+    /// hero, so their item pages offer one. Sorted, once each.
+    pub fn gem_items(&self) -> Vec<String> {
+        let text = self.text;
+        let mut names = Vec::new();
+        let mut heroes = std::collections::HashSet::new();
+        for &(open, close) in self.items.values() {
+            let block = &text[open..=close];
+            if find_from(block, b"\"affected_by_color_gems\"", 0).is_none() {
+                continue;
+            }
+            names.extend(scalar(block, b"name"));
+            heroes.extend(crate::schema::hero_of(block).map(|h| h.to_ascii_lowercase()));
+        }
+        for hero in &heroes {
+            for (_, (open, close)) in self.hero_items.get(hero).into_iter().flatten() {
+                let block = &text[*open..=*close];
+                if crate::schema::slot_of(block).as_deref() == Some("hero_base")
+                    && find_from(block, b"\"entity_model\"", 0).is_some()
+                {
+                    names.extend(scalar(block, b"name"));
+                }
+            }
+        }
+        names.sort();
+        names.dedup();
+        names
     }
 
     /// The hero's `default_item` block for `slot` (first one in the table).
@@ -270,6 +352,110 @@ impl<'a> Table<'a> {
         Some(mods)
     }
 
+    /// The models an item's styles give (`visuals` > `styles` > `N` > `model_player`).
+    fn style_models(&self, block: (usize, usize)) -> Vec<String> {
+        let text = self.text;
+        let child = |range: (usize, usize), name: &str| {
+            children(text, range).into_iter().find(|(k, ..)| k.eq_ignore_ascii_case(name)).map(|(_, o, c)| (o, c))
+        };
+        let Some(styles) = child(block, "visuals").and_then(|v| child(v, "styles")) else { return Vec::new() };
+        let mut out: Vec<String> = Vec::new();
+        for (_, open, close) in children(text, styles) {
+            let body = &text[open..=close];
+            for key in [&b"model_player"[..], b"model_player1", b"model_player2", b"model_player3"] {
+                if let Some(m) = scalar(body, key).map(|m| m.trim().to_string()).filter(|m| m.ends_with(".vmdl")) {
+                    if !out.contains(&m) {
+                        out.push(m);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The model the item's chosen style gives instead of its usual one (`visuals` >
+    /// `styles` > `<style>` > `model_player`), when that style has one.
+    pub fn style_model(&self, item: &ItemRef) -> Option<String> {
+        if item.style == 0 {
+            return None;
+        }
+        let text = self.text;
+        let child = |range: (usize, usize), name: &str| {
+            children(text, range).into_iter().find(|(k, ..)| k.trim().eq_ignore_ascii_case(name)).map(|(_, o, c)| (o, c))
+        };
+        let styles = child(self.find(item)?, "visuals").and_then(|v| child(v, "styles"))?;
+        let (open, close) = child(styles, &item.style.to_string())?;
+        scalar(&text[open..=close], b"model_player").map(|m| m.trim().to_string()).filter(|m| m.ends_with(".vmdl"))
+    }
+
+    /// The materials a map effect item sets, `(map|portrait|post, material)`, from its
+    /// `map_effect` modifiers (`map_shader`, `portrait_shader`, `post_effect_shader`).
+    pub fn map_effects(&self, item: &ItemRef) -> Vec<(&'static str, String)> {
+        let Some(mods) = self.modifiers(item) else { return Vec::new() };
+        mods.into_iter()
+            .filter(|m| m.kind == "map_effect")
+            .filter_map(|m| {
+                let kind = match m.asset.as_deref()? {
+                    "map_shader" => "map",
+                    "portrait_shader" => "portrait",
+                    "post_effect_shader" => "post",
+                    _ => return None,
+                };
+                let material = m.modifier?.trim().to_ascii_lowercase();
+                material.ends_with(".vmat").then_some((kind, material))
+            })
+            .collect()
+    }
+
+    /// The map a terrain loads in place of the regular one, as map base names:
+    /// `("dota", "dota_desert")` from its `map_override` (`maps/dota.vmap` ->
+    /// `maps/dota_desert.vmap`).
+    pub fn map_override(&self, item: &ItemRef) -> Option<(String, String)> {
+        let m = self.modifiers(item)?.into_iter().find(|m| m.kind == "map_override")?;
+        let (from, to) = (map_base(m.asset.as_deref()?), map_base(m.modifier.as_deref()?));
+        (!from.is_empty() && !to.is_empty() && from != to).then_some((from, to))
+    }
+
+    /// The HUD skin an interface item puts on: the folder of its images
+    /// (`resource/flash3/images/hud_skins/<skin>`), from its `hud_skin` modifier.
+    pub fn hud_skin(&self, item: &ItemRef) -> Option<String> {
+        let m = self.modifiers(item)?.into_iter().find(|m| m.kind == "hud_skin")?;
+        let skin = m.asset.or(m.modifier)?.trim().to_ascii_lowercase();
+        (!skin.is_empty()).then_some(skin)
+    }
+
+    /// For each hero asset, the files the hero's items, in any style, put in its
+    /// place: the player may wear one of those items. Keys are `p|<particle>` for
+    /// particle swaps (item effects only, `particles/econ/...`) and `m|<asset>` for
+    /// model ones (a model, the hero's body, a unit such as Lycan's wolves).
+    /// Only the items of `owned` (the account's, owned.rs): the others keep their look.
+    pub fn asset_variants(&self, npc: &str, owned: &std::collections::HashSet<u32>) -> HashMap<String, Vec<String>> {
+        let mut out: HashMap<String, Vec<String>> = HashMap::new();
+        for &(index, block) in self.hero_items.get(&npc.to_ascii_lowercase()).map(Vec::as_slice).unwrap_or(&[]) {
+            if !owned.contains(&index) {
+                continue;
+            }
+            for m in self.modifiers_in(block) {
+                let Some(group) = variant_group(&m.kind) else { continue };
+                let (Some(asset), Some(file)) = (m.asset, m.modifier) else { continue };
+                let lower = file.to_ascii_lowercase();
+                let fits = if group == "p" {
+                    lower.ends_with(".vpcf") && lower.starts_with("particles/econ/")
+                } else {
+                    lower.ends_with(".vmdl")
+                };
+                if !fits {
+                    continue;
+                }
+                let list = out.entry(format!("{group}|{}", asset.to_ascii_lowercase())).or_default();
+                if !list.contains(&file) {
+                    list.push(file);
+                }
+            }
+        }
+        out
+    }
+
     /// Every `asset_modifier` in the `visuals` of the block at `block`.
     fn modifiers_in(&self, block: (usize, usize)) -> Vec<Modifier> {
         let text = self.text;
@@ -289,11 +475,28 @@ impl<'a> Table<'a> {
                         asset: scalar(body, b"asset"),
                         modifier: scalar(body, b"modifier"),
                         style: scalar(body, b"style").and_then(|v| v.trim().parse().ok()),
+                        level: scalar(body, b"level").and_then(|v| v.trim().parse().ok()),
                     }
                 })
                 .collect()
     }
 
+}
+
+/// The kind of file swap a modifier is, for its variants: `p` a particle, `m` a model.
+fn variant_group(kind: &str) -> Option<&'static str> {
+    match kind {
+        "particle" | "particle_clientside" => Some("p"),
+        "model" | "hero_model_change" | "entity_model" | "entity_clientside_model" => Some("m"),
+        _ => None,
+    }
+}
+
+/// `maps/dota.vmap` -> `dota`.
+fn map_base(path: &str) -> String {
+    let p = path.trim().replace('\\', "/").to_ascii_lowercase();
+    let p = p.strip_prefix("maps/").unwrap_or(&p);
+    p.strip_suffix(".vmap").unwrap_or(p).to_string()
 }
 
 /// Unit name -> its `Model`, from `npc_units.txt` or a hero script. Also
@@ -495,8 +698,9 @@ pub fn hero_overrides(
     items: &[HeroItem],
     units: &HashMap<String, String>,
     npcs: &HashMap<String, String>,
+    owned: &std::collections::HashSet<u32>,
 ) -> Vec<Req> {
-    hero_overrides_and_glows(table, items, units, npcs).0
+    hero_overrides_and_glows(table, items, units, npcs, owned).0
 }
 
 /// A glow an item creates that no file swap could place (the slot's default
@@ -511,22 +715,32 @@ pub struct Glow {
     pub model: Option<String>,
 }
 
-/// `hero_overrides`, plus the item glows left without a place.
+/// `hero_overrides`, plus the item glows left without a place. `owned`: the items
+/// the account wears (owned.rs), whose files take the picked items' too.
 pub fn hero_overrides_and_glows(
     table: &Table,
     items: &[HeroItem],
     units: &HashMap<String, String>,
     npcs: &HashMap<String, String>,
+    owned: &std::collections::HashSet<u32>,
 ) -> (Vec<Req>, Vec<Glow>) {
     let refs: Vec<ItemRef> = items.iter().map(|h| h.item.clone()).collect();
     let (mut reqs, _) = overrides(table, &refs, units, false);
     let mut glows = Vec::new();
+    // files the picked items show themselves: never a sibling's place to fill
+    let mut keep: std::collections::HashSet<String> = reqs.iter().map(|r| r.src.clone()).collect();
+    for h in items {
+        if let Some(mods) = table.modifiers(&h.item) {
+            keep.extend(hero_particles(&mods).into_iter().map(compiled_path));
+        }
+        if let Some(m) = h.model.as_deref().filter(|m| m.trim().ends_with(".vmdl")) {
+            keep.insert(compiled_path(m));
+        }
+    }
+    let mut sibling_reqs = Vec::new();
     for h in items {
         let Some(mods) = table.modifiers(&h.item) else { continue };
         let own = hero_particles(&mods);
-        if own.is_empty() {
-            continue;
-        }
         // How many of the item's glows already took a default item's place.
         let mut placed = 0;
         for hero in &h.heroes {
@@ -542,6 +756,7 @@ pub fn hero_overrides_and_glows(
                 }
             }
         }
+        sibling_reqs.extend(sibling_overrides(table, h, &own[..placed], &keep));
         // Glows no default item's effect stands in for: the DLL creates them on
         // the hero, always, as the item does. (An item that blanks out a hero
         // effect, like Twilight Schism turning Luna's luna_ambient_moon_glaive
@@ -560,7 +775,95 @@ pub fn hero_overrides_and_glows(
             }
         }
     }
+    let variants = variant_overrides(table, items, npcs, &reqs, owned);
+    reqs.extend(variants);
+    for r in sibling_reqs {
+        if !reqs.iter().any(|q| q.dst == r.dst) {
+            reqs.push(r);
+        }
+    }
     (reqs, glows)
+}
+
+/// The player's own item in the slot (a sibling: another item of the hero and
+/// slot) instead of the default one: the game loads its files, not the default's.
+/// Its usual model takes the picked one already (`extract::same_slot_items`), and
+/// here its models in other styles too. Its effects take the picked item's that
+/// went in the default item's place (`placed`), the rest show nothing: the DLL
+/// creates the picked item's other glows itself. `keep`: files never replaced.
+fn sibling_overrides(
+    table: &Table,
+    h: &HeroItem,
+    placed: &[&str],
+    keep: &std::collections::HashSet<String>,
+) -> Vec<Req> {
+    let mut out = Vec::new();
+    let model = h.model.as_deref().map(str::trim).filter(|m| m.ends_with(".vmdl")).map(compiled_path);
+    for sib in &h.siblings {
+        let Some(block) = table.find(sib) else { continue };
+        if let Some(model) = &model {
+            for m in table.style_models(block) {
+                let dst = compiled_path(&m);
+                if &dst != model && !keep.contains(&dst) {
+                    out.push(Req { id: h.item.name.clone(), src: model.clone(), dst });
+                }
+            }
+        }
+        let mods = table.modifiers_in(block);
+        let mut seen = std::collections::HashSet::new();
+        let theirs: Vec<&str> = hero_particles(&mods).into_iter().filter(|p| seen.insert(p.to_ascii_lowercase())).collect();
+        for (i, fx) in theirs.iter().enumerate() {
+            let dst = compiled_path(fx);
+            let src = compiled_path(placed.get(i).copied().unwrap_or(NULL_FX));
+            if dst != src && !keep.contains(&dst) {
+                out.push(Req { id: h.item.name.clone(), src, dst });
+            }
+        }
+    }
+    out
+}
+
+/// The player's own items: one of theirs (a bought weapon, or the picked item in
+/// another style, worn or in the ability effects slot) puts its own particle in
+/// place of a hero particle, or its own model in place of a hero model, body or
+/// unit (Lycan's wolves), and the game then loads that file, not the hero's. So the
+/// picked item's file takes those files too (Luna's TI9 glaive owned in its default
+/// style kept her attack purple under the picked crimson one). After the item's own
+/// swaps; a picked item's own file is never overwritten.
+fn variant_overrides(
+    table: &Table,
+    items: &[HeroItem],
+    npcs: &HashMap<String, String>,
+    reqs: &[Req],
+    owned: &std::collections::HashSet<u32>,
+) -> Vec<Req> {
+    let picked: std::collections::HashSet<&str> = reqs.iter().map(|r| r.src.as_str()).collect();
+    let mut variants: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+    let mut out: Vec<Req> = Vec::new();
+    for h in items {
+        let Some(mods) = table.modifiers(&h.item) else { continue };
+        for m in &mods {
+            let Some(group) = variant_group(&m.kind) else { continue };
+            let (Some(asset), Some(modifier)) = (m.asset.as_deref(), m.modifier.as_deref()) else { continue };
+            let ext = if group == "p" { ".vpcf" } else { ".vmdl" };
+            if !modifier.ends_with(ext) || (group == "p" && !asset.ends_with(".vpcf")) {
+                continue;
+            }
+            let src = compiled_path(modifier);
+            let key = format!("{group}|{}", asset.to_ascii_lowercase());
+            for hero in &h.heroes {
+                let Some(npc) = npcs.get(&crate::schema::norm(hero)) else { continue };
+                let of_hero = variants.entry(npc.clone()).or_insert_with(|| table.asset_variants(npc, owned));
+                for other in of_hero.get(&key).map(Vec::as_slice).unwrap_or(&[]) {
+                    let dst = compiled_path(other);
+                    if dst != src && !picked.contains(dst.as_str()) && !out.iter().any(|r| r.dst == dst) {
+                        out.push(Req { id: h.item.name.clone(), src: src.clone(), dst });
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -824,8 +1127,9 @@ mod tests {
             heroes: vec!["Anti-Mage".into()],
             slot: "weapon".into(),
             model: None,
+            siblings: Vec::new(),
         };
-        let reqs = hero_overrides(&table, &[item], &HashMap::new(), &npcs);
+        let reqs = hero_overrides(&table, &[item], &HashMap::new(), &npcs, &Default::default());
         assert_eq!(
             pairs(&reqs),
             vec![
@@ -877,9 +1181,10 @@ mod tests {
             heroes: vec!["Luna".into()],
             slot: "weapon".into(),
             model: None,
+            siblings: Vec::new(),
         };
         let npcs: HashMap<String, String> = [("luna".to_string(), "npc_dota_hero_luna".to_string())].into();
-        let (reqs, glows) = hero_overrides_and_glows(&table, &[schism], &HashMap::new(), &npcs);
+        let (reqs, glows) = hero_overrides_and_glows(&table, &[schism], &HashMap::new(), &npcs, &Default::default());
         assert_eq!(
             pairs(&reqs),
             vec![("particles/error/null.vpcf_c", "particles/units/heroes/hero_luna/luna_ambient_moon_glaive.vpcf_c")]
@@ -887,6 +1192,347 @@ mod tests {
         assert_eq!(
             glows.iter().map(|g| (g.npc.as_str(), g.particle.as_str())).collect::<Vec<_>>(),
             vec![("npc_dota_hero_luna", "particles/econ/items/luna/ti9/weapon_ambient.vpcf")]
+        );
+    }
+
+    #[test]
+    fn owned_items_particles_take_the_picked_one() {
+        let text = r#""items_game"
+{
+	"items"
+	{
+		"100"
+		{
+			"name"		"Luna TI9 Glaive"
+			"prefab"		"wearable"
+			"item_slot"		"weapon"
+			"used_by_heroes"
+			{
+				"npc_dota_hero_luna"		"1"
+			}
+			"visuals"
+			{
+				"asset_modifier"
+				{
+					"type"		"particle"
+					"asset"		"particles/units/heroes/hero_luna/luna_base_attack.vpcf"
+					"modifier"		"particles/econ/items/luna/ti9/base_attack.vpcf"
+				}
+			}
+		}
+		"101"
+		{
+			"name"		"Luna TI9 Glaive Crimson"
+			"prefab"		"wearable"
+			"item_slot"		"weapon"
+			"used_by_heroes"
+			{
+				"npc_dota_hero_luna"		"1"
+			}
+			"visuals"
+			{
+				"asset_modifier"
+				{
+					"type"		"particle"
+					"asset"		"particles/units/heroes/hero_luna/luna_base_attack.vpcf"
+					"modifier"		"particles/econ/items/luna/ti9/crimson_base_attack.vpcf"
+				}
+			}
+		}
+		"102"
+		{
+			"name"		"Drow Bow"
+			"prefab"		"wearable"
+			"item_slot"		"weapon"
+			"used_by_heroes"
+			{
+				"npc_dota_hero_drow_ranger"		"1"
+			}
+			"visuals"
+			{
+				"asset_modifier"
+				{
+					"type"		"particle"
+					"asset"		"particles/units/heroes/hero_luna/luna_base_attack.vpcf"
+					"modifier"		"particles/econ/items/drow/bow/attack.vpcf"
+				}
+			}
+		}
+	}
+}
+"#;
+        let table = Table::new(text.as_bytes());
+        let crimson = HeroItem {
+            item: item("Luna TI9 Glaive Crimson", Some(101)),
+            heroes: vec!["Luna".into()],
+            slot: "weapon".into(),
+            model: None,
+            siblings: Vec::new(),
+        };
+        let npcs: HashMap<String, String> = [("luna".to_string(), "npc_dota_hero_luna".to_string())].into();
+        // the account wears the default-style glaive (100), not the Drow bow
+        let reqs = hero_overrides(&table, &[crimson], &HashMap::new(), &npcs, &[100u32, 102].into_iter().collect());
+        assert!(hero_overrides(&table, &[HeroItem {
+            item: item("Luna TI9 Glaive Crimson", Some(101)),
+            heroes: vec!["Luna".into()],
+            slot: "weapon".into(),
+            model: None,
+            siblings: Vec::new(),
+        }], &HashMap::new(), &npcs, &Default::default()).len() == 1, "nothing the account does not wear");
+        assert_eq!(
+            pairs(&reqs),
+            vec![
+                ("particles/econ/items/luna/ti9/crimson_base_attack.vpcf_c", "particles/units/heroes/hero_luna/luna_base_attack.vpcf_c"),
+                // the same glaive in its default style, if the player owns it; not another hero's item
+                ("particles/econ/items/luna/ti9/crimson_base_attack.vpcf_c", "particles/econ/items/luna/ti9/base_attack.vpcf_c"),
+            ]
+        );
+    }
+
+    #[test]
+    fn terrain_map_and_hud_skin() {
+        let text = r#""items_game"
+{
+	"items"
+	{
+		"11339"
+		{
+			"name"		"Desert Terrain"
+			"prefab"		"terrain"
+			"visuals"
+			{
+				"asset_modifier0"
+				{
+					"type"		"map_override"
+					"asset"		"maps/dota.vmap"
+					"modifier"		"maps/dota_desert.vmap"
+					"style"		"0"
+				}
+			}
+		}
+		"10149"
+		{
+			"name"		"Dreamleague"
+			"prefab"		"hud_skin"
+			"visuals"
+			{
+				"asset_modifier1"
+				{
+					"type"		"hud_skin"
+					"asset"		"Dreamleague"
+					"modifier"		"day_night"
+				}
+			}
+		}
+	}
+}
+"#;
+        let table = Table::new(text.as_bytes());
+        assert_eq!(table.map_override(&item("Desert Terrain", Some(11339))), Some(("dota".into(), "dota_desert".into())));
+        assert_eq!(table.hud_skin(&item("Dreamleague", Some(10149))), Some("dreamleague".into()));
+        assert_eq!(table.hud_skin(&item("Desert Terrain", Some(11339))), None);
+    }
+
+    #[test]
+    fn an_owned_item_in_the_slot_takes_the_picked_one() {
+        let text = r#""items_game"
+{
+	"items"
+	{
+		"1"
+		{
+			"name"		"Lycan's Blades"
+			"prefab"		"default_item"
+			"item_slot"		"weapon"
+			"used_by_heroes"
+			{
+				"npc_dota_hero_lycan"		"1"
+			}
+			"visuals"
+			{
+				"asset_modifier0"
+				{
+					"type"		"particle_create"
+					"modifier"		"particles/units/heroes/hero_lycan/blades_glow.vpcf"
+				}
+			}
+		}
+		"10"
+		{
+			"name"		"Picked Blades"
+			"prefab"		"wearable"
+			"item_slot"		"weapon"
+			"used_by_heroes"
+			{
+				"npc_dota_hero_lycan"		"1"
+			}
+			"visuals"
+			{
+				"asset_modifier0"
+				{
+					"type"		"particle_create"
+					"modifier"		"particles/econ/items/lycan/picked/glow.vpcf"
+				}
+				"asset_modifier1"
+				{
+					"type"		"particle_create"
+					"modifier"		"particles/econ/items/lycan/picked/glow2.vpcf"
+				}
+				"asset_modifier2"
+				{
+					"type"		"entity_model"
+					"asset"		"npc_dota_lycan_wolf1"
+					"modifier"		"models/items/lycan/picked/wolf.vmdl"
+				}
+			}
+		}
+		"11"
+		{
+			"name"		"Owned Blades"
+			"prefab"		"wearable"
+			"item_slot"		"weapon"
+			"used_by_heroes"
+			{
+				"npc_dota_hero_lycan"		"1"
+			}
+			"visuals"
+			{
+				"asset_modifier0"
+				{
+					"type"		"particle_create"
+					"modifier"		"particles/econ/items/lycan/owned/glow.vpcf"
+				}
+				"asset_modifier1"
+				{
+					"type"		"particle_create"
+					"modifier"		"particles/econ/items/lycan/owned/sparks.vpcf"
+				}
+				"asset_modifier2"
+				{
+					"type"		"entity_model"
+					"asset"		"npc_dota_lycan_wolf1"
+					"modifier"		"models/items/lycan/owned/wolf.vmdl"
+				}
+				"styles"
+				{
+					"0"
+					{
+						"name"		"plain"
+					}
+					"1"
+					{
+						"name"		"gold"
+						"model_player"		"models/items/lycan/owned/blades_gold.vmdl"
+					}
+				}
+			}
+		}
+	}
+}
+"#;
+        let table = Table::new(text.as_bytes());
+        let picked = HeroItem {
+            item: item("Picked Blades", Some(10)),
+            heroes: vec!["Lycan".into()],
+            slot: "weapon".into(),
+            model: Some("models/items/lycan/picked/blades.vmdl".into()),
+            siblings: vec![item("Owned Blades", Some(11))],
+        };
+        let npcs: HashMap<String, String> = [("lycan".to_string(), "npc_dota_hero_lycan".to_string())].into();
+        let units: HashMap<String, String> = [("npc_dota_lycan_wolf1".to_string(), "models/heroes/lycan/summon_wolves.vmdl".to_string())].into();
+        let (reqs, glows) = hero_overrides_and_glows(&table, &[picked], &units, &npcs, &[11u32].into_iter().collect());
+        let got = pairs(&reqs);
+        for want in [
+            // the picked wolves over the default ones, and over the owned item's wolves
+            ("models/items/lycan/picked/wolf.vmdl_c", "models/heroes/lycan/summon_wolves.vmdl_c"),
+            ("models/items/lycan/picked/wolf.vmdl_c", "models/items/lycan/owned/wolf.vmdl_c"),
+            // the picked glow that took the default glow's place takes the owned item's first one
+            ("particles/econ/items/lycan/picked/glow.vpcf_c", "particles/units/heroes/hero_lycan/blades_glow.vpcf_c"),
+            ("particles/econ/items/lycan/picked/glow.vpcf_c", "particles/econ/items/lycan/owned/glow.vpcf_c"),
+            // the owned item's other effect shows nothing (the DLL creates glow2 itself)
+            ("particles/error/null.vpcf_c", "particles/econ/items/lycan/owned/sparks.vpcf_c"),
+            // the owned item's model in another style
+            ("models/items/lycan/picked/blades.vmdl_c", "models/items/lycan/owned/blades_gold.vmdl_c"),
+        ] {
+            assert!(got.contains(&want), "missing {want:?} in {got:?}");
+        }
+        assert_eq!(glows.iter().map(|g| g.particle.as_str()).collect::<Vec<_>>(), vec!["particles/econ/items/lycan/picked/glow2.vpcf"]);
+    }
+
+    #[test]
+    fn a_style_with_a_model_of_its_own() {
+        let text = r#""items_game"
+{
+	"items"
+	{
+		"4544"
+		{
+			"name"		"Gazing Eye of the Demon Witch"
+			"prefab"		"wearable"
+			"model_player"		"models/items/lion/hellssight_02/hellssight_02.vmdl"
+			"visuals"
+			{
+				"styles"
+				{
+					"0"
+					{
+						"name"		"plain"
+						"model_player"		"models/items/lion/hellssight_02/hellssight_02.vmdl"
+					}
+					"1"
+					{
+						"name"		"alternate"
+						"model_player"		"models/items/lion/gazing_eye_alternate/gazing_eye_alternate.vmdl"
+					}
+				}
+			}
+		}
+	}
+}
+"#;
+        let table = Table::new(text.as_bytes());
+        let mut eye = item("Gazing Eye of the Demon Witch", Some(4544));
+        assert_eq!(table.style_model(&eye), None);
+        eye.style = 1;
+        assert_eq!(table.style_model(&eye).as_deref(), Some("models/items/lion/gazing_eye_alternate/gazing_eye_alternate.vmdl"));
+    }
+
+    #[test]
+    fn map_effect_materials() {
+        let text = r#""items_game"
+{
+	"items"
+	{
+		"18713"
+		{
+			"name"		"Aghanim's Labyrinth Shader Effect"
+			"prefab"		"map_effect"
+			"visuals"
+			{
+				"asset_modifier0"
+				{
+					"type"		"map_effect"
+					"asset"		"map_shader"
+					"modifier"		"materials/dev/deferred_post_process_aghanim_bp.vmat"
+				}
+				"asset_modifier1"
+				{
+					"type"		"map_effect"
+					"asset"		"portrait_shader"
+					"modifier"		"materials/dev/deferred_post_process_graphic_ui.vmat"
+				}
+			}
+		}
+	}
+}
+"#;
+        let table = Table::new(text.as_bytes());
+        assert_eq!(
+            table.map_effects(&item("Aghanim's Labyrinth Shader Effect", Some(18713))),
+            vec![
+                ("map", "materials/dev/deferred_post_process_aghanim_bp.vmat".to_string()),
+                ("portrait", "materials/dev/deferred_post_process_graphic_ui.vmat".to_string()),
+            ]
         );
     }
 

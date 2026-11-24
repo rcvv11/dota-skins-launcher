@@ -112,7 +112,23 @@ static void AddRule(Rules& rules, const std::string& from, const std::string& to
 // The hero you play in this match (npc name), given by the interface script once picked;
 // empty in the menu and before the pick. Read and written under g_rulesLock.
 static std::string g_localNpc;
-static volatile LONG g_inMenu = 0;  // the interface script reports: menu, not a match
+// the interface script reports: menu, not a match. Dota starts in the menu: before the
+// script's first report (the dashboard's loading screen) the menu's rules hold, or a hero's
+// items loaded then (the front page's heroes) kept their own files for the whole session
+static volatile LONG g_inMenu = 1;
+
+// The game's interface state (ChangeGameUIState): 0 none, 1 the loading screen, 2 a game,
+// 3 the dashboard; -1 not seen yet. The interface script's "menu" (the game state 0) lasts
+// through a match's loading screen, where the match's own resources are registered.
+static volatile LONG g_uiState = -1;
+static const LONG kUiLoading = 1, kUiInGame = 2;
+
+// The real menu: the script's menu with no match loading or running behind it (unknown
+// state: the script's word alone)
+static bool MenuShown() {
+    LONG s = g_uiState;
+    return g_inMenu && s != kUiLoading && s != kUiInGame;
+}
 
 // Whether a swap applies now: every swap in the menu; in a match a hero item's swap only
 // for the hero you play (an enemy or ally on another hero keeps their own items), the
@@ -141,6 +157,30 @@ static std::vector<GlowDef> g_glowDefs;
 // The emblem's attack effect (line attack|particle): added to the attacks of the hero
 // you play, as the game adds an owned emblem's (see HookedCreateTracking)
 static std::string g_attackFx;
+// The preset's weather (line weather|type, 0 for none): set in the running game (see
+// WeatherTick); -1 leaves cl_weather alone
+static volatile LONG g_weatherWanted = -1;
+// The preset's terrain (line terrain|map|override, map base names: dota|dota_desert) and
+// HUD skin (line hudskin|skin): see HookedMapOverride and HookedSetHudSkin
+static std::string g_terrainFrom, g_terrainTo, g_hudSkin;
+// The preset's map effect (lines shader|map|material, shader|portrait|..., shader|post|...):
+// see HookedSetShader
+enum { kShaderMap, kShaderPortrait, kShaderPost, kShaderKinds };
+static std::string g_shaders[kShaderKinds];
+// The chosen styles' material groups (lines matgroup|model|group): see MatGroupTick
+static std::unordered_map<std::string, std::string> g_matGroups;
+// ... and mesh masks (lines meshmask|model|clear|set|reset): an arcana's style is its level,
+// its hero's pieces' body group "arcana" (another mesh): the mask's bits of that group
+// (clear), the level's (set), choice 0's (reset, when the item leaves). See MatGroupTick
+struct MeshMask { uint64_t clear, set, reset; };
+static std::unordered_map<std::string, MeshMask> g_meshMasks;
+// Prismatic gems: the hero models' colours (lines gem|model|RRGGBB, as the game's Color:
+// r, g, b, a bytes), see GemTick; for the item page's menu the palette (gemcolor|name|RRGGBB)
+// and the colour picked per item definition (gempick|def|name), sent to the script
+static std::unordered_map<std::string, uint32_t> g_gems;
+static std::string g_gemColorsJs = "[]";
+static std::string g_gemPicksJs = "{}";
+static std::string g_gemItemsJs = "[]";  // gemitem|name|icon: the items whose page offers a gem
 // Items for empty slots the running Dota has not read yet (line
 // restart|name\tname): their button says «after restart»
 static std::string g_restartJs = "[]";
@@ -250,6 +290,13 @@ static bool LoadConfig(const std::string& path) {
     std::set<std::string> glowFiles;           // the glows' effects (preloaded)
     std::vector<GlowDef> glowDefs;             // the glows for the DLL's own match effects
     std::string attackFx;                      // the emblem's attack effect
+    LONG weather = -1;                         // the weather type
+    std::string terrainFrom, terrainTo, hudSkin;
+    std::string shaders[kShaderKinds];
+    std::unordered_map<std::string, std::string> matGroups;
+    std::unordered_map<std::string, MeshMask> meshMasks;
+    std::unordered_map<std::string, uint32_t> gems;
+    std::string gemColors, gemPicks, gemItems;
     std::string lang = "ru";
     while (std::getline(file, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
@@ -273,6 +320,71 @@ static bool LoadConfig(const std::string& path) {
                          JsString(f.size() > 4 ? f[4] : std::string()) + "," +
                          JsString(f.size() > 5 ? f[5] : std::string()) + "]";
             }
+            continue;
+        }
+        if (line.compare(0, 8, "terrain|") == 0) {
+            auto f = Split(line, '|');
+            if (f.size() >= 3) {
+                terrainFrom = Normalize(f[1]);
+                terrainTo = Normalize(f[2]);
+            }
+            continue;
+        }
+        if (line.compare(0, 4, "gem|") == 0) {
+            auto f = Split(line, '|');
+            if (f.size() >= 3 && !f[1].empty() && f[2].size() == 6) {
+                uint32_t rgb = (uint32_t)strtoul(f[2].c_str(), nullptr, 16);
+                gems[Normalize(f[1])] = ((rgb >> 16) & 0xFF) | (rgb & 0xFF00) | ((rgb & 0xFF) << 16) | 0xFF000000u;
+            }
+            continue;
+        }
+        if (line.compare(0, 9, "gemcolor|") == 0) {
+            auto f = Split(line, '|');
+            if (f.size() >= 3 && !f[1].empty())
+                gemColors += (gemColors.empty() ? "[" : ",[") + JsString(f[1]) + "," + JsString(f[2]) + "]";
+            continue;
+        }
+        if (line.compare(0, 8, "gemitem|") == 0) {
+            auto f = Split(line, '|');
+            if (f.size() >= 2 && !f[1].empty())
+                gemItems += (gemItems.empty() ? "[" : ",[") + JsString(f[1]) + "," + JsString(f.size() >= 3 ? f[2] : "") + "]";
+            continue;
+        }
+        if (line.compare(0, 8, "gempick|") == 0) {
+            auto f = Split(line, '|');
+            if (f.size() >= 3 && !f[1].empty()) gemPicks += (gemPicks.empty() ? "" : ",") + JsString(f[1]) + ":" + JsString(f[2]);
+            continue;
+        }
+        if (line.compare(0, 9, "meshmask|") == 0) {
+            auto f = Split(line, '|');
+            if (f.size() >= 5 && !f[1].empty()) {
+                MeshMask m{strtoull(f[2].c_str(), nullptr, 10), strtoull(f[3].c_str(), nullptr, 10),
+                           strtoull(f[4].c_str(), nullptr, 10)};
+                if (m.clear && m.set) meshMasks[Normalize(f[1])] = m;
+            }
+            continue;
+        }
+        if (line.compare(0, 9, "matgroup|") == 0) {
+            auto f = Split(line, '|');
+            if (f.size() >= 3 && !f[1].empty() && !f[2].empty()) matGroups[Normalize(f[1])] = f[2];
+            continue;
+        }
+        if (line.compare(0, 7, "shader|") == 0) {
+            auto f = Split(line, '|');
+            int kind = f.size() < 3 ? -1 : f[1] == "map" ? kShaderMap : f[1] == "portrait" ? kShaderPortrait : f[1] == "post" ? kShaderPost : -1;
+            if (kind >= 0) {
+                shaders[kind] = Normalize(f[2]);
+                // loaded in the menu beforehand: a match loads nothing it does not list
+                if (!shaders[kind].empty()) glowFiles.insert(shaders[kind]);
+            }
+            continue;
+        }
+        if (line.compare(0, 8, "hudskin|") == 0) {
+            hudSkin = Normalize(line.substr(8));
+            continue;
+        }
+        if (line.compare(0, 8, "weather|") == 0) {
+            weather = atoi(line.c_str() + 8);
             continue;
         }
         if (line.compare(0, 7, "attack|") == 0) {
@@ -330,6 +442,17 @@ static bool LoadConfig(const std::string& path) {
     g_itemModels.swap(itemModels);
     g_glowDefs.swap(glowDefs);
     g_attackFx = attackFx;
+    g_terrainFrom = terrainFrom;
+    g_terrainTo = terrainTo;
+    g_hudSkin = hudSkin;
+    for (int k = 0; k < kShaderKinds; k++) g_shaders[k] = shaders[k];
+    g_matGroups.swap(matGroups);
+    g_meshMasks.swap(meshMasks);
+    g_gems.swap(gems);
+    g_gemColorsJs = "[" + gemColors + "]";
+    g_gemPicksJs = "{" + gemPicks + "}";
+    g_gemItemsJs = "[" + gemItems + "]";
+    InterlockedExchange(&g_weatherWanted, weather >= 0 && weather <= 9 ? weather : -1);
     g_restartJs = "[" + restart + "]";
     {
         std::string js = "{";
@@ -575,7 +698,7 @@ static thread_local bool t_inJitLoad = false;
 // the stand-in's own file (an invisible box: the slot stays empty), the hero you play the
 // picked item (the swap reads its file instead).
 static void LoadStandInNow(void* rs, ResourceName* name) {
-    if (g_inMenu || t_inJitLoad || !g_BlockingLoad || GetCurrentThreadId() != g_mainThread) return;
+    if (MenuShown() || t_inJitLoad || !g_BlockingLoad || GetCurrentThreadId() != g_mainThread) return;
     const char* cur = BufStr_Get(name);
     if (_strnicmp(cur, "models/items/dota_skins_slots/", 30) != 0) return;
     auto status = (GetStatusFn)(*(void***)rs)[kGetStatusSlot];
@@ -597,9 +720,12 @@ static void* HookedFindOrRegister(void* rs, ResourceName* name, uintptr_t flag) 
         // not effects in a match: a regular match gives only what its manifest holds, and
         // an item's effect asked for by its own name came back as the error effect (red
         // crosses); its data is swapped in by InitForFileRead under the original name anyway
-        // (models too: the match's strategy screen got error models the same way)
+        // (models too: the match's strategy screen got error models the same way). Not on a
+        // match's loading screen either, though the script still says "menu" there: the
+        // match registers its resources then (lane creeps), and an original handed out as
+        // its replacement was never registered: "not in the system", the error model
         bool material = len > 5 && _stricmp(cur + len - 5, ".vmat") == 0;
-        if (len > 5 && IsSwappableResource(cur) && (g_inMenu || material) && FindReplacementFile(cur, repl) && IsResident(repl)) {
+        if (len > 5 && IsSwappableResource(cur) && (MenuShown() || material) && FindReplacementFile(cur, repl) && IsResident(repl)) {
             ResourceName other;
             if (g_SetResourceName(&other, repl.c_str())) {
                 void* r = g_OrigFindOrRegister(rs, &other, flag);
@@ -709,7 +835,7 @@ static thread_local bool t_inOurScript = false;
 static std::unordered_map<void*, ULONGLONG> g_lastInject;
 
 static const char kPickJs[] = R"JS(
-if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELECTED", have: "OWNED", restart: "AFTER RESTART" };
+if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELECTED", have: "OWNED", restart: "AFTER RESTART", gemOwn: "The item's own gem", gemNote: "Only you see the gem: the item on your account does not change." };
 (function () {
   var ctx = $.GetContextPanel();
   if (!ctx) return;
@@ -764,6 +890,402 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
     }
   };
   // A hero's npc name. In a regular match the game gives no unit names (empty), so the
+  // --- Prismatic gems: the item page's «Replace gem» opens every colour ---
+  // The palette and the colours picked per item (by its name) come from the launcher
+  // (DSLSetGems). A pick goes to it as DSL_PICK 0|@gem<TAB><colour or -><TAB><item's
+  // names> (-: the item's own gem); it keeps it in the preset, and the DLL colours the hero.
+  if (typeof DSLGems === "undefined") DSLGems = { colors: [], picks: {}, session: {}, items: [] };
+  DSLSetGems = function (colors, picks, items) {
+    DSLGems.colors = colors || [];
+    DSLGems.picks = {};
+    for (var k in picks || {}) DSLGems.picks[k.toLowerCase()] = picks[k];
+    DSLGems.items = [];
+    DSLGems.icons = {};
+    (items || []).forEach(function (it) {
+      var n = (it[0] || "").toLowerCase();
+      DSLGems.items.push(n);
+      DSLGems.icons[n] = it[1] || "";
+    });
+    if (!DSLGems.session) DSLGems.session = {};
+  };
+  DSLGemName = function (name) {
+    var t = $.Localize("#" + name);
+    return t && t.charAt(0) !== "#" ? t : name.replace(/^Unusual/, "").replace(/([a-z])([A-Z])/g, "$1 $2");
+  };
+  // the page's item: its title (a renamed item: its original name too)
+  DSLGemPageNames = function (page) {
+    var out = [];
+    var titles = page.FindChildrenWithClassTraverse("ItemName");
+    if (titles.length && titles[0].text) out.push(titles[0].text);
+    var orig = page.FindChildTraverse("Name");
+    if (orig && orig.paneltype === "Label" && orig.text && out.indexOf(orig.text) < 0) out.push(orig.text);
+    return out;
+  };
+  // the colour picked for the item: this session's pick, else the preset's ("": its own gem)
+  DSLGemPickOf = function (names) {
+    for (var i = 0; i < names.length; i++) {
+      var k = names[i].toLowerCase();
+      if (DSLGems.session.hasOwnProperty(k)) return DSLGems.session[k];
+    }
+    for (var j = 0; j < names.length; j++) {
+      var p = DSLGems.picks[names[j].toLowerCase()];
+      if (p) return p;
+    }
+    return "";
+  };
+  // a socket holding a prismatic gem (its type line)
+  DSLGemIsPrismatic = function (gem) {
+    var types = gem.FindChildrenWithClassTraverse("GemType");
+    var lab = types.length && types[0].GetChildCount() ? types[0].GetChild(0) : null;
+    var text = lab && lab.text ? lab.text.toLowerCase() : "";
+    if (!text) return false;
+    var want = ($.Localize("#DOTA_WearableType_Prismatic_Gem") || "").toLowerCase();
+    return (want && want.charAt(0) !== "#" && text.indexOf(want) >= 0) || text.indexOf("prismatic") >= 0 || text.indexOf("призмат") >= 0;
+  };
+  // the socket's gem name line («Dungeon Doom»)
+  DSLGemNameLabel = function (gem) {
+    var names = gem.FindChildrenWithClassTraverse("GemName");
+    if (!names.length) return null;
+    for (var c = names[0].GetChildCount() - 1; c >= 0; c--) {
+      var l = names[0].GetChild(c);
+      if (l.paneltype === "Label" && l.id !== "GemCount") return l;
+    }
+    return null;
+  };
+  // the picked colour's name in place of the item's gem (Dota reuses the page for other
+  // items: its own text is kept per item, put back when the pick goes)
+  DSLGemShowName = function (gem, item, name) {
+    var l = DSLGemNameLabel(gem);
+    if (!l) return;
+    var mine = l.GetAttributeString("dsl_gem_item", "") === item && l.GetAttributeString("dsl_gem_set", "") !== "";
+    if (!name) {
+      if (mine) {
+        l.text = l.GetAttributeString("dsl_gem_orig", l.text);
+        l.SetAttributeString("dsl_gem_set", "");
+      }
+      return;
+    }
+    if (!mine) {
+      l.SetAttributeString("dsl_gem_orig", l.text || "");
+      l.SetAttributeString("dsl_gem_item", item);
+      l.SetAttributeString("dsl_gem_set", "1");
+    }
+    var text = DSLGemName(name);
+    if (l.text !== text) l.text = text;
+  };
+  // The picker as Dota's own («Select a gem»: PopupItemPicker with its choices, built from
+  // its layout's styles: popups_shared, popup_item_picker; a choice's look is
+  // DOTAItemPickerChoice's, a gem's icon the prismatic gem's: its setting and its stone in
+  // the gem's colour)
+  DSLGemIcon = function (parent, hex) {
+    var box = $.CreatePanel("Panel", parent, "");
+    box.style.width = "89px";
+    box.style.height = "96px";
+    box.style.margin = "6px";
+    box.style.border = "2px solid black";
+    box.style.backgroundColor = "black";
+    box.style.boxShadow = "fill #000000aa 1px 0px 2px 2px";
+    box.style.verticalAlign = "middle";
+    var setting = $.CreatePanel("Image", box, "");
+    setting.SetImage("s2r://panorama/images/econ/sockets/gem_color_png.vtex");
+    var stone = $.CreatePanel("Image", box, "");
+    stone.SetImage("s2r://panorama/images/econ/sockets/gem_color_mask_png.vtex");
+    [setting, stone].forEach(function (img) {
+      img.style.width = "100%";
+      img.style.height = "100%";
+      img.SetScaling("stretch-to-fit-preserve-aspect");
+    });
+    if (hex) stone.style.washColor = "#" + hex;
+    else stone.style.saturation = "0";
+    return box;
+  };
+  // Dota's PopupButton (.Green: the action), with the values of dotastyles.vcss: the
+  // dashboard root our popup hangs on does not load that sheet
+  DSLPopupButton = function (parent, text, green, small) {
+    var b = $.CreatePanel("Button", parent, "");
+    var idle = green ? "gradient( linear, 0% 0%, 0% 100%, from( #03380a ), to( #3d9b3d ) )"
+                     : "gradient( linear, 0% 0%, 0% 100%, from( #222222 ), to( #4B555D ) )";
+    var hover = green ? "gradient( linear, 0% 0%, 0% 100%, from( #085c13 ), to( #49a349 ) )"
+                      : "gradient( linear, 0% 0%, 0% 100%, from( #58636e ), to( #53626e ) )";
+    b.style.backgroundColor = idle;
+    b.style.backgroundImage = "url('s2r://panorama/images/backgrounds/background_play_button_2x_png.vtex')";
+    b.style.backgroundSize = "cover";
+    b.style.border = green ? "1px solid #91EA4B40" : "1px solid #83838390";
+    if (small) {
+      b.style.minWidth = "0px";
+      b.style.padding = "4px 10px 2px 10px";
+      b.style.margin = "0px";
+    } else {
+      b.style.minWidth = "192px";
+      b.style.padding = "10px 30px 10px 30px";
+      b.style.margin = "8px";
+    }
+    b.SetPanelEvent("onmouseover", function () { b.style.backgroundColor = hover; });
+    b.SetPanelEvent("onmouseout", function () { b.style.backgroundColor = idle; });
+    var l = $.CreatePanel("Label", b, "");
+    l.text = text;
+    l.style.color = "white";
+    l.style.fontSize = small ? "18px" : "20px";
+    l.style.horizontalAlign = "center";
+    l.style.textAlign = "center";
+    l.style.verticalAlign = "middle";
+    l.style.textTransform = "uppercase";
+    l.style.textOverflow = "shrink";
+    l.style.textShadow = "0px 0px 5px 3.0 #000000";
+    l.style.fontWeight = "semi-bold";
+    l.style.letterSpacing = "1px";
+    return b;
+  };
+  DSLGemMenu = function (root, names, gem) {
+    var old = root.FindChildTraverse("DSLGemPopup");
+    if (old) old.DeleteAsync(0);
+    // (Dota's script has no layout-from-string: the panels are made here, with the values of
+    // popups_shared.vcss and popup_item_picker.vcss; PopupButton is in the global styles)
+    var pop = $.CreatePanel("Panel", root, "DSLGemPopup");
+    // over the dashboard (its pages and popups), dimmed behind as Dota's popups
+    pop.hittest = true;
+    pop.style.zIndex = "1000";
+    pop.style.width = "100%";
+    pop.style.height = "100%";
+    pop.style.backgroundColor = "#000000b0";
+    pop.SetPanelEvent("onactivate", function () {});
+    var close = function () { pop.DeleteAsync(0); };
+    var box = $.CreatePanel("Panel", pop, "DSLGemPopupBox");
+    box.hittest = true;
+    box.SetPanelEvent("onactivate", function () {});
+    box.style.backgroundColor = "gradient( linear, 0% 0%, 0% 100%, from( #272d2eee ), to( #131617ee ) )";
+    box.style.border = "1px solid #5e6869";
+    box.style.padding = "32px 64px 32px 64px";
+    box.style.minWidth = "450px";
+    box.style.verticalAlign = "middle";
+    box.style.horizontalAlign = "center";
+    box.style.boxShadow = "black 0px 0px 8px 0px";
+    box.style.flowChildren = "down";
+    var title = $.CreatePanel("Label", box, "");
+    title.text = $.Localize("#DOTA_SelectGem_Title");
+    title.style.fontSize = "30px";
+    title.style.fontWeight = "thin";
+    title.style.color = "#afb4b4";
+    title.style.marginBottom = "15px";
+    title.style.horizontalAlign = "center";
+    var icon = "";
+    for (var k = 0; k < names.length && !icon; k++) icon = DSLGems.icons[names[k].toLowerCase()] || "";
+    if (icon) {
+      var header = $.CreatePanel("Image", box, "HeaderItemImage");
+      header.SetImage(icon);
+      header.SetScaling("stretch-to-fit-preserve-aspect");
+      header.style.horizontalAlign = "center";
+      header.style.height = "100px";
+      header.style.width = "150px";
+      header.style.marginBottom = "10px";
+    }
+    var desc = $.CreatePanel("Label", box, "Description");
+    desc.text = DSLTxt.gemNote || "";
+    desc.style.horizontalAlign = "center";
+    desc.style.fontSize = "20px";
+    desc.style.color = "#afb4b4";
+    var list = $.CreatePanel("Panel", box, "Choices");
+    list.style.backgroundColor = "black";
+    list.style.flowChildren = "right-wrap";
+    list.style.width = "771px";
+    list.style.overflow = "squish scroll";
+    list.style.maxHeight = "450px";
+    list.style.marginTop = "12px";
+    list.style.borderLeft = "8px solid black";
+    list.style.borderTop = "8px solid black";
+    list.style.borderBottom = "8px solid black";
+    var row = $.CreatePanel("Panel", box, "");
+    row.style.flowChildren = "right";
+    row.style.horizontalAlign = "center";
+    row.style.marginTop = "25px";
+    row.style.marginBottom = "20px";
+    var cancel = DSLPopupButton(row, $.Localize("#DOTA_Cancel"), false, false);
+    cancel.SetPanelEvent("onactivate", close);
+    var cur = DSLGemPickOf(names);
+    var colors = DSLGems.colors.slice().sort(function (a, b) { return DSLGemName(a[0]) < DSLGemName(b[0]) ? -1 : 1; });
+    var nameOf = $.Localize("#Econ_Socket_Color_Name");
+    var add = function (key, hex, title) {
+      var ch = $.CreatePanel("Panel", list, "");
+      ch.style.flowChildren = "right";
+      ch.style.width = "370px";
+      ch.style.marginRight = "8px";
+      ch.style.marginBottom = "8px";
+      ch.style.border = key === cur ? "1px solid #ffffff40" : "1px solid #ffffff06";
+      DSLGemIcon(ch, hex);
+      var details = $.CreatePanel("Panel", ch, "");
+      details.style.flowChildren = "down";
+      details.style.verticalAlign = "middle";
+      details.style.marginLeft = "2px";
+      details.style.height = "100%";
+      details.style.width = "fill-parent-flow(1.0)";
+      var labels = $.CreatePanel("Panel", details, "");
+      labels.style.marginTop = "10px";
+      labels.style.marginRight = "8px";
+      labels.style.height = "fill-parent-flow(1.0)";
+      labels.style.flowChildren = "down";
+      var nm = $.CreatePanel("Label", labels, "");
+      nm.text = title;
+      nm.style.fontSize = "20px";
+      nm.style.color = "white";
+      nm.style.maxHeight = "26px";
+      nm.style.textOverflow = "shrink";
+      var ty = $.CreatePanel("Label", labels, "");
+      ty.html = true;
+      ty.text = key ? ", <font color='#8847ff'>Mythical</font>" : "";
+      var buttons = $.CreatePanel("Panel", details, "");
+      buttons.style.flowChildren = "right";
+      buttons.style.margin = "0px 8px 8px 0px";
+      buttons.style.width = "100%";
+      var space = $.CreatePanel("Panel", buttons, "");
+      space.style.width = "fill-parent-flow(1.0)";
+      var sel = DSLPopupButton(buttons, $.Localize("#DOTA_SelectGem_Action"), true, true);
+      sel.SetPanelEvent("onactivate", function () {
+        $.Msg("DSL_PICK 0|@gem\t" + (key || "-") + "\t" + names.join("\t"));
+        $.Msg("DSL_LOG gem " + (key || "-") + " for " + names.join(" / "));
+        for (var n = 0; n < names.length; n++) DSLGems.session[names[n].toLowerCase()] = key;
+        DSLGemShowName(gem, names[0], key);
+        close();
+      });
+    };
+    add("", "", DSLTxt.gemOwn || "-");
+    for (var i = 0; i < colors.length; i++) {
+      var cn = DSLGemName(colors[i][0]);
+      add(colors[i][0], colors[i][1], nameOf && nameOf.charAt(0) !== "#" ? nameOf.replace("%s1", cn) : cn);
+    }
+  };
+  // The store page (an item you do not own: no sockets of its own) of an item whose gem
+  // colours its hero: a «Rare sockets» section of ours, after the description
+  DSLGemStoreTick = function (root) {
+    // every visible section list (the store page's, full screen or in the item popup), up
+    // to the page holding it: its title is the item's name
+    var lists = root.FindChildrenWithClassTraverse("SectionList");
+    for (var i = 0; i < lists.length; i++) {
+      var list = lists[i];
+      if (!list.IsValid() || !list.visible) continue;
+      var page = list, title = null;
+      for (var up = 0; page && up < 8 && !title; up++) {
+        page = page.GetParent();
+        title = page ? page.FindChildTraverse("Title") : null;
+      }
+      if (!page || !title) continue;
+      if (page.FindChildTraverse("RareSocketList")) continue;  // the owned item's page has its own
+      var names = [];
+      ["Title", "ItemName"].forEach(function (id) {
+        var l = page.FindChildTraverse(id);
+        if (l && l.paneltype === "Label" && l.text && names.indexOf(l.text) < 0) names.push(l.text);
+      });
+      var offered = names.some(function (n) { return DSLGems.items.indexOf(n.toLowerCase()) >= 0; });
+      var seenKey = page.paneltype + "|" + names.join("/") + "|" + offered;
+      if (!DSLGemStoreTick.seen) DSLGemStoreTick.seen = {};
+      if (!DSLGemStoreTick.seen[seenKey]) {
+        DSLGemStoreTick.seen[seenKey] = true;
+        $.Msg("DSL_LOG gem store page " + page.paneltype + "#" + page.id + ": " + names.join(" / ") + (offered ? " (gems)" : ""));
+      }
+      var sec = list.FindChildTraverse("DSLGemSection");
+      if (!offered || !DSLGems.colors.length) {
+        if (sec && sec.visible) sec.visible = false;
+        continue;
+      }
+      if (!sec) {
+        sec = $.CreatePanel("Panel", list, "DSLGemSection");
+        sec.AddClass("Section");
+        var title = $.CreatePanel("Panel", sec, "");
+        title.AddClass("SectionTitle");
+        var tl = $.CreatePanel("Label", title, "");
+        tl.AddClass("LabelLarge");
+        tl.AddClass("LightestGreyText");
+        tl.text = $.Localize("#DOTA_econ_item_details_rare_sockets_header");
+        var row = $.CreatePanel("Panel", sec, "");
+        row.style.width = "100%";
+        row.style.flowChildren = "right";
+        row.style.marginTop = "10px";
+        var sw = $.CreatePanel("Panel", row, "DSLGemSwatch");
+        sw.style.width = "40px";
+        sw.style.height = "40px";
+        sw.style.verticalAlign = "center";
+        sw.style.marginRight = "14px";
+        sw.style.borderRadius = "50%";
+        sw.style.border = "2px solid #ffffff40";
+        var info = $.CreatePanel("Panel", row, "");
+        info.style.width = "fill-parent-flow(1.0)";
+        info.style.flowChildren = "down";
+        info.style.verticalAlign = "center";
+        var nm = $.CreatePanel("Label", info, "DSLGemNameText");
+        nm.style.fontSize = "20px";
+        nm.style.color = "#ffffff";
+        var ty = $.CreatePanel("Label", info, "");
+        ty.text = $.Localize("#DOTA_WearableType_Prismatic_Gem");
+        ty.style.fontSize = "14px";
+        ty.style.textTransform = "uppercase";
+        ty.style.color = "#8d939c";
+        var b = $.CreatePanel("Button", row, "DSLGemButton");
+        ["ButtonBevel", "ButtonPrimary", "Blue"].forEach(function (c) { b.AddClass(c); });
+        b.style.verticalAlign = "center";
+        var bl = $.CreatePanel("Label", b, "");
+        bl.text = $.Localize("#DOTA_econ_item_details_replace_gem");
+        var desc = list.FindChildrenWithClassTraverse("Description");
+        if (desc.length) list.MoveChildAfter(sec, desc[0]);
+        $.Msg("DSL_LOG gem section added for " + names[0]);
+      }
+      if (!sec.visible) sec.visible = true;
+      var key = names.join("\t");
+      var btn = sec.FindChildTraverse("DSLGemButton");
+      if (btn && btn.GetAttributeString("dsl_gem_item", "") !== key) {
+        btn.SetAttributeString("dsl_gem_item", key);
+        (function (s, n) { btn.SetPanelEvent("onactivate", function () { DSLGemMenu(root, n, s); }); })(sec, names.slice());
+      }
+      var pick = DSLGemPickOf(names);
+      var hex = "";
+      for (var c = 0; c < DSLGems.colors.length; c++) if (DSLGems.colors[c][0] === pick) hex = DSLGems.colors[c][1];
+      var nameText = pick ? DSLGemName(pick) : (DSLTxt.gemOwn || "-");
+      var nl = sec.FindChildTraverse("DSLGemNameText");
+      if (nl && nl.text !== nameText) nl.text = nameText;
+      var swatch = sec.FindChildTraverse("DSLGemSwatch");
+      if (swatch) swatch.style.backgroundColor = hex ? "#" + hex : "#00000000";
+    }
+  };
+  // the item page: our «Replace gem» over Dota's for a prismatic socket (Dota's needs a
+  // gem of yours and asks the item server to swap it)
+  DSLGemTick = function (root) {
+    if (!DSLGems.colors.length) return;
+    // every socket of every item page (Dota keeps more than one)
+    var gems = root.FindChildrenWithClassTraverse("GemContainer");
+    var seen = gems.length;
+    for (var i = 0; i < gems.length; i++) {
+      var gem = gems[i];
+      if (!gem.IsValid() || !DSLGemIsPrismatic(gem)) continue;
+      var page = gem;
+      for (var up = 0; page && up < 14 && page.id !== "ItemEditBackground"; up++) page = page.GetParent();
+      if (!page) continue;
+      var names = DSLGemPageNames(page);
+      if (!names.length) {
+        if (!DSLGemTick.noName) { DSLGemTick.noName = true; $.Msg("DSL_LOG gem: no item name on the item page"); }
+        continue;
+      }
+      var key = names.join("	");
+      var replace = gem.FindChildTraverse("ReplaceGem");
+      var ours = gem.FindChildTraverse("DSLGemButton");
+      if (!ours) {
+        var parent = replace ? replace.GetParent() : gem;
+        ours = $.CreatePanel("Button", parent, "DSLGemButton");
+        ["ButtonBevel", "ButtonPrimary", "Blue"].forEach(function (c) { ours.AddClass(c); });
+        var l = $.CreatePanel("Label", ours, "");
+        l.text = $.Localize("#DOTA_econ_item_details_replace_gem");
+        if (replace) parent.MoveChildBefore(ours, replace);
+        $.Msg("DSL_LOG gem button added for " + names[0] + " (" + seen + " sockets)");
+      }
+      if (ours.GetAttributeString("dsl_gem_item", "") !== key) {
+        ours.SetAttributeString("dsl_gem_item", key);
+        (function (g, n) { ours.SetPanelEvent("onactivate", function () { DSLGemMenu(root, n, g); }); })(gem, names.slice());
+      }
+      if (replace && replace.visible) replace.visible = false;
+      if (!ours.visible) ours.visible = true;
+      // Dota disables the socket without gems of yours (and again when it redraws the page):
+      // our button works anyway
+      for (var en = ours; en && en !== gem.GetParent(); en = en.GetParent()) if (!en.enabled) en.enabled = true;
+      DSLGemShowName(gem, names[0], DSLGemPickOf(names));
+    }
+  };
   // player's picked hero or the entity's class name (npc_dota_hero_x) stands in.
   DSLHeroName = function (ent, player) {
     var n = "";
@@ -851,6 +1373,7 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
           card.style.opacity = "1";
           card.style.brightness = "1";
           var chain = [row.paneltype + "#" + row.id];
+          DSLEnableStyles(box);
           var have = box.FindChildTraverse("DSLPickButton");
           if (have) { DSLSetPicked(have, have.GetChild(0), !!picked[DSLKey(row)]); continue; }
           // as on Dota's card: a status line at the bottom; on hover over the card
@@ -893,8 +1416,8 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
           (function (b, l, row) {
             b.SetPanelEvent("onactivate", function () {
               if (!row || !row.IsValid()) return;
-              var rowLabels = DSLLabels(row);
-              var key = rowLabels.join("|");
+              var rowLabels = DSLPickLabels(row);
+              var key = DSLKey(row);
               if (picked[key]) return;
               var def = DSLItemDef(row);
               // the list's other rows go back to «SELECT» (one item per slot)
@@ -911,6 +1434,7 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
                 DSLSetPicked(ob, ob.GetChild(0), false);
               }
               picked[key] = true;
+              b.SetAttributeInt("dsl_style", DSLStyleOf(row).style);
               DSLSetPicked(b, l, true);
               $.DispatchEvent("Activated", row, "mouse");
               $.Msg("DSL_PICK " + def + "|" + rowLabels.join("\t"));
@@ -976,6 +1500,7 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
             }
           }
         } catch (e12) { $.Msg("DSL_LOG persona error " + e12); }
+        try { DSLGemTick(root); DSLGemStoreTick(root); } catch (e13) { $.Msg("DSL_LOG gem error " + e13); }
       }
       // item glows: on your own hero in a match, on the hero models in the menu
       $.Msg("DSL_GTICK " + loopKind);
@@ -993,7 +1518,9 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
   }
   // the row's item definition index: a property of the DOTAEconItem element
   DSLItemDef = function (row) {
-    var stack = [row], seen = [];
+    var card = row;
+    for (var up = 0; card && up < 6 && card.paneltype !== "DOTAEconItemAnimated"; up++) card = card.GetParent();
+    var stack = card && card.paneltype === "DOTAEconItemAnimated" ? [row, card] : [row], seen = [];
     while (stack.length) {
       var p = stack.pop();
       var vals = [p.itemdef, p.itemDef, p.ItemDef, p.itemdefindex, p.GetAttributeInt ? p.GetAttributeInt("itemdef", 0) : 0];
@@ -1019,7 +1546,77 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
     }
     return out;
   };
-  DSLKey = function (row) { return row && row.IsValid() ? DSLLabels(row).join("|") : ""; };
+  // the row's key: its texts without the style switch («2 / 3»), so a picked card stays
+  // picked when its style changes
+  DSLKey = function (row) {
+    if (!row || !row.IsValid()) return "";
+    var out = [], stack = [row];
+    while (stack.length) {
+      var p = stack.pop();
+      if (p.id === "DSLPickButton" || p.id === "StylesPanel") continue;
+      if (p.paneltype === "Label" && p.text) out.push(p.text.replace(/[|\t\r\n]/g, " "));
+      for (var c = p.GetChildCount() - 1; c >= 0; c--) stack.push(p.GetChild(c));
+    }
+    return out.join("|");
+  };
+  // the style shown on the row's card (from 0) and how many it has: its dots (radio
+  // buttons), else the arrows' «2 / 3»; style -1 without styles
+  DSLStyleOf = function (row) {
+    var out = { style: -1, count: 0 };
+    if (!row || !row.IsValid()) return out;
+    var sel = row.FindChildTraverse("StyleSelector");
+    if (sel) {
+      for (var i = 0; i < sel.GetChildCount(); i++) {
+        var r = sel.GetChild(i);
+        if (r.paneltype !== "RadioButton") continue;
+        if (r.checked) out.style = out.count;
+        out.count++;
+      }
+    }
+    if (out.count < 2 || out.style < 0) {
+      var lab = row.FindChildTraverse("StyleIndexLabel");
+      var m = lab && lab.text ? /(\d+)\s*\/\s*(\d+)/.exec(lab.text) : null;
+      out = m && +m[2] > 1 ? { style: +m[1] - 1, count: +m[2] } : { style: -1, count: 0 };
+    }
+    return out;
+  };
+  // the row's texts for the launcher, the card's style first as «2 / 3» (the launcher
+  // takes the first such text)
+  DSLPickLabels = function (row) {
+    var labels = DSLLabels(row), st = DSLStyleOf(row);
+    if (st.style >= 0) labels.unshift((st.style + 1) + " / " + st.count);
+    return labels;
+  };
+  // a picked card whose style is switched (its dots or arrows): the item is picked again
+  // in that style. Per card (the button keeps what it saw): a card Dota builds anew shows
+  // its first style without that being a pick
+  DSLWatchStyle = function (row, b) {
+    var st = DSLStyleOf(row);
+    if (st.style < 0) return;
+    var seen = b.GetAttributeInt("dsl_style", -2);
+    if (seen === st.style) return;
+    b.SetAttributeInt("dsl_style", st.style);
+    if (seen === -2) return;
+    // Dota redrawing the card after the refresh our pick brings may show the style it had
+    // before again: not a pick (or the two would take turns)
+    var now = Date.now();
+    if (st.style === b.GetAttributeInt("dsl_style_prev", -3) && now - (+b.GetAttributeString("dsl_style_at", "0")) < 3000) return;
+    b.SetAttributeInt("dsl_style_prev", seen);
+    b.SetAttributeString("dsl_style_at", "" + now);
+    $.Msg("DSL_PICK " + DSLItemDef(row) + "|" + DSLPickLabels(row).join("\t"));
+    $.Msg("DSL_LOG style " + (st.style + 1) + " of " + st.count + " picked");
+  };
+  // the card's style switch for an item you do not own as well
+  DSLEnableStyles = function (box) {
+    var sp = box.FindChild("StylesPanel");
+    if (!sp) return;
+    var stack = [sp];
+    while (stack.length) {
+      var p = stack.pop();
+      if ((p.paneltype === "RadioButton" || p.paneltype === "Button") && !p.enabled) p.enabled = true;
+      for (var c = 0; c < p.GetChildCount(); c++) stack.push(p.GetChild(c));
+    }
+  };
   // all our buttons inside the panel
   DSLButtons = function (root) {
     var out = [], stack = [root];
@@ -1330,6 +1927,21 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
       }
     }
     hoverItems = alive;
+    // a card Dota gave another item (it reuses its cards when the list changes): that
+    // item's state at once, not the previous one's «SELECTED» until the next slow tick
+    for (var n2 = 0; n2 < alive.length; n2++) {
+      var it2 = alive[n2];
+      var nameLab = it2.row.FindChildTraverse("EconItemName");
+      var shownName = nameLab && nameLab.text ? nameLab.text : "";
+      if (it2.b.GetAttributeString("dsl_name", "") === shownName) continue;
+      it2.b.SetAttributeString("dsl_name", shownName);
+      it2.b.SetAttributeInt("dsl_style", -2);  // its style switch is seen anew
+      DSLSetPicked(it2.b, it2.b.GetChild(0), !!picked[DSLKey(it2.row)]);
+    }
+    // picked cards: their style switch picks the item again in the new style
+    for (var w = 0; w < alive.length; w++) {
+      if (alive[w].b.GetAttributeString("dsl_state", "") === "on") DSLWatchStyle(alive[w].row, alive[w].b);
+    }
     if (pendingRestart) {
       var names = {};
       for (var r = 0; r < pendingRestart.length; r++) names[("" + pendingRestart[r]).trim().toLowerCase()] = true;
@@ -1512,6 +2124,27 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
   $.Msg("DSL_LOG loop started in " + ctx.id + " (" + loopKind + ", root " + root.id + ")");
   // called by the DLL when the replacements are loaded: rebuild the hero model
   DSLRefresh = function () {
+    // the item page (Dota's popup over the pages): its preview scene loaded again, so its
+    // effects are made anew (a prismatic gem's colour: the weapon's glow is coloured when
+    // it is born). The page is reached through the popup manager, not the pages below
+    try {
+      var details = root.FindChildTraverse("ItemDetails");
+      if (details && details.visible) {
+        var stack = [details], n = 0, reloaded = 0;
+        while (stack.length && n < 6000) {
+          var p = stack.pop();
+          n++;
+          if (!p.visible) continue;
+          if (p.paneltype === "DOTAUIEconSetPreview") {
+            var scene = p.FindChildTraverse("Preview3DItems");
+            if (scene && typeof scene.ReloadScene === "function") { scene.ReloadScene(); reloaded++; }
+            continue;
+          }
+          for (var c = 0; c < p.GetChildCount(); c++) stack.push(p.GetChild(c));
+        }
+        $.Msg("DSL_LOG refresh: item page previews reloaded: " + reloaded);
+      }
+    } catch (e) { $.Msg("DSL_LOG refresh: item page error " + e); }
     var pages = root.FindChildrenWithClassTraverse("DashboardPage");
     for (var i = 0; i < pages.length; i++) {
       var hp = pages[i];
@@ -1543,7 +2176,9 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
       $.Msg("DSL_LOG refresh: loadout changed (revert " + (revert ? (shown ? "shown" : "hidden") : "none") + ", controls " + (controls ? (controls.visible ? "shown" : "hidden") : "none") + ")");
       return;
     }
-    $.Msg("DSL_LOG refresh: no hero page open (" + loopKind + " loop)");
+    // no hero page: the other previews (the item page's) are rebuilt by the same event
+    $.DispatchEvent("DOTALoadoutChanged");
+    $.Msg("DSL_LOG refresh: no hero page open, loadout changed for the other previews (" + loopKind + " loop)");
   };
   tick();
 })();
@@ -1583,7 +2218,8 @@ static void MaybeSendGlows(int kind) {
     AcquireSRWLockShared(&g_glowsLock);
     std::string script = "if (typeof DSLSetGlows === 'function') DSLSetGlows(" + g_glowsJs + ");"
                          "if (typeof DSLSetRestart === 'function') DSLSetRestart(" + g_restartJs + ");"
-                         "if (typeof DSLSetSlots === 'function') DSLSetSlots(" + g_slotsJs + ");";
+                         "if (typeof DSLSetSlots === 'function') DSLSetSlots(" + g_slotsJs + ");"
+                         "if (typeof DSLSetGems === 'function') DSLSetGems(" + g_gemColorsJs + "," + g_gemPicksJs + "," + g_gemItemsJs + ");";
     ReleaseSRWLockShared(&g_glowsLock);
     Log("[*] Sending item glows to the game UI (%s)", kLoopNames[kind]);
     t_inOurScript = true;
@@ -1653,8 +2289,8 @@ static void HookedRunScript(void* engine, void* panel, const char* script, const
     std::string lang;
     { AcquireSRWLockShared(&g_rulesLock); lang = g_lang; ReleaseSRWLockShared(&g_rulesLock); }
     const char* texts = (lang == "en")
-        ? "DSLTxt = { select: \"SELECT\", selected: \"SELECTED\", have: \"OWNED\", restart: \"AFTER RESTART\" };"
-        : "DSLTxt = { select: \"ВЫБРАТЬ\", selected: \"ВЫБРАНО\", have: \"ЕСТЬ У ВАС\", restart: \"ПОСЛЕ ПЕРЕЗАПУСКА\" };";
+        ? "DSLTxt = { select: \"SELECT\", selected: \"SELECTED\", have: \"OWNED\", restart: \"AFTER RESTART\", gemOwn: \"The item's own gem\", gemNote: \"Only you see the gem: the item on your account does not change.\" };"
+        : "DSLTxt = { select: \"ВЫБРАТЬ\", selected: \"ВЫБРАНО\", have: \"ЕСТЬ У ВАС\", restart: \"ПОСЛЕ ПЕРЕЗАПУСКА\", gemOwn: \"Свой самоцвет предмета\", gemNote: \"Самоцвет видите только вы: предмет на аккаунте не меняется.\" };";
     g_OrigRunScript(engine, panel, texts, "dota_skins_lang.js", 0);
     g_OrigRunScript(engine, panel, kPickJs, "dota_skins_pick.js", 0);
     g_injectPanel = nullptr;
@@ -1989,6 +2625,12 @@ static void ReadSchemaOffsets(const Section& rdata, const Section& data, SchemaF
 // Off the interface thread: the scans take a moment and client.dll may still be loading.
 static void ResolveParticles(const Section& text, const Section& rdata);
 static void ResolveProjectiles(const Section& text, const Section& rdata);
+static void ResolveUiState(const Section& text, const Section& rdata);
+static void ResolveWeather(HMODULE cl, const Section& text, const Section& rdata);
+static void ResolveTerrainAndHud(const Section& text);
+static void ResolveShaders(const Section& text);
+static void ResolveMatGroups(const Section& text, const Section& rdata);
+static void ResolveGems(const Section& text, const Section& rdata, const Section& data);
 // CSkeletonInstance::SetModel(skeleton, model binding): see LiveModelTick
 using SkeletonSetModelFn = void (*)(void* skeleton, void* binding);
 static SkeletonSetModelFn g_SkeletonSetModel = nullptr;
@@ -2029,6 +2671,12 @@ static DWORD WINAPI ResolveItemHosts(LPVOID) {
         o.parent, o.owner, o.entity, o.ownerEntity);
     ResolveParticles(text, rdata);
     ResolveProjectiles(text, rdata);
+    ResolveUiState(text, rdata);
+    ResolveWeather(cl, text, rdata);
+    ResolveTerrainAndHud(text);
+    ResolveShaders(text);
+    ResolveMatGroups(text, rdata);
+    ResolveGems(text, rdata, data);
     // the function asserting "CSkeletonInstance::SetModel"
     g_SkeletonSetModel = (SkeletonSetModelFn)FunctionStart(FindRipRef(text, FindString(rdata, "CSkeletonInstance::SetModel")));
     Log("[%c] Live models: CSkeletonInstance::SetModel %p", g_SkeletonSetModel ? '+' : '-', (void*)g_SkeletonSetModel);
@@ -2341,6 +2989,678 @@ static void ResolveProjectiles(const Section& text, const Section& rdata) {
         g_trackingHooked ? " hooked" : layout ? " NOT hooked" : fn ? " (another layout: not hooked)" : "");
 }
 
+// --- The game's interface state ---
+// CDOTA...::ChangeGameUIState(self, state) logs "ChangeGameUIState: %s -> %s" and stores the
+// state: the loading screen comes before anything of the match is registered.
+using ChangeUiStateFn = uint64_t (*)(void* self, int state);
+static ChangeUiStateFn g_OrigChangeUiState = nullptr;
+
+static uint64_t HookedChangeUiState(void* self, int state) {
+    static const char* const kNames[] = {"none", "loading screen", "game", "dashboard"};
+    LONG old = InterlockedExchange(&g_uiState, state);
+    if (old != state)
+        Log("[*] Interface: %s%s", state >= 0 && state <= 3 ? kNames[state] : "?",
+            state == kUiLoading ? " (no name swaps: a match may be loading)" : "");
+    return g_OrigChangeUiState(self, state);
+}
+
+static void ResolveUiState(const Section& text, const Section& rdata) {
+    uint8_t* fn = FunctionStart(FindRipRef(text, FindString(rdata, "ChangeGameUIState: %s -> %s\n")));
+    // push rbp; push rsi; push r14; sub rsp,40h; movsxd r14,dword [rcx+130h] (16 bytes, no RIP-relative)
+    static const uint8_t kProlog[] = {0x40, 0x55, 0x56, 0x41, 0x56, 0x48, 0x83, 0xEC, 0x40,
+                                      0x4C, 0x63, 0xB1, 0x30, 0x01, 0x00, 0x00};
+    bool hooked = fn && memcmp(fn, kProlog, sizeof(kProlog)) == 0 &&
+                  InstallHook(fn, sizeof(kProlog), (void*)&HookedChangeUiState, (void**)&g_OrigChangeUiState);
+    Log("[%c] Interface state: ChangeGameUIState %p %s", hooked ? '+' : '-', (void*)fn,
+        hooked ? "hooked" : fn ? "(another layout: not hooked)" : "not found");
+}
+
+// --- Terrain ---
+// A terrain is another map for the world: C_DOTA_MapOverride (the engine's
+// IWorldVPKOverrideManager) tells the client which map to load instead of the server's,
+// from the local player's equipped terrain (its map_override: maps/dota.vmap ->
+// maps/dota_desert.vmap; the game itself leaves the hero demo out). Its decision
+// (self, map, out name, out item) -> bool is hooked: the preset's terrain answers for its
+// map, at every map load, so a new terrain needs no restart.
+using MapOverrideFn = bool (*)(void* self, const char* map, void* outName, void** outItem);
+static MapOverrideFn g_OrigMapOverride = nullptr;
+using BufSetLengthFn = char* (*)(void* s, int len, bool ignoreAlign, int* newCapacity);
+using BufInsertFn = const char* (*)(void* s, int at, const char* str, int len, bool ignoreAlign);
+static BufSetLengthFn g_BufSetLength = nullptr;
+static BufInsertFn g_BufInsert = nullptr;
+
+// "maps/dota.vmap", "maps/dota.vpk", "dota" -> "dota"
+static std::string MapBase(const char* path) {
+    std::string p = Normalize(path ? path : "");
+    if (p.compare(0, 5, "maps/") == 0) p.erase(0, 5);
+    size_t dot = p.rfind('.');
+    if (dot != std::string::npos && p.find('/', dot) == std::string::npos) p.resize(dot);
+    return p;
+}
+
+static bool HookedMapOverride(void* self, const char* map, void* outName, void** outItem) {
+    std::string from, to;
+    AcquireSRWLockShared(&g_glowsLock);
+    from = g_terrainFrom;
+    to = g_terrainTo;
+    ReleaseSRWLockShared(&g_glowsLock);
+    if (!to.empty() && map && outName && outItem && g_BufSetLength && g_BufInsert && MapBase(map) == from) {
+        *outItem = nullptr;  // no item of the player's: only the map
+        g_BufSetLength(outName, 0, false, nullptr);
+        g_BufInsert(outName, 0, to.c_str(), -1, false);
+        Log("[*] Terrain: the map %s loads as %s", from.c_str(), to.c_str());
+        return true;
+    }
+    return g_OrigMapOverride(self, map, outName, outItem);
+}
+
+// --- HUD skin ---
+// The HUD's SetHudSkin(hud, skin, ...) (what the test_hud_skin command calls) loads the
+// skin's images (resource/flash3/images/hud_skins/<skin>/...) and keeps the skin's name.
+// The game calls it with the equipped skin when the HUD comes up: hooked, it gets the
+// preset's skin instead. A skin changed in a match is put on at once (HudSkinTick).
+using SetHudSkinFn = void (*)(void* hud, const char* skin, bool a, int b, bool c);
+static SetHudSkinFn g_OrigSetHudSkin = nullptr;
+static void** g_hudPtr = nullptr;     // the HUD object
+static int g_hudSkinField = -1;       // its current skin's name (a CUtlString)
+static void* g_hudShown = nullptr;    // main thread: the HUD the preset's skin went on,
+static std::string g_hudShownSkin;    // that skin,
+static std::string g_hudAfter;        // and the HUD's own name for it right after
+
+static std::string HudCurrentSkin(void* hud) {
+    if (!hud || g_hudSkinField < 0) return "?";
+    const char* s = *(const char* const*)((const uint8_t*)hud + g_hudSkinField);
+    return s ? std::string(s) : std::string();
+}
+
+static void HookedSetHudSkin(void* hud, const char* skin, bool a, int b, bool c) {
+    std::string mine;
+    AcquireSRWLockShared(&g_glowsLock);
+    mine = g_hudSkin;
+    ReleaseSRWLockShared(&g_glowsLock);
+    if (mine.empty()) {
+        g_OrigSetHudSkin(hud, skin, a, b, c);
+        return;
+    }
+    if (!skin || _stricmp(skin, mine.c_str()) != 0) Log("[*] HUD skin: %s instead of %s", mine.c_str(), skin && skin[0] ? skin : "the default");
+    g_OrigSetHudSkin(hud, mine.c_str(), a, b, c);
+    g_hudShown = hud;
+    g_hudShownSkin = mine;
+    g_hudAfter = HudCurrentSkin(hud);
+}
+
+// Main thread, in a match: the preset's skin on the HUD, again when the HUD is another one
+// or something else changed its skin (a skin the game forces stays: it is not fought over)
+static void HudSkinTick() {
+    if (!g_OrigSetHudSkin || !g_hudPtr || g_inMenu) return;
+    void* hud = *g_hudPtr;
+    if (!hud) return;
+    std::string mine;
+    AcquireSRWLockShared(&g_glowsLock);
+    mine = g_hudSkin;
+    ReleaseSRWLockShared(&g_glowsLock);
+    std::string cur = HudCurrentSkin(hud);
+    if (hud == g_hudShown && mine == g_hudShownSkin && cur == g_hudAfter) return;
+    if (mine.empty() && g_hudShownSkin.empty()) {  // nothing of ours: the game's own skin stays
+        g_hudShown = hud;
+        g_hudAfter = cur;
+        return;
+    }
+    Log("[*] HUD skin: %s", mine.empty() ? "the default again" : mine.c_str());
+    g_OrigSetHudSkin(hud, mine.c_str(), false, 0, false);  // "" has no images: the default skin
+    g_hudShown = hud;
+    g_hudShownSkin = mine;
+    g_hudAfter = HudCurrentSkin(hud);
+}
+
+static void ResolveTerrainAndHud(const Section& text) {
+    uint8_t* end = text.start + text.size;
+    // the terrain decision: the one function asking the loadout for slot 93 (terrains) with
+    // this frame: xor r9d,r9d; mov edx,1000; mov r8d,93
+    static const uint8_t kTerrainSlot[] = {0x45, 0x33, 0xC9, 0xBA, 0xE8, 0x03, 0x00, 0x00, 0x41, 0xB8, 0x5D, 0x00, 0x00, 0x00};
+    // mov [rsp+20h],r9; push rbx; push rdi; push r14; push r15; sub rsp,48h (15 bytes, hooked);
+    // mov r15,rcx; xor ebx,ebx; mov [r9],rbx (the out item cleared)
+    static const uint8_t kMapProlog[] = {0x4C, 0x89, 0x4C, 0x24, 0x20, 0x53, 0x57, 0x41, 0x56, 0x41, 0x57, 0x48,
+                                         0x83, 0xEC, 0x48, 0x4C, 0x8B, 0xF9, 0x33, 0xDB, 0x49, 0x89, 0x19};
+    uint8_t* mapFn = nullptr;
+    for (uint8_t* p = text.start; p + sizeof(kTerrainSlot) <= end && !mapFn; p++) {
+        if (memcmp(p, kTerrainSlot, sizeof(kTerrainSlot)) != 0) continue;
+        uint8_t* fn = FunctionStart(p);
+        if (fn && memcmp(fn, kMapProlog, sizeof(kMapProlog)) == 0) mapFn = fn;
+    }
+    if (HMODULE t0 = GetModuleHandleA("tier0.dll")) {
+        g_BufSetLength = (BufSetLengthFn)GetProcAddress(t0, "?SetLength@CBufferString@@QEAAPEADH_NPEAH@Z");
+        g_BufInsert = (BufInsertFn)GetProcAddress(t0, "?Insert@CBufferString@@QEAAPEBDHPEBDH_N@Z");
+    }
+    bool terrain = mapFn && g_BufSetLength && g_BufInsert &&
+                   InstallHook(mapFn, 15, (void*)&HookedMapOverride, (void**)&g_OrigMapOverride);
+    Log("[%c] Terrains: map override %p %s", terrain ? '+' : '-', (void*)mapFn, terrain ? "hooked" : "NOT hooked");
+
+    // the test_hud_skin command: mov rcx,[<hud>]; xor r9d,r9d; xor r8d,r8d; mov byte [rsp+20h],0; call <SetHudSkin>
+    static const uint8_t kHudCall[] = {0x45, 0x33, 0xC9, 0x45, 0x33, 0xC0, 0xC6, 0x44, 0x24, 0x20, 0x00, 0xE8};
+    uint8_t* setSkin = nullptr;
+    for (uint8_t* p = text.start + 7; p + sizeof(kHudCall) + 4 <= end && !setSkin; p++) {
+        if (memcmp(p, kHudCall, sizeof(kHudCall)) != 0 || p[-7] != 0x48 || p[-6] != 0x8B || p[-5] != 0x0D) continue;
+        g_hudPtr = (void**)(p + *(int32_t*)(p - 4));
+        setSkin = p + sizeof(kHudCall) + 4 + *(int32_t*)(p + sizeof(kHudCall));
+    }
+    // mov [rsp+20h],r9d; mov [rsp+10h],rdx; push rbp; push rbx; push rdi; push r12 (15 bytes)
+    static const uint8_t kSkinProlog[] = {0x44, 0x89, 0x4C, 0x24, 0x20, 0x48, 0x89, 0x54, 0x24, 0x10, 0x55, 0x53, 0x57, 0x41, 0x54};
+    // its name kept: lea rcx,[r13+X]; mov [rsp+40h],sil; mov rdx,r12; call [CUtlString::Set]
+    static const uint8_t kSkinName[] = {0x40, 0x88, 0x74, 0x24, 0x40, 0x49, 0x8B, 0xD4, 0xFF, 0x15};
+    for (uint8_t* q = setSkin; setSkin && q < setSkin + 0x400 && q + 17 <= end; q++) {
+        if (q[0] == 0x49 && q[1] == 0x8D && q[2] == 0x8D && memcmp(q + 7, kSkinName, sizeof(kSkinName)) == 0) {
+            g_hudSkinField = *(int32_t*)(q + 3);
+            break;
+        }
+    }
+    bool hud = setSkin && memcmp(setSkin, kSkinProlog, sizeof(kSkinProlog)) == 0 &&
+               InstallHook(setSkin, sizeof(kSkinProlog), (void*)&HookedSetHudSkin, (void**)&g_OrigSetHudSkin);
+    if (!hud) g_hudPtr = nullptr;
+    Log("[%c] HUD skins: SetHudSkin %p %s, HUD %p, skin name +0x%X", hud ? '+' : '-', (void*)setSkin,
+        hud ? "hooked" : "NOT hooked", (void*)g_hudPtr, g_hudSkinField);
+}
+
+// --- Map effects (shaders) ---
+// A map effect item gives materials, not files: the custom post-process material of the
+// map ("map_shader"), of the portraits ("portrait_shader") and a post effect
+// ("post_effect_shader"). The game sets them by name after every map load, from the
+// equipped item (an empty name: none): SetMapShader(name) and its two twins load the
+// material and keep it in a global the renderer reads every frame. Hooked, they get the
+// preset's material; a change in the running game is set at once (ShaderTick).
+using SetShaderFn = void (*)(const char* name);
+static SetShaderFn g_OrigSetShader[kShaderKinds] = {};
+static std::string g_shaderShown[kShaderKinds];  // main thread: what we set last
+static bool g_shaderOurs[kShaderKinds] = {};     // a material of the preset's is on
+
+static const char* const kShaderNames[kShaderKinds] = {"map", "portrait", "post effect"};
+
+static void SetShaderHooked(int kind, const char* name) {
+    std::string mine;
+    AcquireSRWLockShared(&g_glowsLock);
+    mine = g_shaders[kind];
+    ReleaseSRWLockShared(&g_glowsLock);
+    if (mine.empty()) {
+        g_OrigSetShader[kind](name);
+        g_shaderOurs[kind] = false;
+        g_shaderShown[kind].clear();
+        return;
+    }
+    if (!name || _stricmp(name, mine.c_str()) != 0)
+        Log("[*] Map effect: %s shader %s", kShaderNames[kind], mine.c_str());
+    g_OrigSetShader[kind](mine.c_str());
+    g_shaderOurs[kind] = true;
+    g_shaderShown[kind] = mine;
+}
+static void HookedSetShaderMap(const char* name) { SetShaderHooked(kShaderMap, name); }
+static void HookedSetShaderPortrait(const char* name) { SetShaderHooked(kShaderPortrait, name); }
+static void HookedSetShaderPost(const char* name) { SetShaderHooked(kShaderPost, name); }
+
+// Main thread, every script tick in a match: a material changed in the preset is set at
+// once; one taken out of the preset leaves no custom material (the game's next map load
+// sets the player's own again). The menu is left to the game: it sets them on map loads.
+static void ShaderTick() {
+    if (g_inMenu) return;
+    for (int k = 0; k < kShaderKinds; k++) {
+        if (!g_OrigSetShader[k]) continue;
+        std::string mine;
+        AcquireSRWLockShared(&g_glowsLock);
+        mine = g_shaders[k];
+        ReleaseSRWLockShared(&g_glowsLock);
+        if (mine == g_shaderShown[k] && (!mine.empty() || !g_shaderOurs[k])) continue;
+        if (mine.empty() && !g_shaderOurs[k]) continue;
+        Log("[*] Map effect: %s shader %s", kShaderNames[k], mine.empty() ? "back to none" : mine.c_str());
+        g_OrigSetShader[k](mine.c_str());
+        g_shaderOurs[k] = !mine.empty();
+        g_shaderShown[k] = mine;
+    }
+}
+
+static void ResolveShaders(const Section& text) {
+    // the map effects' setup ends with the three: mov rcx,rdi; call <portrait>;
+    // mov rcx,rbp; call <map>; mov rcx,r13; call <post effect>
+    uint8_t* end = text.start + text.size;
+    uint8_t* site = nullptr;
+    for (uint8_t* p = text.start; p + 24 <= end && !site; p++) {
+        if (p[0] == 0x48 && p[1] == 0x8B && p[2] == 0xCF && p[3] == 0xE8 && p[8] == 0x48 && p[9] == 0x8B && p[10] == 0xCD &&
+            p[11] == 0xE8 && p[16] == 0x49 && p[17] == 0x8B && p[18] == 0xCD && p[19] == 0xE8)
+            site = p;
+    }
+    // mov rax,rsp; push rdi; sub rsp,100h; test rcx,rcx (14 bytes, no RIP-relative)
+    static const uint8_t kProlog[] = {0x48, 0x8B, 0xC4, 0x57, 0x48, 0x81, 0xEC, 0x00, 0x01, 0x00, 0x00, 0x48, 0x85, 0xC9};
+    static void* const kHooks[kShaderKinds] = {(void*)&HookedSetShaderMap, (void*)&HookedSetShaderPortrait, (void*)&HookedSetShaderPost};
+    // call offsets in the site: portrait at +3, map at +11, post effect at +19
+    static const int kCall[kShaderKinds] = {11, 3, 19};
+    uint8_t* fn[kShaderKinds] = {};
+    int hooked = 0;
+    for (int k = 0; site && k < kShaderKinds; k++) {
+        uint8_t* call = site + kCall[k];
+        fn[k] = call + 5 + *(int32_t*)(call + 1);
+        if (memcmp(fn[k], kProlog, sizeof(kProlog)) == 0 &&
+            InstallHook(fn[k], sizeof(kProlog), kHooks[k], (void**)&g_OrigSetShader[k]))
+            hooked++;
+        else
+            g_OrigSetShader[k] = nullptr;
+    }
+    Log("[%c] Map effects: map %p, portrait %p, post effect %p (%d of 3 hooked)", hooked == kShaderKinds ? '+' : '-',
+        (void*)fn[kShaderMap], (void*)fn[kShaderPortrait], (void*)fn[kShaderPost], hooked);
+}
+
+// --- Styles: material groups ---
+// An item's style is often a material group of its model ("skin" 1: the model's group "1",
+// the Windranger arcana's autumn look, of her hair too), and a style picked while the
+// model was loaded did not show: a model takes its materials when it loads. The game
+// switches a group on the model itself: CSkeletonInstance's m_materialGroup (a string
+// token) through its change handler, which tells the scene object. The config's
+// matgroup|model|group lines are the preset's groups; the models in the world get theirs
+// (in a match your own hero's only, and the strategy screen's previews).
+using MakeTokenFn = uint32_t* (*)(uint32_t* out, const char* s);
+using GroupChangedFn = void (*)(void* skeleton, void* unused, const uint32_t* token);
+static MakeTokenFn g_MakeToken = nullptr;
+static GroupChangedFn g_GroupChanged = nullptr;
+static int g_groupOffset = -1;
+// CModelState's m_MeshGroupMask (a uint64: bit N, the model's mesh group N) through its
+// change handler ("skeletonMeshGroupMaskChanged"), which tells the scene object: (model
+// state, entity, &mask)
+using MaskChangedFn = void (*)(void* modelState, void* entity, const uint64_t* mask);
+static MaskChangedFn g_MaskChanged = nullptr;
+static int g_maskOffset = -1;
+
+static void ResolveMatGroups(const Section& text, const Section& rdata) {
+    // the handler registered as "skeletonMaterialGroupChanged": lea rax,<handler> before it;
+    // the handler: mov r8d,[r8]; cmp r8d,[rcx+<m_materialGroup>]
+    uint8_t* reg = FindRipRef(text, FindString(rdata, "skeletonMaterialGroupChanged"));
+    for (uint8_t* q = reg; reg && q > reg - 0x60 && !g_GroupChanged; q--) {
+        if (q[0] != 0x48 || q[1] != 0x8D || q[2] != 0x05) continue;
+        uint8_t* fn = q + 7 + *(int32_t*)(q + 3);
+        if (fn < text.start || fn + 10 > text.start + text.size) continue;
+        if (fn[0] == 0x45 && fn[1] == 0x8B && fn[2] == 0x00 && fn[3] == 0x44 && fn[4] == 0x3B && fn[5] == 0x81) {
+            g_GroupChanged = (GroupChangedFn)fn;
+            g_groupOffset = *(int32_t*)(fn + 6);
+        }
+    }
+    if (HMODULE t0 = GetModuleHandleA("tier0.dll"))
+        g_MakeToken = (MakeTokenFn)GetProcAddress(t0, "?Make@CUtlStringToken@@SA?AV1@PEBD@Z");
+    bool ok = g_GroupChanged && g_MakeToken && g_groupOffset > 0 && g_groupOffset < 0x2000;
+    if (!ok) g_GroupChanged = nullptr;
+    Log("[%c] Style groups: handler %p, m_materialGroup +0x%X, token %p", ok ? '+' : '-', (void*)g_GroupChanged,
+        g_groupOffset, (void*)g_MakeToken);
+    // the mask's handler: lea rax,<handler> before its name; it begins mov [rsp+8],rbx;
+    // mov [rsp+10h],rsi; push rdi; sub rsp,20h; mov rax,[r8]; mov rdi,r8;
+    // mov [rcx+<raw>],rax; mov rsi,rdx; mov rax,[r8]; mov rbx,rcx; cmp [rcx+<mask>],rax
+    static const uint8_t kMask[] = {0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48,
+                                    0x83, 0xEC, 0x20, 0x49, 0x8B, 0x00, 0x49, 0x8B, 0xF8, 0x48, 0x89, 0x81};
+    static const uint8_t kMask2[] = {0x48, 0x8B, 0xF2, 0x49, 0x8B, 0x00, 0x48, 0x8B, 0xD9, 0x48, 0x39, 0x81};
+    uint8_t* maskReg = FindRipRef(text, FindString(rdata, "skeletonMeshGroupMaskChanged"));
+    for (uint8_t* q = maskReg; maskReg && q > maskReg - 0x60 && !g_MaskChanged; q--) {
+        if (q[0] != 0x48 || q[1] != 0x8D || q[2] != 0x05) continue;
+        uint8_t* fn = q + 7 + *(int32_t*)(q + 3);
+        if (fn < text.start || fn + 0x40 > text.start + text.size) continue;
+        if (memcmp(fn, kMask, sizeof kMask) == 0 && memcmp(fn + 28, kMask2, sizeof kMask2) == 0) {
+            g_MaskChanged = (MaskChangedFn)fn;
+            g_maskOffset = *(int32_t*)(fn + 40);
+        }
+    }
+    if (g_maskOffset <= 0 || g_maskOffset >= 0x1000) g_MaskChanged = nullptr;
+    Log("[%c] Style meshes: handler %p, m_MeshGroupMask +0x%X (model state +0x%X)", g_MaskChanged ? '+' : '-',
+        (void*)g_MaskChanged, g_maskOffset, g_ih.modelState);
+}
+
+// Main thread, every glow tick (a few times a second at most)
+static void MatGroupTick() {
+    if ((!g_GroupChanged && !g_MaskChanged) || !g_itemHostsReady || !g_entityList) return;
+    static ULONGLONG last = 0;
+    ULONGLONG now = GetTickCount64();
+    if (now - last < 200) return;
+    last = now;
+    std::unordered_map<std::string, std::string> groups;
+    std::unordered_map<std::string, MeshMask> masks;
+    AcquireSRWLockShared(&g_glowsLock);
+    if (g_GroupChanged) groups = g_matGroups;
+    if (g_MaskChanged) masks = g_meshMasks;
+    ReleaseSRWLockShared(&g_glowsLock);
+    static std::set<std::string> applied;  // models given a group: put back when it leaves
+    // models given a mask: choice 0 again when they leave
+    static std::map<std::string, MeshMask> appliedMasks;
+    static std::set<std::string> logged;
+    if (groups.empty() && applied.empty() && masks.empty() && appliedMasks.empty()) return;
+    static std::unordered_map<std::string, uint32_t> tokens;
+    uint8_t** chunks = (uint8_t**)*g_entityList;
+    for (int c = 0; chunks && c < 64; c++) {
+        uint8_t* chunk = chunks[c];
+        if (!chunk) continue;
+        for (int i = 0; i < 512; i++) {
+            uint8_t* e = chunk + i * 0x70;
+            const uint8_t* ent = *(const uint8_t* const*)e;
+            int index = c * 512 + i;
+            if (!ent || (int)(*(const uint32_t*)(e + 0x10) & 0x7fff) != index) continue;
+            const uint8_t* node = nullptr;
+            std::string model = ModelOf(ent, &node);
+            if (model.empty() || !node) continue;
+            // the model the file holds: the swap table's replacement of it
+            std::string key = model;
+            AcquireSRWLockShared(&g_rulesLock);
+            auto rule = g_rules->replacements.find(model);
+            if (rule != g_rules->replacements.end() && RuleActive(*g_rules, model)) key = rule->second;
+            ReleaseSRWLockShared(&g_rulesLock);
+            auto g = groups.find(key);
+            auto mk = masks.find(key);
+            auto am = appliedMasks.find(key);
+            bool matWork = g != groups.end() || applied.count(key);
+            bool maskWork = mk != masks.end() || am != appliedMasks.end();
+            if (!matWork && !maskWork) continue;
+            if (!g_inMenu && index < 0x4000) {
+                // a match: your hero and what it wears
+                const uint8_t* parentNode = *(const uint8_t* const*)(node + g_ih.parent);
+                int holder = parentNode ? EntityIndexOf(*(const uint8_t* const*)(parentNode + g_ih.owner)) : index;
+                if (!(g_heroIndex > 0 && holder == g_heroIndex)) continue;
+            }
+            if (maskWork) {
+                uint8_t* state = (uint8_t*)node + g_ih.modelState;
+                uint64_t cur = *(const uint64_t*)(state + g_maskOffset);
+                uint64_t want = mk != masks.end() ? (cur & ~mk->second.clear) | mk->second.set
+                                                  : (cur & ~am->second.clear) | am->second.reset;
+                if (cur != want) {
+                    g_MaskChanged(state, (void*)ent, &want);
+                    uint64_t after = *(const uint64_t*)(state + g_maskOffset);
+                    char tag[32];
+                    snprintf(tag, sizeof tag, "|%llx", (unsigned long long)want);
+                    if (logged.insert(key + tag).second)
+                        Log("[*] Style: %s mesh mask %llx -> %llx (now %llx)", key.c_str(), (unsigned long long)cur,
+                            (unsigned long long)want, (unsigned long long)after);
+                }
+                if (mk != masks.end()) appliedMasks[key] = mk->second;
+                else appliedMasks.erase(key);
+            }
+            if (!matWork || !g_GroupChanged) continue;
+            uint32_t want = 0;  // 0: the model's own group again
+            if (g != groups.end()) {
+                auto tk = tokens.find(g->second);
+                if (tk == tokens.end()) {
+                    uint32_t tok = 0;
+                    g_MakeToken(&tok, g->second.c_str());
+                    tk = tokens.emplace(g->second, tok).first;
+                }
+                want = tk->second;
+            }
+            uint32_t cur = *(const uint32_t*)(node + g_groupOffset);
+            if (cur == want) continue;
+            g_GroupChanged((void*)node, nullptr, &want);
+            if (want && applied.insert(key).second)
+                Log("[*] Style: %s gets material group %s", key.c_str(), g->second.c_str());
+        }
+    }
+}
+
+// --- Prismatic gems ---
+// A hero's gem colour is C_DOTA_BaseNPC's m_colorGemColor (with m_bHasColorGem), worked out
+// from its items' prismatic gems when they change (the Fractal Horns' own red without one).
+// Its effects take it when they are made: the hero's virtual "colour this effect" sets
+// control point 15 to the colour and 16 to x=1 (0: the effect's own colours). A colour
+// picked on the item page (the config's gem|model|colour) is the hero's: the hook gives it
+// to the effects made from now on, GemTick to the hero and to the effects already made
+// (their indices kept by the hook: a gone effect's index is simply not found).
+using ApplyGemFn = void (*)(void* npc, int fx, const uint32_t* skip);
+static ApplyGemFn g_OrigApplyGem = nullptr;
+static int g_gemOffset = -1, g_hasGemOffset = -1;
+struct GemFx { const void* npc; int fx; bool hasSkip; uint32_t skip; };
+static std::vector<GemFx> g_gemFx;
+static std::unordered_map<const void*, uint32_t> g_gemWant;  // hero -> its colour, from GemTick
+static SRWLOCK g_gemLock = SRWLOCK_INIT;
+
+// The colour picked for a hero entity: its model's, or that of the model the swap table
+// turns it into (in a match your own hero's and its illusions' only)
+static bool GemFor(const uint8_t* ent, uint32_t& color, std::string* keyOut = nullptr) {
+    const uint8_t* node = nullptr;
+    std::string model = ModelOf(ent, &node);
+    if (model.empty()) return false;
+    std::string swapped;
+    AcquireSRWLockShared(&g_rulesLock);
+    auto rule = g_rules->replacements.find(model);
+    if (rule != g_rules->replacements.end() && RuleActive(*g_rules, model)) swapped = rule->second;
+    ReleaseSRWLockShared(&g_rulesLock);
+    bool found = false;
+    std::string key;
+    AcquireSRWLockShared(&g_glowsLock);
+    auto g = g_gems.find(model);
+    if (g == g_gems.end() && !swapped.empty()) g = g_gems.find(swapped);
+    if (g != g_gems.end()) {
+        color = g->second;
+        key = g->first;
+        found = true;
+    }
+    ReleaseSRWLockShared(&g_glowsLock);
+    if (!found) return false;
+    if (!g_inMenu) {
+        int index = EntityIndexOf(ent);
+        if (index >= 0 && index < 0x4000) {
+            int owner = (int)(*(const uint32_t*)(ent + g_ih.ownerEntity) & 0x7fff);
+            if (!(g_heroIndex > 0 && (index == g_heroIndex || owner == g_heroIndex))) return false;
+        }
+    }
+    if (keyOut) *keyOut = key;
+    return true;
+}
+
+// The game works the colour out from the hero's items (its prismatic gem) when they change,
+// and its items' effects made then read it at once (the weapon's: a single particle coloured
+// when it is born): the picked colour is the answer from the start
+using ComputeGemFn = bool (*)(void* npc, uint32_t* out);
+static ComputeGemFn g_OrigComputeGem = nullptr;
+
+static bool HookedComputeGem(void* npc, uint32_t* out) {
+    bool has = g_OrigComputeGem(npc, out);
+    uint32_t c = 0;
+    if (g_itemHostsReady && out && GemFor((const uint8_t*)npc, c)) {
+        *out = c;
+        return true;
+    }
+    return has;
+}
+
+static void HookedApplyGem(void* npc, int fx, const uint32_t* skip) {
+    AcquireSRWLockExclusive(&g_gemLock);
+    if (g_gemFx.size() >= 4096) g_gemFx.erase(g_gemFx.begin(), g_gemFx.begin() + 1024);
+    g_gemFx.push_back({npc, fx, skip != nullptr, skip ? *skip : 0u});
+    auto w = g_gemWant.find(npc);
+    if (w != g_gemWant.end()) {
+        *(uint32_t*)((uint8_t*)npc + g_gemOffset) = w->second;
+        *((uint8_t*)npc + g_hasGemOffset) = 1;
+    }
+    ReleaseSRWLockExclusive(&g_gemLock);
+    g_OrigApplyGem(npc, fx, skip);
+}
+
+static void ResolveGems(const Section& text, const Section& rdata, const Section& data) {
+    SchemaField want[] = {
+        {"C_DOTA_BaseNPC", "m_colorGemColor", &g_gemOffset},
+        {"C_DOTA_BaseNPC", "m_bHasColorGem", &g_hasGemOffset},
+    };
+    ReadSchemaOffsets(rdata, data, want, sizeof(want) / sizeof(want[0]));
+    uint8_t* fn = nullptr;
+    if (g_gemOffset > 0 && g_hasGemOffset > 0) {
+        // mov [rsp+10h],rbx; mov [rsp+18h],rsi; push rdi; sub rsp,60h; mov ebx,[rcx+<colour>];
+        // mov edi,edx; ...; cmp byte [rcx+<has gem>],0
+        uint8_t sig[23] = {0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48,
+                           0x83, 0xEC, 0x60, 0x8B, 0x99, 0, 0, 0, 0, 0x8B, 0xFA};
+        *(int32_t*)(sig + 17) = g_gemOffset;
+        for (size_t i = 0; i + sizeof sig + 0x40 <= text.size && !fn; i++) {
+            uint8_t* p = text.start + i;
+            if (memcmp(p, sig, sizeof sig) != 0) continue;
+            for (uint8_t* q = p + sizeof sig; q < p + sizeof sig + 0x30; q++)
+                if (q[0] == 0x80 && q[1] == 0xB9 && *(int32_t*)(q + 2) == g_hasGemOffset && q[6] == 0) { fn = p; break; }
+        }
+    }
+    // the first 15 bytes (to sub rsp) have no RIP-relative instructions
+    bool ok = fn && InstallHook(fn, 15, (void*)HookedApplyGem, (void**)&g_OrigApplyGem);
+    if (!ok) g_OrigApplyGem = nullptr;
+    Log("[%c] Gems: effect colouring %p, m_colorGemColor +0x%X, m_bHasColorGem +0x%X", ok ? '+' : '-', (void*)fn,
+        g_gemOffset, g_hasGemOffset);
+    // the colour worked out from the items: lea rdx,[reg+<colour>]; mov rcx,reg; call <it>;
+    // mov [reg+<has gem>],al. It begins mov [rsp+10h],rbx; mov [rsp+18h],rbp; mov [rsp+20h],rsi
+    static const uint8_t kCompute[] = {0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20};
+    uint8_t* compute = nullptr;
+    for (size_t i = 0; ok && i + 0x20 <= text.size && !compute; i++) {
+        uint8_t* q = text.start + i;
+        if ((q[0] & 0xFB) != 0x48 || q[1] != 0x8D || (q[2] & 0xF8) != 0x90 || *(int32_t*)(q + 3) != g_gemOffset) continue;
+        for (uint8_t* c = q + 7; c < q + 7 + 6; c++) {
+            if (*c != 0xE8 || c[5] != 0x88 || (c[6] & 0xF8) != 0x80 || *(int32_t*)(c + 7) != g_hasGemOffset) continue;
+            uint8_t* fn2 = c + 5 + *(int32_t*)(c + 1);
+            if (fn2 >= text.start && fn2 + 0x40 <= text.start + text.size && memcmp(fn2, kCompute, sizeof kCompute) == 0) compute = fn2;
+            break;
+        }
+    }
+    bool ok2 = compute && InstallHook(compute, 15, (void*)HookedComputeGem, (void**)&g_OrigComputeGem);
+    if (!ok2) g_OrigComputeGem = nullptr;
+    Log("[%c] Gems: hero colour from its items %p", ok2 ? '+' : '-', (void*)compute);
+}
+
+// Main thread, every glow tick
+static void GemTick() {
+    if (!g_OrigApplyGem || !g_itemHostsReady || !g_entityList) return;
+    static ULONGLONG last = 0;
+    ULONGLONG now = GetTickCount64();
+    if (now - last < 200) return;
+    last = now;
+    std::unordered_map<std::string, uint32_t> gems;
+    AcquireSRWLockShared(&g_glowsLock);
+    gems = g_gems;
+    ReleaseSRWLockShared(&g_glowsLock);
+    // heroes given a colour: their own (put back when it leaves), the one their effects show
+    struct Given { uint32_t color; uint8_t has; uint32_t shown; };
+    static std::unordered_map<const void*, Given> given;
+    static std::unordered_map<const void*, bool> npcs;
+    static std::set<std::string> logged;
+    if (gems.empty() && given.empty()) return;
+    std::unordered_map<const void*, uint32_t> want;
+    std::vector<std::pair<uint8_t*, uint32_t>> recolor;  // hero, the colour for its effects
+    std::set<const void*> alive;  // every entity in the list (a hero's model may be loading)
+    uint8_t** chunks = (uint8_t**)*g_entityList;
+    for (int c = 0; chunks && c < 64; c++) {
+        uint8_t* chunk = chunks[c];
+        if (!chunk) continue;
+        for (int i = 0; i < 512; i++) {
+            uint8_t* e = chunk + i * 0x70;
+            const uint8_t* ent = *(const uint8_t* const*)e;
+            int index = c * 512 + i;
+            if (!ent || (int)(*(const uint32_t*)(e + 0x10) & 0x7fff) != index) continue;
+            alive.insert(ent);
+            if (!IsA(ent, ".?AVC_DOTA_BaseNPC@@", npcs)) continue;
+            uint32_t pick = 0;
+            std::string key;
+            bool ours = GemFor(ent, pick, &key);
+            auto g = ours ? gems.find(key) : gems.end();
+            uint8_t* npc = (uint8_t*)ent;
+            uint32_t* color = (uint32_t*)(npc + g_gemOffset);
+            uint8_t* has = npc + g_hasGemOffset;
+            auto gv = given.find(ent);
+            if (g != gems.end() && ours) {
+                want[ent] = g->second;
+                if (gv == given.end()) gv = given.emplace(ent, Given{*color, *has, *has ? *color : 0u}).first;
+                // the game works it out again when the hero's items change: ours again
+                if (*color != g->second || !*has) {
+                    *color = g->second;
+                    *has = 1;
+                }
+                if (gv->second.shown != g->second) {
+                    gv->second.shown = g->second;
+                    recolor.push_back({npc, g->second});
+                    char tag[96];
+                    snprintf(tag, sizeof tag, "|%08x", g->second);
+                    if (logged.insert(g->first + tag).second)
+                        Log("[*] Gem: %s gets colour %02X%02X%02X", g->first.c_str(), g->second & 0xFF,
+                            (g->second >> 8) & 0xFF, (g->second >> 16) & 0xFF);
+                }
+            } else if (gv != given.end()) {
+                // the colour left: the hero's own again, on its effects too
+                *color = gv->second.color;
+                *has = gv->second.has;
+                recolor.push_back({npc, gv->second.color});
+                given.erase(gv);
+            }
+        }
+    }
+    for (auto it = given.begin(); it != given.end();) it = alive.count(it->first) ? std::next(it) : given.erase(it);
+    std::vector<GemFx> fx;
+    AcquireSRWLockExclusive(&g_gemLock);
+    g_gemWant.swap(want);
+    g_gemFx.erase(std::remove_if(g_gemFx.begin(), g_gemFx.end(), [&](const GemFx& f) { return !alive.count(f.npc); }),
+                  g_gemFx.end());
+    if (!recolor.empty()) fx = g_gemFx;
+    ReleaseSRWLockExclusive(&g_gemLock);
+    for (auto& [npc, c] : recolor) {
+        int n = 0;
+        for (auto& f : fx)
+            if (f.npc == npc) {
+                g_OrigApplyGem(npc, f.fx, f.hasSkip ? &f.skip : nullptr);
+                n++;
+            }
+        if (n) Log("[*] Gem: %d effects of %p coloured %02X%02X%02X", n, (void*)npc, c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF);
+    }
+}
+
+// --- Weather ---
+// A weather item has no file to swap: the client turns its weather on by type, from
+// cl_weather when it is set, else from the loadout. Its environment update reads the
+// convar every time, takes away the effect of another weather and creates the new one as
+// soon as that is loaded. The launcher's autoexec.cfg line sets it when Dota starts; the
+// config's weather|N sets it in the running game, so a new weather needs no restart. The
+// value is written in place: cl_weather is a cheat convar, refused by the console in a match.
+static uint8_t* g_weatherConVar = nullptr;       // the ConVar object: +8 its data
+static int g_weatherValueOffset = -1;            // the value in the data, as the update reads it
+static const char* const* g_weatherFx = nullptr;  // the effect of each weather type (0..9)
+static bool g_weatherOurs = false;               // main thread: a weather of ours is on
+
+static void ResolveWeather(HMODULE cl, const Section& text, const Section& rdata) {
+    // lea rdx,"cl_weather"; lea rcx,<convar>; call <register>
+    uint8_t* reg = FindRipRef(text, FindString(rdata, "cl_weather"));
+    if (reg && reg[0] == 0x48 && reg[1] == 0x8D && reg[2] == 0x15 && reg[7] == 0x48 && reg[8] == 0x8D && reg[9] == 0x0D)
+        g_weatherConVar = reg + 14 + *(int32_t*)(reg + 10);
+    // its readers: mov rax,[convar+8]; mov r32,[rax+disp8]. After one, the effect of the type:
+    // lea rcx,<client.dll>; mov r14,[rcx+rax*8+table]
+    for (size_t i = 0; g_weatherConVar && i + 10 <= text.size; i++) {
+        uint8_t* p = text.start + i;
+        if (p[0] != 0x48 || p[1] != 0x8B || p[2] != 0x05 || p + 7 + *(int32_t*)(p + 3) != g_weatherConVar + 8 ||
+            p[7] != 0x8B || (p[8] & 0xC7) != 0x40)
+            continue;
+        if (g_weatherValueOffset < 0) g_weatherValueOffset = p[9];
+        for (uint8_t* q = p + 10; !g_weatherFx && q < p + 0x60 && q + 15 <= text.start + text.size; q++) {
+            if (q[0] == 0x48 && q[1] == 0x8D && q[2] == 0x0D && q + 7 + *(int32_t*)(q + 3) == (uint8_t*)cl &&
+                q[7] == 0x4C && q[8] == 0x8B && q[9] == 0xB4 && q[10] == 0xC1) {
+                auto table = (const char* const*)((uint8_t*)cl + *(int32_t*)(q + 11));
+                // weather 0 has none, the others are effects
+                if (!table[0] && table[1] && strncmp(table[1], "particles/", 10) == 0) g_weatherFx = table;
+            }
+        }
+    }
+    Log("[%c] Weather: cl_weather %p, value +0x%X, effects %p", g_weatherConVar && g_weatherValueOffset >= 0 ? '+' : '-',
+        (void*)g_weatherConVar, g_weatherValueOffset, (void*)g_weatherFx);
+}
+
+// Main thread, every script tick: the preset's weather in cl_weather. No weather in the
+// preset leaves the player's own setting, unless a weather of ours is to be taken away.
+static void WeatherTick() {
+    LONG want = g_weatherWanted;
+    if (want < 0 || !g_weatherConVar || g_weatherValueOffset < 0) return;
+    uint8_t* data = *(uint8_t**)(g_weatherConVar + 8);
+    if (!data) return;
+    int* value = (int*)(data + g_weatherValueOffset);
+    if (*value == want) {
+        if (want) g_weatherOurs = true;
+        return;
+    }
+    if (want == 0 && !g_weatherOurs) return;
+    // the new weather's effect loaded first: the game creates it only once it is loaded
+    // (a match loads the weather it starts with)
+    if (want > 0 && g_weatherFx && g_weatherFx[want] && g_SetResourceName && g_BlockingLoad && g_ResourceSystem) {
+        ResourceName name;
+        if (g_SetResourceName(&name, g_weatherFx[want])) g_BlockingLoad(g_ResourceSystem, &name, 0);
+    }
+    Log("[*] Weather: cl_weather %d -> %ld", *value, want);
+    *value = (int)want;
+    g_weatherOurs = want != 0;
+}
+
 // Main thread, every glow tick: the preset emblem's attack effect loaded for the hooked
 // projectiles (into the engine's just-in-time manifest, as the stand-ins: it was loaded in
 // the menu already, so this only gives its binding), looked at again every few seconds.
@@ -2535,11 +3855,18 @@ static void LiveModelTick() {
             if (rule == g_rules->replacements.end() || !RuleActive(*g_rules, model)) continue;
             const std::string& desired = rule->second;
             if (desired.size() < 5 || desired.compare(desired.size() - 5, 5, ".vmdl") != 0) continue;
-            // a wearable: on a hero's bones (its scene node's parent), the strategy screen's or yours
             const uint8_t* parentNode = *(const uint8_t* const*)(node + g_ih.parent);
-            if (!parentNode) continue;
-            int holder = EntityIndexOf(*(const uint8_t* const*)(parentNode + g_ih.owner));
-            if (holder < 0x4000 && !(g_heroIndex > 0 && holder == g_heroIndex)) continue;
+            if (parentNode) {
+                // a wearable: on a hero's bones (its scene node's parent), the strategy screen's or yours
+                int holder = EntityIndexOf(*(const uint8_t* const*)(parentNode + g_ih.owner));
+                if (holder < 0x4000 && !(g_heroIndex > 0 && holder == g_heroIndex)) continue;
+            } else {
+                // a unit of its own (lane creeps, towers, couriers, wards): a general swap only.
+                // Its model may be loaded from a match before the preset changed: the new one
+                // goes on the units then, with no restart
+                auto heroes = g_rules->heroes.find(model);
+                if (heroes != g_rules->heroes.end() && !heroes->second.empty()) continue;
+            }
             todo.push_back({node, index, model, desired});
         }
     }
@@ -2556,7 +3883,10 @@ static void LiveModelTick() {
         void* current = g_ih.modelHandle >= 0 ? *(void* const*)(s.node + g_ih.modelState + g_ih.modelHandle) : nullptr;
         if (current == binding) continue;
         g_SkeletonSetModel((void*)s.node, binding);
-        Log("[*] Live model: entity %d %s (read as %s) -> %s", s.index, s.model.c_str(), held.c_str(), s.desired.c_str());
+        // once per model and replacement: a wave of creeps is many units
+        static std::set<std::string> logged;
+        if (logged.insert(s.model + ">" + s.desired).second)
+            Log("[*] Live model: entity %d %s (read as %s) -> %s", s.index, s.model.c_str(), held.c_str(), s.desired.c_str());
     }
 }
 
@@ -2833,6 +4163,9 @@ static bool CheckDslMessage(const char* msg) {
     // ticks and loop starts name their loop: "dash" (the menu's) or "hud" (the match's)
     int kind = strstr(p, " hud") ? kHud : kDash;
     if (strncmp(p, "DSL_TICK", 8) == 0) {
+        WeatherTick();
+        HudSkinTick();
+        ShaderTick();
         if (g_inMenu) {
             RunPreloads();
             if (kind == kDash) MaybeRefreshPreview();
@@ -2853,6 +4186,8 @@ static bool CheckDslMessage(const char* msg) {
         LiveModelTick();
         MatchGlowTick();
         AttackFxTick();
+        MatGroupTick();
+        GemTick();
     }
     else if (strncmp(p, "DSL_LOOP", 8) == 0) {
         // a new script context: it has neither the glow table nor the item models yet
@@ -2874,6 +4209,8 @@ static bool CheckDslMessage(const char* msg) {
             // the emblem's attack effect: its binding taken again in the match
             g_attackBinding = nullptr;
             g_attackBound.clear();
+            // the HUD skin: put on again for the new match
+            g_hudShown = nullptr;
         }
     }
     else if (strncmp(p, "DSL_LOG", 7) == 0) Log("[js] %.3800s", p + 7);

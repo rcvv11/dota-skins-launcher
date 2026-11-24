@@ -182,7 +182,7 @@ mod tests {
     #[test]
     fn wearing_cleans_old_duplicates() {
         let c = catalog();
-        let mut p = Profile { name: "p".into(), skins: vec!["old_arms".into(), "arms_gold".into(), "back".into()], styles: Default::default() };
+        let mut p = Profile { name: "p".into(), skins: vec!["old_arms".into(), "arms_gold".into(), "back".into()], styles: Default::default(), gems: Default::default() };
         let items: Vec<&Skin> = c.skins.iter().filter(|s| s.id == "axe_head").collect();
         assert!(wear(&mut p, &c, &items));
         assert_eq!(p.skins, vec!["arms_gold", "back", "axe_head"]);
@@ -191,7 +191,7 @@ mod tests {
     #[test]
     fn wearing_replaces_the_same_slot_only() {
         let c = catalog();
-        let mut p = Profile { name: "p".into(), skins: vec!["old_arms".into(), "axe_head".into()], styles: Default::default() };
+        let mut p = Profile { name: "p".into(), skins: vec!["old_arms".into(), "axe_head".into()], styles: Default::default(), gems: Default::default() };
         let items: Vec<&Skin> = c.skins.iter().filter(|s| s.id == "arms" || s.id == "back").collect();
         assert!(wear(&mut p, &c, &items));
         assert_eq!(p.skins, vec!["axe_head", "arms", "back"]);

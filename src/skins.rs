@@ -61,12 +61,53 @@ pub fn parse_groups(output: &str) -> Groups {
     out
 }
 
-/// Material groups of `models` (`.vmdl` paths) from the game's pak.
-pub fn material_groups(cli: &Path, pak: &Path, models: &[String]) -> Result<Groups, String> {
-    use std::os::windows::process::CommandExt;
-    if models.is_empty() {
-        return Ok(Groups::new());
+/// Mesh groups (body group choices, `"<group>_@<choice>_#&<name>"`) from
+/// Source2Viewer-CLI's `-b DATA` output, each model's as one list: bit N of a model's
+/// mesh group mask is its group N.
+pub fn parse_mesh_groups(output: &str) -> Groups {
+    let mut out = Groups::new();
+    let mut model: Option<String> = None;
+    let mut names: Option<Vec<String>> = None;
+    for line in output.lines() {
+        let t = line.trim();
+        if t.starts_with('[') && t.contains("] ") && t.ends_with("_c") {
+            let path = t.split_once("] ").map(|(_, p)| p).unwrap_or("");
+            model = Some(path.trim_end_matches("_c").to_ascii_lowercase());
+            names = None;
+            continue;
+        }
+        match names.as_mut() {
+            None => {
+                if let Some(rest) = t.strip_prefix("m_meshGroups") {
+                    let rest = rest.trim_start_matches([' ', '=']).trim();
+                    if rest.starts_with('[') && rest.ends_with(']') {
+                        // "m_meshGroups = [  ]"
+                        if let Some(m) = model.take() {
+                            out.insert(m, vec![Vec::new()]);
+                        }
+                    } else {
+                        names = Some(Vec::new());
+                    }
+                }
+            }
+            Some(list) => {
+                if let Some(name) = t.strip_prefix('"').and_then(|r| r.split('"').next()) {
+                    list.push(name.to_string());
+                } else if t.starts_with(']') {
+                    if let Some(m) = model.take() {
+                        out.insert(m, vec![std::mem::take(list)]);
+                    }
+                    names = None;
+                }
+            }
+        }
     }
+    out
+}
+
+/// Source2Viewer-CLI's `-b DATA` output for `models` (`.vmdl` paths) in the game's pak.
+fn model_data(cli: &Path, pak: &Path, models: &[String]) -> Result<String, String> {
+    use std::os::windows::process::CommandExt;
     let filters: Vec<String> = models.iter().map(|m| compiled_path(m)).collect();
     let output = std::process::Command::new(cli)
         .arg("-i")
@@ -77,17 +118,26 @@ pub fn material_groups(cli: &Path, pak: &Path, models: &[String]) -> Result<Grou
         .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|e| crate::trf!("не удалось запустить Source2Viewer-CLI: {e}", "could not start Source2Viewer-CLI: {e}"))?;
-    Ok(parse_groups(&String::from_utf8_lossy(&output.stdout)))
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Material groups of `models`, remembered in `cache\material_groups.txt`
 /// (Source2Viewer-CLI takes a moment to start; the cache is reset when the
 /// game's pak changes, i.e. after a game update).
 pub fn material_groups_cached(cli: &Path, pak: &Path, models: &[String]) -> Groups {
+    data_cached(cli, pak, models, "material_groups.txt", parse_groups)
+}
+
+/// Mesh groups of `models` (see `parse_mesh_groups`), remembered in `cache\mesh_groups.txt`.
+pub fn mesh_groups_cached(cli: &Path, pak: &Path, models: &[String]) -> Groups {
+    data_cached(cli, pak, models, "mesh_groups.txt", parse_mesh_groups)
+}
+
+fn data_cached(cli: &Path, pak: &Path, models: &[String], file: &str, parse: fn(&str) -> Groups) -> Groups {
     // one at a time (a pick and the background warm-up): each writes the whole file
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let path = crate::config::app_dir().join("cache").join("material_groups.txt");
+    let path = crate::config::app_dir().join("cache").join(file);
     let stamp = std::fs::metadata(pak).map(|m| format!("{}|{:?}", m.len(), m.modified().ok())).unwrap_or_default();
     let text = std::fs::read_to_string(&path).unwrap_or_default();
     let mut lines = text.lines();
@@ -108,7 +158,8 @@ pub fn material_groups_cached(cli: &Path, pak: &Path, models: &[String]) -> Grou
         models.iter().filter(|m| !cache.contains_key(&m.to_ascii_lowercase())).cloned().collect();
     if !missing.is_empty() {
         // the CLI failing is not remembered: it is asked again next time
-        let Ok(found) = material_groups(cli, pak, &missing) else { return Groups::new() };
+        let Ok(data) = model_data(cli, pak, &missing) else { return Groups::new() };
+        let found = parse(&data);
         for m in &missing {
             // a model without groups is remembered too (empty), so it is not asked again
             let key = m.to_ascii_lowercase();
@@ -166,6 +217,94 @@ pub fn wanted<'a>(table: &Table, items: &'a [HeroItem]) -> Vec<(&'a HeroItem, St
             models.into_iter().map(|m| (h, m, skin as usize)).collect()
         })
         .collect()
+}
+
+/// changer.dll's lines for the chosen styles' material groups, `matgroup|<model>|<group>`:
+/// a style picked while its model is loaded shows only when the group is switched on
+/// the model itself (a model takes its materials when it loads). An item that puts a
+/// body on the hero (an arcana) gives its group to the hero's other preset models too
+/// (a model without that group is left as it is). Groups are named by their number, as
+/// the items' models name them ("1", "2").
+pub fn group_lines(table: &Table, items: &[HeroItem], wanted: &[(&HeroItem, String, usize)]) -> Vec<String> {
+    let mut out: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    // a piece another item turns into another model (the arcana's refits): that one too
+    let swaps = crate::visuals::model_swaps(table, items);
+    for (h, model, skin) in wanted {
+        out.entry(model.trim().to_ascii_lowercase()).or_insert(*skin);
+        let body = table
+            .modifiers(&h.item)
+            .unwrap_or_default()
+            .iter()
+            .any(|m| m.kind == "entity_model" && m.asset.as_deref().is_some_and(|a| a.starts_with("npc_dota_hero_")));
+        if !body {
+            continue;
+        }
+        for other in items.iter().filter(|o| o.heroes.iter().any(|x| h.heroes.contains(x))) {
+            if let Some(m) = other.model.as_deref().map(str::trim).filter(|m| m.ends_with(".vmdl")) {
+                out.entry(m.to_ascii_lowercase()).or_insert(*skin);
+                if let Some(to) = swaps.get(&compiled_path(m)) {
+                    out.entry(to.strip_suffix("_c").unwrap_or(to).to_ascii_lowercase()).or_insert(*skin);
+                }
+            }
+        }
+    }
+    out.into_iter().map(|(model, skin)| format!("matgroup|{model}|{skin}")).collect()
+}
+
+/// The arcanas' levels for their heroes' preset models (model -> level). An arcana's
+/// style is its level (`arcana_level` of the chosen style), and the game shows its
+/// hero's pieces' body group "arcana" of that level: Windranger's autumn style is her
+/// hair's, cape's, quiver's, bow's and shoulders' choice 2 (another mesh), not a
+/// material group.
+pub fn arcana_levels(table: &Table, items: &[HeroItem]) -> std::collections::BTreeMap<String, u32> {
+    let swaps = crate::visuals::model_swaps(table, items);
+    let mut levels: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+    for h in items {
+        let mods = table.modifiers(&h.item).unwrap_or_default();
+        let Some(level) = mods.iter().find(|m| m.kind == "arcana_level").and_then(|m| m.level) else { continue };
+        for other in items.iter().filter(|o| o.heroes.iter().any(|x| h.heroes.contains(x))) {
+            let mut models: Vec<String> = other.model.iter().map(|m| m.trim().to_string()).collect();
+            for m in table.modifiers(&other.item).unwrap_or_default() {
+                if m.kind == "entity_model" {
+                    models.extend(m.modifier.map(|p| p.trim().to_string()));
+                }
+            }
+            for m in models.iter().filter(|m| m.ends_with(".vmdl")) {
+                levels.entry(m.to_ascii_lowercase()).or_insert(level);
+                if let Some(to) = swaps.get(&compiled_path(m)) {
+                    levels.entry(to.strip_suffix("_c").unwrap_or(to).to_ascii_lowercase()).or_insert(level);
+                }
+            }
+        }
+    }
+    levels
+}
+
+/// changer.dll's lines for the arcanas' levels, `meshmask|<model>|<clear>|<set>|<reset>`:
+/// the model's mesh group mask without the body group "arcana"'s bits (`clear`), with
+/// the level's choice (`set`; choice 0, `reset`, when the item leaves). A model without
+/// that group, or without that choice, is left as it is.
+pub fn mask_lines(levels: &std::collections::BTreeMap<String, u32>, meshes: &Groups) -> Vec<String> {
+    let mut out = Vec::new();
+    for (model, level) in levels {
+        let Some(names) = meshes.get(model).and_then(|g| g.first()) else { continue };
+        let (mut clear, mut set, mut reset) = (0u64, 0u64, 0u64);
+        for (bit, name) in names.iter().enumerate().take(64) {
+            let Some(choice) = name.strip_prefix("arcana_@").and_then(|r| r.split('_').next()) else { continue };
+            let Ok(choice) = choice.parse::<u32>() else { continue };
+            clear |= 1 << bit;
+            if choice == *level {
+                set = 1 << bit;
+            }
+            if choice == 0 {
+                reset = 1 << bit;
+            }
+        }
+        if set != 0 {
+            out.push(format!("meshmask|{model}|{clear}|{set}|{reset}"));
+        }
+    }
+    out
 }
 
 /// Group N's materials over group 0's, for every wanted item.
@@ -253,6 +392,7 @@ mod tests {
             heroes: vec!["Luna".into()],
             slot: "weapon".into(),
             model: Some("models/items/luna/luna_ti9_immortal/luna_ti9_immortal.vmdl".into()),
+            siblings: Vec::new(),
         };
         let wanted = vec![(&item, item.model.clone().unwrap(), 2usize)];
         let reqs = overrides(&wanted, &parse_groups(OUT));
@@ -271,4 +411,108 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn arcana_style_is_its_pieces_body_group() {
+        let text = r#""items_game"
+{
+	"items"
+	{
+		"13806"
+		{
+			"name"		"Compass of the Rising Gale"
+			"item_slot"		"hero_base"
+			"visuals"
+			{
+				"styles"
+				{
+					"0"	{	"skin"	"0"	}
+					"1"	{	"skin"	"1"	}
+				}
+				"asset_modifier"
+				{
+					"type"		"entity_model"
+					"asset"		"npc_dota_hero_windrunner"
+					"modifier"		"models/items/windrunner/windrunner_arcana/wr_arcana_base.vmdl"
+				}
+				"asset_modifier"
+				{
+					"type"		"arcana_level"
+					"level"		"1"
+					"style"		"0"
+				}
+				"asset_modifier"
+				{
+					"type"		"arcana_level"
+					"level"		"2"
+					"style"		"1"
+				}
+			}
+		}
+		"32650"
+		{
+			"name"		"Hair of the Rising Gale"
+			"item_slot"		"head"
+		}
+		"500"
+		{
+			"name"		"Some Axe Helm"
+			"item_slot"		"head"
+		}
+	}
+}
+"#;
+        let table = Table::new(text.as_bytes());
+        let piece = |name: &str, index: u32, style: u32, hero: &str, model: Option<&str>| HeroItem {
+            item: crate::visuals::ItemRef { name: name.into(), index: Some(index), style },
+            heroes: vec![hero.into()],
+            slot: "head".into(),
+            model: model.map(Into::into),
+            siblings: Vec::new(),
+        };
+        let base = "models/items/windrunner/windrunner_arcana/wr_arcana_base.vmdl";
+        let hair = "models/items/windrunner/windrunner_arcana/wr_arcana_head.vmdl";
+        // the body: body groups without "arcana"; the hair: style0, its copy, style1
+        let meshes = parse_mesh_groups(MESHES);
+        assert_eq!(meshes[hair], vec![vec!["arcana_@0_#&style0", "arcana_@1_#&style0_copy", "arcana_@2_#&style1"]]);
+        assert!(meshes["models/a.vmdl"][0].is_empty());
+        let lines_for = |style: u32| {
+            let items = vec![
+                piece("Compass of the Rising Gale", 13806, style, "Windranger", None),
+                piece("Hair of the Rising Gale", 32650, 0, "Windranger", Some(hair)),
+                piece("Some Axe Helm", 500, 0, "Axe", Some("models/items/axe/helm.vmdl")),
+            ];
+            let wanted = wanted(&table, &items);
+            let mut lines = group_lines(&table, &items, &wanted);
+            lines.extend(mask_lines(&arcana_levels(&table, &items), &meshes));
+            lines
+        };
+        // autumn: group "1" of the body (and of the hair, which has none); the hair's mesh
+        // of level 2 (bit 2 instead of bits 0-2)
+        assert_eq!(
+            lines_for(1),
+            vec![format!("matgroup|{base}|1"), format!("matgroup|{hair}|1"), format!("meshmask|{hair}|7|4|1")]
+        );
+        // the first style: no group, level 1; another hero's items are not touched
+        assert_eq!(lines_for(0), vec![format!("meshmask|{hair}|7|2|1")]);
+    }
+
+    const MESHES: &str = r#"[1/3] models/items/windrunner/windrunner_arcana/wr_arcana_base.vmdl_c
+	m_meshGroups =
+	[
+		"arms_@0_#&0",
+		"arms_@1_#&1",
+	]
+	m_materialGroups = [  ]
+[2/3] models/items/windrunner/windrunner_arcana/wr_arcana_head.vmdl_c
+	m_meshGroups =
+	[
+		"arcana_@0_#&style0",
+		"arcana_@1_#&style0_copy",
+		"arcana_@2_#&style1",
+	]
+	m_materialGroups = [  ]
+[3/3] models/a.vmdl_c
+	m_meshGroups = [  ]
+"#;
 }

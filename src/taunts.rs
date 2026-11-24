@@ -237,7 +237,7 @@ mod tests {
 "#;
 
     fn act(asset: &str, modifier: &str) -> crate::visuals::Modifier {
-        crate::visuals::Modifier { kind: "activity".into(), asset: Some(asset.into()), modifier: Some(modifier.into()), style: None }
+        crate::visuals::Modifier { kind: "activity".into(), asset: Some(asset.into()), modifier: Some(modifier.into()), style: None, level: None }
     }
 
     #[test]
