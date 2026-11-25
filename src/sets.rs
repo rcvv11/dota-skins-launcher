@@ -39,6 +39,12 @@ impl NameIndex {
             if let Some(texts) = item.token.as_deref().and_then(|t| tokens.get(&t.trim_start_matches('#').to_lowercase())) {
                 names.extend(texts.iter().cloned());
             }
+            // a set's card names it without the word «set» («The Eminence of Ristul»,
+            // the set's type shown apart): its name without "Bundle" / «Комплект» too
+            if !item.bundle.is_empty() {
+                let short: Vec<String> = names.iter().filter_map(|n| short_set_name(n)).collect();
+                names.extend(short);
+            }
             for n in names {
                 // the first definition of a name wins (sets and items rarely share one)
                 index.by_name.entry(norm(&n)).or_insert_with(|| members.clone());
@@ -51,6 +57,23 @@ impl NameIndex {
     pub fn resolve(&self, labels: &[String]) -> Vec<String> {
         labels.iter().find_map(|l| self.by_name.get(&norm(l))).cloned().unwrap_or_default()
     }
+}
+
+/// A set's name without its "Bundle" / «Комплект» word, when it has one.
+fn short_set_name(name: &str) -> Option<String> {
+    let n = name.trim();
+    let lower = n.to_lowercase();
+    for suffix in [" bundle", " set"] {
+        if lower.ends_with(suffix) {
+            return Some(n[..n.len() - suffix.len()].trim().to_string());
+        }
+    }
+    for prefix in ["комплект ", "набор "] {
+        if lower.starts_with(prefix) {
+            return Some(n.chars().skip(prefix.chars().count()).collect::<String>().trim().to_string());
+        }
+    }
+    None
 }
 
 fn norm(s: &str) -> String {
@@ -216,5 +239,12 @@ mod tests {
         assert_eq!(index.resolve(&labels(&["вина выжившего"])), vec!["Blade of the Survivor", "Hair of the Survivor"]);
         assert_eq!(index.resolve(&labels(&["Blade of the Survivor"])), vec!["Blade of the Survivor"]);
         assert!(index.resolve(&labels(&["Купить"])).is_empty());
+        // a set's card names it without "Bundle" (and in Russian without «Комплект»)
+        let bundled = TABLE.replace("\"Guilt of the Survivor\"", "\"Guilt of the Survivor Bundle\"");
+        let index = NameIndex::build(bundled.as_bytes(), &tokens);
+        assert_eq!(index.resolve(&labels(&["Guilt of the Survivor"])), vec!["Blade of the Survivor", "Hair of the Survivor"]);
+        assert_eq!(short_set_name("The Eminence of Ristul Bundle").as_deref(), Some("The Eminence of Ristul"));
+        assert_eq!(short_set_name("Комплект The Eminence of Ristul").as_deref(), Some("The Eminence of Ristul"));
+        assert_eq!(short_set_name("Blade of the Survivor"), None);
     }
 }

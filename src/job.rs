@@ -210,6 +210,10 @@ fn run(plan: &Plan, step: &dyn Fn(&str)) -> Result<String, String> {
             // The picked items' icons in Dota's slot tiles.
             if plan.memory_swap {
                 glow_lines.extend(crate::slot_icons::config_lines(data, &plan.hero_items));
+                // the preset's items by name, with their style: their wardrobe cards say
+                // «SELECTED» (not the account's own item's) and show that style
+                let items = plan.hero_items.iter().map(|h| &h.item).chain(plan.general.iter());
+                glow_lines.extend(items.map(|i| format!("picked|{}|{}", i.name.replace('|', " "), i.style)));
             }
             // Colourings that are another material group of the model.
             let wanted = crate::skins::wanted(&index, &plan.hero_items);

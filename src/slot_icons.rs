@@ -6,8 +6,8 @@
 //! letters and digits only; a caption in English and in Russian). The "equipped"
 //! row's tiles have no caption: they follow the hero script's slot order, given as
 //! `slotdef|<HERO>|#<position>|<item>|<style>` and `slotdef|<HERO>|#LEN|<count>|0`.
-//! Then the item's icon as a Panorama image path (empty for an item in a style)
-//! and its rarity: the script lays the icon over the game's own and colours the
+//! Then the item's icon as a Panorama image path (an item in a style: that style's
+//! icon) and its rarity: the script lays the icon over the game's own and colours the
 //! rarity strip itself, so the game redrawing a tile does not show.
 
 use crate::visuals::HeroItem;
@@ -20,11 +20,10 @@ pub fn key(s: &str) -> String {
 pub fn config_lines(data: &crate::gamedata::GameData, items: &[HeroItem]) -> Vec<String> {
     let mut lines = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    // always our icon (an item in a style: that style's): Dota redraws the tile with the
+    // account's own item, and only our image over it keeps the preset's showing
     let icon = |h: &HeroItem| -> String {
-        if h.item.style > 0 {
-            return String::new();
-        }
-        data.index.image_inventory(&h.item).map(|i| format!("file://{{images}}/{}.png", i.trim())).unwrap_or_default()
+        data.index.style_icon(&h.item).map(|i| format!("file://{{images}}/{}.png", i.trim())).unwrap_or_default()
     };
     // the tile's rarity strip (the script colours it itself: Dota's redraws reset it)
     let rarity = |h: &HeroItem| data.index.rarity(&h.item).unwrap_or_default();

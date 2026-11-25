@@ -180,7 +180,8 @@ static std::unordered_map<std::string, MeshMask> g_meshMasks;
 static std::unordered_map<std::string, uint32_t> g_gems;
 static std::string g_gemColorsJs = "[]";
 static std::string g_gemPicksJs = "{}";
-static std::string g_gemItemsJs = "[]";  // gemitem|name|icon: the items whose page offers a gem
+static std::string g_gemItemsJs = "[]";
+static std::string g_presetJs = "[]";  // picked|name: the preset's items, for the cards' «SELECTED»  // gemitem|name|icon: the items whose page offers a gem
 // Items for empty slots the running Dota has not read yet (line
 // restart|name\tname): their button says «after restart»
 static std::string g_restartJs = "[]";
@@ -296,7 +297,7 @@ static bool LoadConfig(const std::string& path) {
     std::unordered_map<std::string, std::string> matGroups;
     std::unordered_map<std::string, MeshMask> meshMasks;
     std::unordered_map<std::string, uint32_t> gems;
-    std::string gemColors, gemPicks, gemItems;
+    std::string gemColors, gemPicks, gemItems, preset;
     std::string lang = "ru";
     while (std::getline(file, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
@@ -342,6 +343,12 @@ static bool LoadConfig(const std::string& path) {
             auto f = Split(line, '|');
             if (f.size() >= 3 && !f[1].empty())
                 gemColors += (gemColors.empty() ? "[" : ",[") + JsString(f[1]) + "," + JsString(f[2]) + "]";
+            continue;
+        }
+        if (line.compare(0, 7, "picked|") == 0) {
+            auto f = Split(line, '|');
+            if (f.size() >= 2 && !f[1].empty())
+                preset += (preset.empty() ? "[" : ",[") + JsString(f[1]) + "," + (f.size() >= 3 && !f[2].empty() ? f[2] : "0") + "]";
             continue;
         }
         if (line.compare(0, 8, "gemitem|") == 0) {
@@ -452,6 +459,7 @@ static bool LoadConfig(const std::string& path) {
     g_gemColorsJs = "[" + gemColors + "]";
     g_gemPicksJs = "{" + gemPicks + "}";
     g_gemItemsJs = "[" + gemItems + "]";
+    g_presetJs = "[" + preset + "]";
     InterlockedExchange(&g_weatherWanted, weather >= 0 && weather <= 9 ? weather : -1);
     g_restartJs = "[" + restart + "]";
     {
@@ -1348,6 +1356,10 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
           for (var c = 0; c < p.GetChildCount(); c++) stack.push(p.GetChild(c));
         }
         var added = 0;
+        // does the list hold one of the preset's items (then it, not the account's
+        // equipped item, is the «SELECTED» one)
+        var listHasPreset = false;
+        for (var k0 = 0; k0 < infos.length && !listHasPreset; k0++) listHasPreset = DSLInPreset(infos[k0].GetParent());
         for (var k = 0; k < infos.length; k++) {
           var box = infos[k];
           var row = box.GetParent();
@@ -1365,7 +1377,23 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
             nativeStatus.visible = true;
             nativeStatus.SetAttributeString("dsl_hidden", "");
           }
-          if (owned) continue;
+          if (owned) {
+            // Dota's status on an owned card («SELECTED» on the account's equipped item):
+            // the preset's item is the selected one, the account's other items «OWNED»
+            var lab = nativeStatus ? nativeStatus.FindChild("StatusLabel0") : null;
+            if (lab) {
+              var mine = lab.GetAttributeString("dsl_set", "");
+              if (lab.text !== mine) lab.SetAttributeString("dsl_orig", lab.text || "");
+              var orig = lab.GetAttributeString("dsl_orig", "");
+              var origSelected = orig === DSLTxt.selected || /EQUIPPED/i.test(orig);
+              var want = DSLInPreset(row) ? DSLTxt.selected : (listHasPreset && origSelected ? DSLTxt.have : orig);
+              if (want && lab.text !== want) {
+                lab.text = want;
+                lab.SetAttributeString("dsl_set", want);
+              }
+            }
+            continue;
+          }
           // hide the buy block with the price; on unavailable cards Dota's own «UNAVAILABLE» and the dimming
           var multi = box.FindChild("AvailableItemPurchaseButton");
           if (multi) multi.visible = false;
@@ -1375,7 +1403,7 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
           var chain = [row.paneltype + "#" + row.id];
           DSLEnableStyles(box);
           var have = box.FindChildTraverse("DSLPickButton");
-          if (have) { DSLSetPicked(have, have.GetChild(0), !!picked[DSLKey(row)]); continue; }
+          if (have) { DSLSetPicked(have, have.GetChild(0), DSLIsPicked(row)); continue; }
           // as on Dota's card: a status line at the bottom; on hover over the card
           // it fades and a full-width «SELECT» button takes its place
           var wrap = $.CreatePanel("Panel", box, "DSLPickWrap");
@@ -1412,13 +1440,13 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
           l.style.horizontalAlign = "center";
           l.text = DSLTxt.select;
           hoverItems.push({ b: b, st: st, row: row });
-          DSLSetPicked(b, l, !!picked[DSLKey(row)]);
+          DSLSetPicked(b, l, DSLIsPicked(row));
           (function (b, l, row) {
             b.SetPanelEvent("onactivate", function () {
               if (!row || !row.IsValid()) return;
               var rowLabels = DSLPickLabels(row);
               var key = DSLKey(row);
-              if (picked[key]) return;
+              if (DSLIsPicked(row)) return;
               var def = DSLItemDef(row);
               // the list's other rows go back to «SELECT» (one item per slot)
               // rows are nested in wrappers: go up to the container of the whole list
@@ -1430,10 +1458,15 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
               for (var c = 0; c < others.length; c++) {
                 var ob = others[c];
                 if (ob === b) continue;
-                delete picked[DSLKey(DSLRowOf(ob))];
+                var orow = DSLRowOf(ob);
+                delete picked[DSLKey(orow)];
+                var oname = orow ? DSLCardName(orow) : "";
+                if (oname) delete presetNames[oname.toLowerCase()];
                 DSLSetPicked(ob, ob.GetChild(0), false);
               }
               picked[key] = true;
+              var myName = DSLCardName(row);
+              if (myName) presetNames[myName.toLowerCase()] = true;
               b.SetAttributeInt("dsl_style", DSLStyleOf(row).style);
               DSLSetPicked(b, l, true);
               $.DispatchEvent("Activated", row, "mouse");
@@ -1591,19 +1624,30 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
   // in that style. Per card (the button keeps what it saw): a card Dota builds anew shows
   // its first style without that being a pick
   DSLWatchStyle = function (row, b) {
+    var now = Date.now();
+    // the cursor on the card's style switch (its dots, its arrows): a change soon after
+    // is yours; any other is Dota redrawing the card (after our refresh, a scroll of the
+    // list...), which shows the item's first style
+    var sp = row.FindChildTraverse("StylesPanel");
+    if (sp && sp.BHasHoverStyle()) b.SetAttributeString("dsl_style_hover", "" + now);
     var st = DSLStyleOf(row);
     if (st.style < 0) return;
     var seen = b.GetAttributeInt("dsl_style", -2);
-    if (seen === st.style) return;
+    var want = DSLPresetStyle(row);
+    var yours = now - (+b.GetAttributeString("dsl_style_hover", "0")) < 1500;
+    if (seen === st.style && (yours || want < 0 || st.style === want)) return;
+    if (!yours) {
+      // not a pick: the card shows the preset's style again (tried once a second)
+      b.SetAttributeInt("dsl_style", st.style);
+      if (want >= 0 && want < st.count && st.style !== want && now - (+b.GetAttributeString("dsl_style_fix", "0")) > 1000) {
+        b.SetAttributeString("dsl_style_fix", "" + now);
+        DSLShowStyle(row, want);
+      }
+      return;
+    }
     b.SetAttributeInt("dsl_style", st.style);
     if (seen === -2) return;
-    // Dota redrawing the card after the refresh our pick brings may show the style it had
-    // before again: not a pick (or the two would take turns)
-    var now = Date.now();
-    if (st.style === b.GetAttributeInt("dsl_style_prev", -3) && now - (+b.GetAttributeString("dsl_style_at", "0")) < 3000) return;
-    b.SetAttributeInt("dsl_style_prev", seen);
-    b.SetAttributeString("dsl_style_at", "" + now);
-    $.Msg("DSL_PICK " + DSLItemDef(row) + "|" + DSLPickLabels(row).join("\t"));
+    $.Msg("DSL_PICK " + DSLItemDef(row) + "|" + DSLPickLabels(row).join("	"));
     $.Msg("DSL_LOG style " + (st.style + 1) + " of " + st.count + " picked");
   };
   // the card's style switch for an item you do not own as well
@@ -1637,6 +1681,49 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
     return null;
   };
   var picked = {};  // row key -> picked
+  if (typeof DSLLastRefresh === "undefined") DSLLastRefresh = 0;  // our last preview refresh
+  // the preset's items by name (from the launcher): their cards are the «SELECTED» ones
+  var presetNames = {}, presetStyles = {};
+  DSLSetPreset = function (list) {
+    presetNames = {};
+    presetStyles = {};
+    (list || []).forEach(function (it) {
+      var n = ("" + it[0]).toLowerCase();
+      presetNames[n] = true;
+      presetStyles[n] = +it[1] || 0;
+    });
+  };
+  // the preset's style of the row's item (-1: not in the preset)
+  DSLPresetStyle = function (row) {
+    var n = row ? DSLCardName(row).toLowerCase() : "";
+    return n && presetNames[n] ? presetStyles[n] : -1;
+  };
+  // the card shows the style: its dot, else its arrows
+  DSLShowStyle = function (row, style) {
+    var sel = row.FindChildTraverse("StyleSelector");
+    var radios = [];
+    if (sel) for (var i = 0; i < sel.GetChildCount(); i++) if (sel.GetChild(i).paneltype === "RadioButton") radios.push(sel.GetChild(i));
+    if (radios.length > style) {
+      $.DispatchEvent("Activated", radios[style], "mouse");
+      return;
+    }
+    var st = DSLStyleOf(row);
+    var large = row.FindChildTraverse("LargeStyleSelector");
+    if (!large || st.style < 0) return;
+    var arrows = large.FindChildrenWithClassTraverse(style > st.style ? "Right" : "Left");
+    for (var s = Math.abs(style - st.style); arrows.length && s > 0; s--) $.DispatchEvent("Activated", arrows[0], "mouse");
+  };
+  DSLCardName = function (row) {
+    var card = row;
+    while (card && card.paneltype !== "DOTAEconItemAnimated") card = card.GetParent();
+    var l = card ? card.FindChildTraverse("EconItemName") : null;
+    return l && l.text ? l.text : "";
+  };
+  DSLInPreset = function (row) {
+    var n = row ? DSLCardName(row) : "";
+    return !!n && !!presetNames[n.toLowerCase()];
+  };
+  DSLIsPicked = function (row) { return !!picked[DSLKey(row)] || DSLInPreset(row); };
   // «SELECT» is a dark grey button, as Dota's; «SELECTED» is a label without a background
   // as on Dota's card (ui_econ_item_animated): «SELECT» is a ButtonPrimary DarkGrey button
   // across the card's bottom; «SELECTED» is the status line (white text with a glow)
@@ -1726,8 +1813,27 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
       bottom.style.backgroundColor = color;
       bottom.SetAttributeString("dsl_color", color);
     }
+    // the «equipped» corner (#Equipped, top right): the item's rarity, as Dota's own for
+    // an immortal or an arcana (their images), a wash of its colour otherwise. Dota shows
+    // it only on a tile of an equipped item (.Equipped), which ours is not: shown inline
+    var corner = econ.FindChild("Equipped");
+    if (corner && corner.style.visibility !== "visible") corner.style.visibility = "visible";
+    if (corner && color && corner.GetAttributeString("dsl_color", "") !== m[3]) {
+      corner.SetAttributeString("dsl_color", m[3]);
+      var own = m[3] === "immortal" || m[3] === "arcana";
+      corner.style.backgroundImage = "url('s2r://panorama/images/status_icons/econtooltip_equipped" + (own ? "_" + m[3] : "") + "_psd.vtex')";
+      corner.style.washColor = own ? "none" : color;
+      corner.style.width = own ? "23%" : "20%";
+      corner.style.height = own ? "21%" : "19%";
+    }
     var icon = m[2];
-    if (!icon) return;  // an item in a style: its own icon, Dota's image is left
+    if (!icon) {
+      // an item in a style: Dota's image of it (set with its style) shows; the icon of
+      // the item the tile had before (Crimson Witness under Bracers of Aeons) goes
+      var stale = econ.FindChild("DSLSlotIcon");
+      if (stale && stale.visible) stale.visible = false;
+      return;
+    }
     var img = econ.FindChild("EconItemIcon");
     var ov = econ.FindChild("DSLSlotIcon");
     if (!ov) {
@@ -1936,7 +2042,7 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
       if (it2.b.GetAttributeString("dsl_name", "") === shownName) continue;
       it2.b.SetAttributeString("dsl_name", shownName);
       it2.b.SetAttributeInt("dsl_style", -2);  // its style switch is seen anew
-      DSLSetPicked(it2.b, it2.b.GetChild(0), !!picked[DSLKey(it2.row)]);
+      DSLSetPicked(it2.b, it2.b.GetChild(0), DSLIsPicked(it2.row));
     }
     // picked cards: their style switch picks the item again in the new style
     for (var w = 0; w < alive.length; w++) {
@@ -2124,6 +2230,7 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
   $.Msg("DSL_LOG loop started in " + ctx.id + " (" + loopKind + ", root " + root.id + ")");
   // called by the DLL when the replacements are loaded: rebuild the hero model
   DSLRefresh = function () {
+    DSLLastRefresh = Date.now();
     // the item page (Dota's popup over the pages): its preview scene loaded again, so its
     // effects are made anew (a prismatic gem's colour: the weapon's glow is coloured when
     // it is born). The page is reached through the popup manager, not the pages below
@@ -2219,7 +2326,8 @@ static void MaybeSendGlows(int kind) {
     std::string script = "if (typeof DSLSetGlows === 'function') DSLSetGlows(" + g_glowsJs + ");"
                          "if (typeof DSLSetRestart === 'function') DSLSetRestart(" + g_restartJs + ");"
                          "if (typeof DSLSetSlots === 'function') DSLSetSlots(" + g_slotsJs + ");"
-                         "if (typeof DSLSetGems === 'function') DSLSetGems(" + g_gemColorsJs + "," + g_gemPicksJs + "," + g_gemItemsJs + ");";
+                         "if (typeof DSLSetGems === 'function') DSLSetGems(" + g_gemColorsJs + "," + g_gemPicksJs + "," + g_gemItemsJs + ");"
+                         "if (typeof DSLSetPreset === 'function') DSLSetPreset(" + g_presetJs + ");";
     ReleaseSRWLockShared(&g_glowsLock);
     Log("[*] Sending item glows to the game UI (%s)", kLoopNames[kind]);
     t_inOurScript = true;
@@ -3386,6 +3494,15 @@ static void MatGroupTick() {
             uint32_t cur = *(const uint32_t*)(node + g_groupOffset);
             if (cur == want) continue;
             g_GroupChanged((void*)node, nullptr, &want);
+            {
+                static std::set<std::string> told;
+                uint32_t after = *(const uint32_t*)(node + g_groupOffset);
+                char tag[64];
+                snprintf(tag, sizeof tag, "|%08x|%08x", cur, want);
+                if (told.insert(key + tag).second)
+                    Log("[*] Style: %s group %08x -> %08x (%s), now %08x", key.c_str(), cur, want,
+                        g != groups.end() ? g->second.c_str() : "own", after);
+            }
             if (want && applied.insert(key).second)
                 Log("[*] Style: %s gets material group %s", key.c_str(), g->second.c_str());
         }

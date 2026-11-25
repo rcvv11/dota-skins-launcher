@@ -257,6 +257,28 @@ impl<'a> Table<'a> {
         scalar(&self.text[open..=close], b"image_inventory").filter(|s| !s.trim().is_empty())
     }
 
+    /// The item's icon in its chosen style: the style's alternate icon (`visuals` >
+    /// `styles` > `<style>` > `alternate_icon` N, `alternate_icons` > N > `icon_path`),
+    /// else its own icon.
+    pub fn style_icon(&self, item: &ItemRef) -> Option<String> {
+        let (open, close) = self.find(item)?;
+        let text = self.text;
+        let child = |range: (usize, usize), name: &str| {
+            children(text, range).into_iter().find(|(k, ..)| k.eq_ignore_ascii_case(name)).map(|(_, o, c)| (o, c))
+        };
+        let alternate = (item.style > 0)
+            .then(|| child((open, close), "visuals"))
+            .flatten()
+            .and_then(|v| {
+                let style = child(v, "styles").and_then(|s| child(s, &item.style.to_string()))?;
+                let n = scalar(&text[style.0..=style.1], b"alternate_icon")?;
+                let icons = child(v, "alternate_icons").and_then(|a| child(a, n.trim()))?;
+                scalar(&text[icons.0..=icons.1], b"icon_path")
+            })
+            .filter(|s| !s.trim().is_empty());
+        alternate.or_else(|| self.image_inventory(item))
+    }
+
     /// The item's rarity (`item_rarity`, lower case; "common" when it names none).
     pub fn rarity(&self, item: &ItemRef) -> Option<String> {
         let (open, close) = self.find(item)?;
@@ -755,6 +777,23 @@ pub fn hero_overrides_and_glows(
                     reqs.push(Req { id: h.item.name.clone(), src, dst });
                 }
             }
+        }
+        // The account wears its own item there: the default item's effects never show,
+        // only that item's do, so only as many glows have a place as it has effects
+        // (Chrononaut Continuum, a weapon without any, left Mace of Aeons' glow unseen)
+        if !h.siblings.is_empty() {
+            let theirs = h
+                .siblings
+                .iter()
+                .filter_map(|s| table.find(s))
+                .map(|b| {
+                    let mods = table.modifiers_in(b);
+                    let mut seen = std::collections::HashSet::new();
+                    hero_particles(&mods).into_iter().filter(|p| seen.insert(p.to_ascii_lowercase())).count()
+                })
+                .max()
+                .unwrap_or(0);
+            placed = placed.min(theirs);
         }
         sibling_reqs.extend(sibling_overrides(table, h, &own[..placed], &keep));
         // Glows no default item's effect stands in for: the DLL creates them on
@@ -1457,6 +1496,27 @@ mod tests {
             assert!(got.contains(&want), "missing {want:?} in {got:?}");
         }
         assert_eq!(glows.iter().map(|g| g.particle.as_str()).collect::<Vec<_>>(), vec!["particles/econ/items/lycan/picked/glow2.vpcf"]);
+
+        // an owned weapon without effects (Chrononaut Continuum under Mace of Aeons): the
+        // default glow never shows, so both picked glows are the DLL's
+        let plain = text.replace(
+            "\"particles/econ/items/lycan/owned/glow.vpcf\"",
+            "\"models/x.vmdl\"",
+        )
+        .replace("\"particles/econ/items/lycan/owned/sparks.vpcf\"", "\"models/y.vmdl\"");
+        let table = Table::new(plain.as_bytes());
+        let picked = HeroItem {
+            item: item("Picked Blades", Some(10)),
+            heroes: vec!["Lycan".into()],
+            slot: "weapon".into(),
+            model: Some("models/items/lycan/picked/blades.vmdl".into()),
+            siblings: vec![item("Owned Blades", Some(11))],
+        };
+        let (_, glows) = hero_overrides_and_glows(&table, &[picked], &units, &npcs, &[11u32].into_iter().collect());
+        assert_eq!(
+            glows.iter().map(|g| g.particle.as_str()).collect::<Vec<_>>(),
+            vec!["particles/econ/items/lycan/picked/glow.vpcf", "particles/econ/items/lycan/picked/glow2.vpcf"]
+        );
     }
 
     #[test]
