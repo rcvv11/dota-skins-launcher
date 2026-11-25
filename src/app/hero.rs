@@ -4,9 +4,9 @@
 use super::*;
 
 const TILE_W: f32 = 128.0;
-const TILE_H: f32 = 98.0;
+const TILE_H: f32 = 104.0;
 const HERO_W: f32 = 150.0;
-const HERO_H: f32 = 112.0;
+const HERO_H: f32 = 100.0;
 const GAP: f32 = 12.0;
 
 /// Display order of slots; unknown slots go last, persona variants after their base.
@@ -111,19 +111,20 @@ impl LauncherApp {
         let icons = &mut self.icons;
 
         content_panel(ctx, |ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
             ui.label(
                 egui::RichText::new(crate::tr!("Выберите героя", "Choose a hero"))
-                    .font(bold_font(18.0))
+                    .font(bold_font(20.0))
                     .color(theme::TEXT),
             );
             ui.label(
                 egui::RichText::new(crate::tr!("Слоты героя и выбранные предметы текущего пресета", "Hero slots and the selected items of the current preset"))
-                    .size(12.0)
+                    .size(12.5)
                     .color(theme::TEXT_FAINT),
             );
-            ui.add_space(10.0);
+            ui.add_space(14.0);
             if tiles.is_empty() {
-                ui.label(egui::RichText::new(crate::tr!("Никого не нашлось", "Nobody found")).color(theme::TEXT_DIM));
+                nothing_found(ui, crate::tr!("Попробуйте другое имя", "Try another name"));
                 return;
             }
 
@@ -131,7 +132,7 @@ impl LauncherApp {
             let cols = (((avail + GAP) / (HERO_W + GAP)).floor() as usize).max(1);
             let w = (avail - GAP * (cols as f32 - 1.0)) / cols as f32;
             let rows = tiles.len().div_ceil(cols);
-            egui::ScrollArea::vertical()
+            egui::ScrollArea::vertical().id_salt("hero_picker_page")
                 .auto_shrink([false, false])
                 .show_rows(ui, HERO_H + GAP, rows, |ui, range| {
                     ui.spacing_mut().item_spacing.y = 0.0;
@@ -143,7 +144,7 @@ impl LauncherApp {
                             {
                                 let key = format!("hero:{hero}");
                                 let tex = icons.get(&key, None, portrait.as_deref().map(|p| assets.join(p)));
-                                if hero_tile(ui, w, hero_title(hero), *count, tex.as_ref()).clicked() {
+                                if hero_tile(ui, w, hero_title(hero), *count, tex.as_ref(), hero == NO_HERO).clicked() {
                                     picked = Some(hero.clone());
                                 }
                             }
@@ -274,36 +275,34 @@ impl LauncherApp {
 
         content_panel(ctx, |ui| {
             // ---- header
+            if theme::button(ui, Some(Icon::Back), crate::tr!("Все герои", "All heroes"), egui::vec2(0.0, 30.0), Kind::Ghost).clicked() {
+                back = true;
+            }
+            ui.add_space(6.0);
             ui.horizontal(|ui| {
-                if ui
-                    .add(egui::Button::new(egui::RichText::new(crate::tr!("← Все герои", "← All heroes")).size(12.5)).frame(false))
-                    .clicked()
-                {
-                    back = true;
-                }
-            });
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(96.0, 54.0), Sense::hover());
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(92.0, 52.0), Sense::hover());
                 let key = format!("hero:{hero}");
                 match icons.get(&key, None, portrait.as_deref().map(|p| assets.join(p))) {
                     Some(tex) => {
                         let [tw, th] = tex.size();
                         egui::Image::new(egui::load::SizedTexture::new(tex.id(), rect.size()))
                             .uv(cover_uv(tw as f32 / th.max(1) as f32, rect.aspect_ratio()))
-                            .rounding(Rounding::same(8.0))
+                            .rounding(Rounding::same(theme::R_MD + 2.0))
                             .paint_at(ui, rect);
                     }
                     None => {
-                        ui.painter().rect_filled(rect, Rounding::same(8.0), theme::SURFACE_HI);
+                        ui.painter().rect_filled(rect, Rounding::same(theme::R_MD + 2.0), theme::SURFACE_HI);
+                        theme::paint_icon(ui.painter(), rect.center(), Icon::Catalog, 20.0, theme::TEXT_FAINT);
                     }
                 }
+                ui.painter().rect_stroke(rect, Rounding::same(theme::R_MD + 2.0), Stroke::new(1.0_f32, Color32::from_white_alpha(14)));
                 ui.add_space(6.0);
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.add_space(4.0);
                     ui.label(
                         egui::RichText::new(hero_title(hero))
-                            .font(bold_font(20.0))
+                            .font(bold_font(22.0))
                             .color(theme::TEXT),
                     );
                     ui.label(
@@ -311,19 +310,26 @@ impl LauncherApp {
                             slots.len(),
                             skins.len()
                         ))
-                        .size(12.0)
-                        .color(theme::TEXT_DIM),
+                        .size(12.5)
+                        .color(theme::TEXT_FAINT),
                     );
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // a narrow window: the short label, so the hero's name keeps its place
+                    let label = if ui.available_width() < 520.0 {
+                        crate::tr!("Снять всё", "Remove all")
+                    } else {
+                        crate::tr!("Снять всё с героя", "Remove everything from the hero")
+                    };
                     if equipped_count > 0
-                        && theme::ghost_button(ui, crate::tr!("Снять всё с героя", "Remove everything from the hero"), egui::vec2(150.0, 32.0), theme::DANGER)
+                        && theme::button(ui, None, label, egui::Vec2::ZERO, Kind::Danger)
+                            .on_hover_text(crate::tr!("Снять с героя все предметы этого пресета", "Take all of this preset's items off the hero"))
                             .clicked()
                     {
                         clear_hero = true;
                     }
                     if can_hero_3d
-                        && theme::ghost_button(ui, crate::tr!("3D на герое", "3D on the hero"), egui::vec2(120.0, 32.0), theme::ACCENT_HI)
+                        && theme::button(ui, Some(Icon::Cube), crate::tr!("3D на герое", "3D on the hero"), egui::Vec2::ZERO, Kind::Secondary)
                             .on_hover_text(crate::tr!("Герой с предметами текущего пресета, обновляется при смене предметов", "The hero with the current preset's items, updates when items change"))
                             .clicked()
                     {
@@ -331,28 +337,22 @@ impl LauncherApp {
                     }
                 });
             });
-            ui.add_space(10.0);
+            ui.add_space(14.0);
             if has_persona {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    if theme::chip(ui, crate::tr!("ОБЫЧНЫЙ ОБЛИК", "CLASSIC LOOK"), !persona, theme::ACCENT_HI).clicked() {
-                        switch_persona = Some(false);
-                    }
-                    let label = match &persona_name {
-                        Some(n) => crate::trf!("ПЕРСОНА: {}", "PERSONA: {}", n.to_uppercase()),
-                        None => crate::tr!("ПЕРСОНА", "PERSONA").to_string(),
-                    };
-                    if theme::chip(ui, &label, persona, catalog::rarity_color("arcana"))
-                        .on_hover_text(crate::tr!("Альтернативный облик героя со своими слотами", "The hero's alternative look with its own slots"))
-                        .clicked()
-                    {
-                        switch_persona = Some(true);
-                    }
-                });
-                ui.add_space(8.0);
+                let looks = [
+                    crate::tr!("Обычный облик", "Classic look").to_string(),
+                    match &persona_name {
+                        Some(n) => crate::trf!("Персона: {}", "Persona: {}", n),
+                        None => crate::tr!("Персона", "Persona").to_string(),
+                    },
+                ];
+                if let Some(i) = theme::segmented(ui, "persona", &looks, usize::from(persona)) {
+                    switch_persona = Some(i == 1);
+                }
+                ui.add_space(12.0);
             }
 
-            egui::ScrollArea::vertical()
+            egui::ScrollArea::vertical().id_salt("hero_slots_page")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     // ---- slot tiles
@@ -390,47 +390,52 @@ impl LauncherApp {
                     }
 
                     // ---- options for the active slot
-                    ui.add_space(6.0);
+                    ui.add_space(8.0);
                     ui.horizontal(|ui| {
+                        ui.set_min_height(theme::CONTROL_H);
+                        ui.label(
+                            egui::RichText::new(tile_label(&active_slot))
+                                .font(bold_font(17.0))
+                                .color(theme::TEXT),
+                        );
                         ui.label(
                             egui::RichText::new(crate::trf!(
-                                "{}, вариантов: {}", "{}, variants: {}",
-                                tile_label(&active_slot),
+                                "вариантов: {}", "variants: {}",
                                 if active_slot == SETS { set_cards.len() } else { options.len() }
                             ))
-                            .font(bold_font(15.0))
-                            .color(theme::TEXT),
+                            .size(12.5)
+                            .color(theme::TEXT_FAINT),
                         );
-                        if let Some(id) = &current {
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if theme::ghost_button(ui, crate::tr!("Вернуть стандартный", "Back to default"), egui::vec2(170.0, 30.0), theme::TEXT)
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(8.0);
+                            if let Some(s) = sort_combo(ui, "hero_sort", sort) {
+                                new_sort = Some(s);
+                            }
+                            if let Some(id) = &current {
+                                if theme::button(ui, Some(Icon::Revert), crate::tr!("Вернуть стандартный", "Back to default"), egui::Vec2::ZERO, Kind::Secondary)
                                     .on_hover_text(crate::tr!("Убрать выбранный предмет из этого слота", "Remove the selected item from this slot"))
                                     .clicked()
                                 {
                                     toggles.push(id.clone());
                                 }
-                            });
-                        }
+                            }
+                        });
                     });
-                    ui.add_space(4.0);
+                    ui.add_space(8.0);
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
-                        if theme::chip(ui, crate::tr!("ВСЕ", "ALL"), rarity.is_none(), theme::TEXT).clicked() {
+                        if theme::chip(ui, crate::tr!("Все", "All"), rarity.is_none(), None).clicked() {
                             new_rarity = Some(None);
                         }
                         for r in &rarities {
                             let active = rarity.as_deref() == Some(r.as_str());
-                            let label = catalog::rarity_label(r).to_uppercase();
-                            if theme::chip(ui, &label, active, catalog::rarity_color(r)).clicked() {
+                            let label = catalog::rarity_label(r);
+                            if theme::chip(ui, &label, active, Some(catalog::rarity_color(r))).clicked() {
                                 new_rarity = Some(if active { None } else { Some(r.clone()) });
                             }
                         }
-                        ui.add_space(8.0);
-                        if let Some(s) = sort_combo(ui, "hero_sort", sort) {
-                            new_sort = Some(s);
-                        }
                     });
-                    ui.add_space(10.0);
+                    ui.add_space(14.0);
 
                     if active_slot == SETS {
                         let avail = ui.available_width() - 8.0;
@@ -454,10 +459,7 @@ impl LauncherApp {
                         return;
                     }
                     if options.is_empty() {
-                        ui.label(
-                            egui::RichText::new(crate::tr!("Нет вариантов под текущие фильтры", "No variants for the current filters"))
-                                .color(theme::TEXT_DIM),
-                        );
+                        nothing_found(ui, crate::tr!("Нет вариантов под текущие фильтры", "No variants for the current filters"));
                         return;
                     }
                     let avail = ui.available_width() - 8.0;
@@ -541,83 +543,62 @@ impl LauncherApp {
     }
 }
 
-/// Central panel with the launcher's background and padding.
+/// A page on the content panel.
 fn content_panel(ctx: &egui::Context, add: impl FnOnce(&mut egui::Ui)) {
-    egui::CentralPanel::default()
-        .frame(
-            egui::Frame::none()
-                .fill(theme::BG_DEEP)
-                .inner_margin(egui::Margin {
-                    left: 20.0,
-                    right: 12.0,
-                    top: 16.0,
-                    bottom: 0.0,
-                }),
-        )
-        .show(ctx, |ui| {
-            let bg = ui.max_rect().expand2(egui::vec2(20.0, 16.0));
-            let glow = Rect::from_min_max(bg.min, Pos2::new(bg.max.x, bg.min.y + 220.0));
-            ui.painter().add(theme::vgradient(
-                glow,
-                theme::ACCENT.gamma_multiply(0.07),
-                Color32::TRANSPARENT,
-            ));
-            add(ui);
-        });
+    egui::CentralPanel::default().frame(page_frame()).show(ctx, add);
 }
 
+/// A hero in the picker: the picture fills the tile, the name sits on its shaded
+/// bottom; the general items' tile has no picture.
 fn hero_tile(
     ui: &mut egui::Ui,
     w: f32,
     name: &str,
     count: usize,
     tex: Option<&egui::TextureHandle>,
+    general: bool,
 ) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, HERO_H), Sense::click());
     if ui.is_rect_visible(rect) {
         let hover = ui.ctx().animate_bool_with_time(resp.id.with("h"), resp.hovered(), 0.12);
         let p = ui.painter();
-        let r = Rounding::same(theme::R_MD);
-        p.rect_filled(rect, r, theme::lerp_color(theme::SURFACE, theme::SURFACE_HI, hover));
-        let pic = Rect::from_min_size(rect.min, egui::vec2(w, HERO_H - 30.0));
-        let top = Rounding { nw: theme::R_MD, ne: theme::R_MD, sw: 0.0, se: 0.0 };
+        let radius = theme::R_LG - 2.0;
+        let r = Rounding::same(radius);
         match tex {
             Some(tex) => {
                 let [tw, th] = tex.size();
-                egui::Image::new(egui::load::SizedTexture::new(tex.id(), pic.size()))
-                    .uv(cover_uv(tw as f32 / th.max(1) as f32, pic.aspect_ratio()))
-                    .rounding(top)
+                let uv = zoom_uv(cover_uv(tw as f32 / th.max(1) as f32, rect.aspect_ratio()), 1.0 + 0.06 * hover);
+                egui::Image::new(egui::load::SizedTexture::new(tex.id(), rect.size()))
+                    .uv(uv)
+                    .rounding(r)
                     .tint(theme::lerp_color(Color32::from_gray(200), Color32::WHITE, hover))
-                    .paint_at(ui, pic);
+                    .paint_at(ui, rect);
             }
             None => {
-                p.rect_filled(pic, top, theme::ACCENT.gamma_multiply(0.12));
-                p.text(
-                    pic.center(),
-                    egui::Align2::CENTER_CENTER,
-                    name.chars().next().unwrap_or('?').to_string(),
-                    bold_font(30.0),
-                    theme::ACCENT.gamma_multiply(0.6),
-                );
+                p.rect_filled(rect, r, theme::lerp_color(theme::SURFACE, theme::SURFACE_HI, hover));
+                let icon = if general { Icon::Catalog } else { Icon::Heroes };
+                theme::paint_icon(p, rect.center() - egui::vec2(0.0, 14.0), icon, 24.0, theme::TEXT_FAINT);
             }
         }
-        let g = theme::galley(ui, name, bold_font(13.0), theme::TEXT, w - 50.0);
-        p.galley(Pos2::new(rect.min.x + 10.0, pic.max.y + 7.0), g, theme::TEXT);
-        let cg = theme::galley(ui, &count.to_string(), FontId::proportional(11.5), theme::TEXT_FAINT, 40.0);
+        // shade under the name
+        let shade = Rect::from_min_max(Pos2::new(rect.min.x, rect.max.y - 58.0), rect.max);
+        theme::fade_up(ui, shade, Rounding { nw: 0.0, ne: 0.0, sw: radius, se: radius }, Color32::from_black_alpha(230));
+        let cg = theme::galley(ui, &count.to_string(), FontId::proportional(11.5), Color32::from_white_alpha(140), 44.0);
+        let g = theme::galley(ui, name, bold_font(13.5), Color32::WHITE, w - 30.0 - cg.size().x);
+        p.galley(Pos2::new(rect.min.x + 11.0, rect.max.y - 10.0 - g.size().y), g, Color32::WHITE);
         p.galley(
-            Pos2::new(rect.max.x - 10.0 - cg.size().x, pic.max.y + 8.0),
+            Pos2::new(rect.max.x - 11.0 - cg.size().x, rect.max.y - 10.5 - cg.size().y),
             cg,
-            theme::TEXT_FAINT,
+            Color32::WHITE,
         );
-        p.rect_stroke(
-            rect,
-            r,
-            Stroke::new(1.0_f32, theme::lerp_color(theme::BORDER, theme::ACCENT, hover)),
-        );
+        let outline = theme::lerp_color(Color32::from_white_alpha(14), Color32::from_white_alpha(80), hover);
+        p.rect_stroke(rect, r, Stroke::new(1.0_f32, outline));
     }
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// A slot of the hero: its caption and count, the item chosen for it (or an
+/// empty place for the default) and that item's name.
 fn slot_tile(
     ui: &mut egui::Ui,
     w: f32,
@@ -632,68 +613,66 @@ fn slot_tile(
         let hover = ui.ctx().animate_bool_with_time(resp.id.with("h"), resp.hovered(), 0.12);
         let act = ui.ctx().animate_bool_with_time(resp.id.with("a"), active, 0.15);
         let p = ui.painter();
-        let r = Rounding::same(theme::R_MD);
+        let r = Rounding::same(theme::R_LG - 2.0);
         let accent = item.map(|s| catalog::rarity_color(&s.rarity)).unwrap_or(theme::BORDER_HI);
         p.rect_filled(rect, r, theme::lerp_color(theme::SURFACE, theme::SURFACE_HI, hover.max(act)));
 
-        // slot caption
-        let cap = tile_label(slot).to_uppercase();
-        let g = theme::galley(ui, &cap, bold_font(10.0), theme::TEXT_FAINT, w - 50.0);
-        p.galley(rect.min + egui::vec2(10.0, 8.0), g, theme::TEXT_FAINT);
-        let cg = theme::galley(ui, &count.to_string(), FontId::proportional(10.5), theme::TEXT_FAINT, 40.0);
+        // slot caption and how many items it has
+        let cap_color = theme::lerp_color(theme::TEXT_FAINT, theme::TEXT_DIM, act.max(hover));
+        let cg = theme::galley(ui, &count.to_string(), FontId::proportional(11.0), theme::TEXT_FAINT, 40.0);
+        let g = theme::galley(ui, &tile_label(slot), FontId::proportional(12.0), cap_color, w - 30.0 - cg.size().x);
+        p.galley(rect.min + egui::vec2(10.0, 7.0), g, cap_color);
         p.galley(Pos2::new(rect.max.x - 10.0 - cg.size().x, rect.min.y + 8.0), cg, theme::TEXT_FAINT);
 
         // picture
         let pic = Rect::from_min_max(
-            rect.min + egui::vec2(10.0, 24.0),
-            Pos2::new(rect.max.x - 10.0, rect.max.y - 29.0),
+            rect.min + egui::vec2(8.0, 27.0),
+            Pos2::new(rect.max.x - 8.0, rect.max.y - 29.0),
         );
+        let pr = Rounding::same(theme::R_SM);
         match (item, tex) {
             (Some(_), Some(tex)) => {
                 let [tw, th] = tex.size();
                 egui::Image::new(egui::load::SizedTexture::new(tex.id(), pic.size()))
                     .uv(cover_uv(tw as f32 / th.max(1) as f32, pic.aspect_ratio()))
-                    .rounding(Rounding::same(6.0))
+                    .rounding(pr)
                     .paint_at(ui, pic);
             }
             (Some(_), None) => {
-                p.rect_filled(pic, Rounding::same(6.0), accent.gamma_multiply(0.15));
+                p.rect_filled(pic, pr, accent.gamma_multiply(0.15));
             }
             (None, _) => {
-                p.rect_filled(pic, Rounding::same(6.0), theme::INPUT);
-                p.text(
+                p.rect(pic, pr, theme::BG, Stroke::new(1.0_f32, theme::BORDER));
+                theme::paint_icon(
+                    p,
                     pic.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "+",
-                    bold_font(22.0),
+                    Icon::Add,
+                    13.0,
                     theme::lerp_color(theme::TEXT_FAINT, theme::TEXT_DIM, hover),
                 );
             }
         }
 
-        // item name or default
-        let (text, color) = match item {
-            Some(s) => (s.name.as_str(), theme::TEXT),
-            None => (crate::tr!("Стандартный", "Default"), theme::TEXT_FAINT),
-        };
-        let font = if item.is_some() { bold_font(12.5) } else { FontId::proportional(12.5) };
-        let g = theme::galley(ui, text, font, color, w - 20.0);
-        p.galley(Pos2::new(rect.min.x + 10.0, rect.max.y - 23.0), g, color);
-
-        if item.is_some() {
-            let stripe = Rect::from_min_max(Pos2::new(rect.min.x, rect.max.y - 3.0), rect.max);
-            p.rect_filled(
-                stripe,
-                Rounding { nw: 0.0, ne: 0.0, sw: theme::R_MD, se: theme::R_MD },
-                accent.gamma_multiply(0.85),
-            );
+        // item name, or default
+        match item {
+            Some(s) => {
+                let y = rect.max.y - 15.0;
+                p.circle_filled(Pos2::new(rect.min.x + 13.0, y), 3.0, accent);
+                let g = theme::galley(ui, &s.name, bold_font(12.5), theme::TEXT, w - 32.0);
+                p.galley(Pos2::new(rect.min.x + 21.0, y - g.size().y / 2.0), g, theme::TEXT);
+            }
+            None => {
+                let g = theme::galley(ui, crate::tr!("Стандартный", "Default"), FontId::proportional(12.5), theme::TEXT_FAINT, w - 20.0);
+                p.galley(Pos2::new(rect.min.x + 10.0, rect.max.y - 15.0 - g.size().y / 2.0), g, theme::TEXT_FAINT);
+            }
         }
+
         let outline = theme::lerp_color(
             theme::lerp_color(theme::BORDER, theme::BORDER_HI, hover),
             theme::ACCENT,
             act,
         );
-        p.rect_stroke(rect, r, Stroke::new(1.0 + act, outline));
+        p.rect_stroke(rect, r, Stroke::new(1.0 + 0.5 * act, outline));
     }
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     match item {

@@ -1,21 +1,3 @@
-//! Effects that never end by themselves.
-//!
-//! The game lets some effects go as soon as it makes them, counting on them to end
-//! on their own: Caustic Finale's burst on a hit (`sandking_caustic_finale_debuff`,
-//! emitting for 0.1 s). An item's effect in its place that never ends by itself
-//! (The Barren Vector of the Crimson Witness's debuff, which keeps dripping until the
-//! game stops it) then stays on the unit for good: nothing stops it. So a swap of an
-//! effect that ends by itself for one that does not is left out. Effects the game
-//! stops itself (a modifier's own effect, Caustic Finale's `orb_of_venom`) never end
-//! by themselves either way, and their swaps stay.
-//!
-//! An effect never ends by itself when it, or one of its children, emits without end:
-//! a continuous emitter without an emission duration, or a maintain emitter. An effect
-//! surely ends by itself when something in it emits, and everything that emits does so
-//! for a while only, its particles decay, and nothing waits for the game to stop it (an
-//! end cap) or starts it again. An empty effect (a hero's blank placeholder an item
-//! fills, Windranger's focus fire) is neither: the game stops it itself.
-
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 

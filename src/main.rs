@@ -47,7 +47,8 @@ fn main() -> eframe::Result<()> {
     }
 
     // changer.dll is injected into dota2.exe: the launcher runs as administrator from the start
-    if !win::is_elevated() {
+    // (a debug build runs with the rights it was started with: for working on the UI)
+    if !cfg!(debug_assertions) && !win::is_elevated() {
         if win::relaunch_elevated() {
             return Ok(());
         }

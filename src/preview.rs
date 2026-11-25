@@ -1034,7 +1034,7 @@ impl Preview {
                     .color(theme::TEXT_FAINT),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.checkbox(&mut self.auto_rotate, crate::tr!("Автоповорот", "Auto-rotate"));
+                theme::toggle(ui, &mut self.auto_rotate, crate::tr!("Автоповорот", "Auto-rotate"));
                 if let Some((_, _, tris)) = self.model {
                     let text = if self.models.len() > 1 {
                         crate::trf!("моделей: {}, {tris} треуг.", "models: {}, {tris} tris", self.models.len())
