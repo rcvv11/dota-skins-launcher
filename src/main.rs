@@ -13,6 +13,7 @@ mod downloads;
 mod emblem;
 mod extract;
 mod gamedata;
+mod fxlife;
 mod gems;
 mod glow;
 mod gsi;

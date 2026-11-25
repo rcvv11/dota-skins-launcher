@@ -327,6 +327,14 @@ fn run(plan: &Plan, step: &dyn Fn(&str)) -> Result<String, String> {
             }
         }
     }
+    // An effect the game lets go as soon as it makes it, counting on it to end by itself,
+    // never gets one in its place that does not end by itself: it would stay for good
+    // (The Barren Vector of the Crimson Witness's Caustic Finale debuff on its targets)
+    if let (Some(cli), Some(game_dir)) = (&plan.vrf_cli, &game_dir) {
+        for r in crate::fxlife::drop_endless_swaps(cli, &game_dir.join("pak01_dir.vpk"), &mut reqs) {
+            crate::picks::trace(&format!("  effect swap left out (never ends by itself): {} -> {}", r.dst, r.src));
+        }
+    }
     // An item that got any file (an arcana with no model of its own, but a
     // body swap and effects) is applied.
     skipped.retain(|s| !reqs.iter().any(|r| r.id == s.name));

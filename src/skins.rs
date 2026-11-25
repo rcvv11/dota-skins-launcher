@@ -108,17 +108,23 @@ pub fn parse_mesh_groups(output: &str) -> Groups {
 /// Source2Viewer-CLI's `-b DATA` output for `models` (`.vmdl` paths) in the game's pak.
 fn model_data(cli: &Path, pak: &Path, models: &[String]) -> Result<String, String> {
     use std::os::windows::process::CommandExt;
-    let filters: Vec<String> = models.iter().map(|m| compiled_path(m)).collect();
-    let output = std::process::Command::new(cli)
-        .arg("-i")
-        .arg(pak)
-        .arg("-f")
-        .arg(filters.join(","))
-        .args(["-b", "DATA"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|e| crate::trf!("не удалось запустить Source2Viewer-CLI: {e}", "could not start Source2Viewer-CLI: {e}"))?;
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    let mut out = String::new();
+    // a few at a time: the paths go on one command line
+    for chunk in models.chunks(120) {
+        let filters: Vec<String> = chunk.iter().map(|m| compiled_path(m)).collect();
+        let output = std::process::Command::new(cli)
+            .arg("-i")
+            .arg(pak)
+            .arg("-f")
+            .arg(filters.join(","))
+            .args(["-b", "DATA"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|e| crate::trf!("не удалось запустить Source2Viewer-CLI: {e}", "could not start Source2Viewer-CLI: {e}"))?;
+        out.push_str(&String::from_utf8_lossy(&output.stdout));
+        out.push('\n');
+    }
+    Ok(out)
 }
 
 /// Material groups of `models`, remembered in `cache\material_groups.txt`
@@ -133,7 +139,9 @@ pub fn mesh_groups_cached(cli: &Path, pak: &Path, models: &[String]) -> Groups {
     data_cached(cli, pak, models, "mesh_groups.txt", parse_mesh_groups)
 }
 
-fn data_cached(cli: &Path, pak: &Path, models: &[String], file: &str, parse: fn(&str) -> Groups) -> Groups {
+/// Something read from files' `DATA` blocks (`parse`), per file, remembered in
+/// `cache\<file>` until the game's pak changes.
+pub(crate) fn data_cached(cli: &Path, pak: &Path, models: &[String], file: &str, parse: fn(&str) -> Groups) -> Groups {
     // one at a time (a pick and the background warm-up): each writes the whole file
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
