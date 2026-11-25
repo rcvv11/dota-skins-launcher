@@ -3945,7 +3945,7 @@ static void* LiveBinding(const std::string& model) {
     return binding;
 }
 
-struct LiveSwap { const uint8_t* node; int index; std::string model, desired; };
+struct LiveSwap { const uint8_t* node; int index; std::string model, desired; bool wearable; };
 
 static void LiveModelTick() {
     if (g_inMenu) {
@@ -3984,7 +3984,7 @@ static void LiveModelTick() {
                 auto heroes = g_rules->heroes.find(model);
                 if (heroes != g_rules->heroes.end() && !heroes->second.empty()) continue;
             }
-            todo.push_back({node, index, model, desired});
+            todo.push_back({node, index, model, desired, parentNode != nullptr});
         }
     }
     ReleaseSRWLockShared(&g_rulesLock);
@@ -3994,15 +3994,22 @@ static void LiveModelTick() {
         auto f = g_loadedAs.find(s.model);
         if (f != g_loadedAs.end()) held = f->second;
         ReleaseSRWLockShared(&g_loadedAsLock);
-        if (held == s.desired) continue;  // its file was read as that item already
+        // (not "its file was read as that item already": that is the name's last read only.
+        // A match reads a hero's models on its loading screen, as they are; a read of the
+        // same name later, after the pick, as the item, left the hero's own model, read
+        // before, as it was: The Barren Vector's claws stayed Sand King's own. The model
+        // the entity holds decides; unknown, the last read does, as before)
+        if (g_ih.modelHandle < 0 && held == s.desired) continue;
         void* binding = LiveBinding(s.desired);
         if (!binding) continue;
         void* current = g_ih.modelHandle >= 0 ? *(void* const*)(s.node + g_ih.modelState + g_ih.modelHandle) : nullptr;
         if (current == binding) continue;
         g_SkeletonSetModel((void*)s.node, binding);
-        // once per model and replacement: a wave of creeps is many units
+        // once per model and replacement (a wave of creeps is many units); a hero's
+        // wearable once per entity
         static std::set<std::string> logged;
-        if (logged.insert(s.model + ">" + s.desired).second)
+        std::string key = s.model + ">" + s.desired + (s.wearable ? "#" + std::to_string(s.index) : std::string());
+        if (logged.insert(key).second)
             Log("[*] Live model: entity %d %s (read as %s) -> %s", s.index, s.model.c_str(), held.c_str(), s.desired.c_str());
     }
 }
