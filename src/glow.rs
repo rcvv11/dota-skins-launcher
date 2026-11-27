@@ -29,7 +29,9 @@ fn cache_file(name: &str) -> PathBuf {
 }
 
 // "2": control point 0 and world-origin offsets are read too (older entries lack them)
-const DRIVERS_FILE: &str = "glow_drivers2.txt";
+// (4: a driver with no control point given is control point 0, the field's default; one
+// on the `parent` entity is marked with "^")
+const DRIVERS_FILE: &str = "glow_drivers4.txt";
 const PARTS_FILE: &str = "glow_parts.txt";
 
 fn with_drivers<R>(f: impl FnOnce(&mut HashMap<String, Vec<Driver>>) -> R) -> R {
@@ -399,9 +401,10 @@ fn parse_line(text: &str) -> Vec<Driver> {
 /// A world-origin control point is a value, not a place: its "attachment" is the
 /// offset ("1,0,0"), set as it is (attaching it to the hero made a model snapshot
 /// taken from that point trace the hero's whole model). A driver with no attach
-/// type is the entity's origin (`self_with_wearables` for control point 0); the
-/// game's `parent` stub is left out. Control point 0 is on the entity when the
-/// file does not place it (else it stayed at the world origin).
+/// type is the entity's origin (`self_with_wearables` for control point 0), a
+/// `parent` one the hero's (an item's effect: "^", Razor's arcana storm takes its
+/// CP 1 there; left out, it stayed at the world origin). Control point 0 is on the
+/// entity when the file does not place it (else it stayed at the world origin).
 pub fn parse(text: &str) -> Vec<Driver> {
     let mut out: Vec<Driver> = Vec::new();
     if let Some(start) = text.find("m_controlPointConfigurations") {
@@ -414,17 +417,25 @@ pub fn parse(text: &str) -> Vec<Driver> {
             for entry in body.split('}') {
                 let entity = field(entry, "m_entityName");
                 let kind = field(entry, "m_iAttachType");
-                if kind.is_none() && (entity.is_none() || entity.as_deref() == Some("parent")) {
+                if kind.is_none() && entity.is_none() {
                     continue;
                 }
-                let cp = field(entry, "m_iControlPoint").and_then(|v| v.parse().ok()).unwrap_or(out.len() as u32);
+                // on the effect's entity's parent (an item's effect: the hero, not the item's
+                // model, Razor's arcana base storm at the hero's attach_hitloc): "^" before
+                // its attachment
+                let parent = entity.as_deref() == Some("parent");
+                // the text leaves out a field at its default: no control point is control
+                // point 0 (Razor's arcana shield: its CP 1 on the shield's eye, then `self`
+                // for CP 0, which taken as the next one put CP 1 on the hero's feet)
+                let cp = field(entry, "m_iControlPoint").and_then(|v| v.parse().ok()).unwrap_or(0);
                 let kind = kind.unwrap_or_else(|| "PATTACH_ABSORIGIN_FOLLOW".into());
                 let attachment = if kind == "PATTACH_WORLDORIGIN" {
                     field(entry, "m_vecOffset")
                         .map(|v| v.trim_matches(|c| c == '[' || c == ']' || c == ' ').replace(' ', ""))
                         .unwrap_or_default()
                 } else {
-                    field(entry, "m_attachmentName").unwrap_or_default()
+                    let name = field(entry, "m_attachmentName").unwrap_or_default();
+                    if parent { format!("^{name}") } else { name }
                 };
                 out.push((cp, kind, attachment));
             }
@@ -546,6 +557,16 @@ mod tests {
 }"#;
 
     #[test]
+    fn a_driver_without_its_control_point_is_control_point_0() {
+        // Razor's arcana shield: CP 1 on the shield's eye, then the entity itself for CP 0
+        let shield = "{\n\tm_controlPointConfigurations =\n\t[\n\t\t{\n\t\t\tm_name = \"preview\"\n\t\t\tm_drivers =\n\t\t\t[\n\t\t\t\t{\n\t\t\t\t\tm_iControlPoint = 1\n\t\t\t\t\tm_iAttachType = \"PATTACH_POINT_FOLLOW\"\n\t\t\t\t\tm_attachmentName = \"attach_shield_eye_fx\"\n\t\t\t\t\tm_entityName = \"self_with_wearables\"\n\t\t\t\t},\n\t\t\t\t{\n\t\t\t\t\tm_entityName = \"self\"\n\t\t\t\t},\n\t\t\t]\n\t\t},\n\t]\n}";
+        let d = parse(shield);
+        assert!(d.contains(&(1, "PATTACH_POINT_FOLLOW".to_string(), "attach_shield_eye_fx".to_string())));
+        assert!(d.contains(&(0, "PATTACH_ABSORIGIN_FOLLOW".to_string(), String::new())));
+        assert_eq!(d.iter().filter(|x| x.0 == 1).count(), 1);
+    }
+
+    #[test]
     fn children_skinned_to_bones_the_hero_lacks_are_left_out() {
         let texts: std::collections::HashMap<String, String> = [
             (
@@ -583,6 +604,8 @@ mod tests {
                 (0, "PATTACH_ABSORIGIN_FOLLOW".to_string(), String::new()),
                 (1, "PATTACH_POINT_FOLLOW".to_string(), "attach_weapon_center".to_string()),
                 (6, "PATTACH_WORLDORIGIN".to_string(), "1.0,0.0,0.0".to_string()),
+                // the file's `parent` stub: the hero's origin
+                (10, "PATTACH_ABSORIGIN_FOLLOW".to_string(), "^".to_string()),
             ]
         );
     }
@@ -593,17 +616,18 @@ mod tests {
         assert_eq!(
             d,
             vec![
-                (0, "PATTACH_POINT_FOLLOW".to_string(), "attach_weapon_l".to_string()),
+                // on the hero (the file's "parent"), not the item's model
+                (0, "PATTACH_POINT_FOLLOW".to_string(), "^attach_weapon_l".to_string()),
                 (7, "PATTACH_ABSORIGIN_FOLLOW".to_string(), String::new()),
             ]
         );
         assert_eq!(parse_line(&drivers_text(&d)), d);
         assert_eq!(
             config_line("npc_dota_hero_alchemist", "particles/a.vpcf", &d, Some("models/items/alchemist/axe.vmdl"), &["particles/a.vpcf".to_string()]),
-            "glow|npc_dota_hero_alchemist|particles/a.vpcf|0:PATTACH_POINT_FOLLOW:attach_weapon_l;7:PATTACH_ABSORIGIN_FOLLOW:|models/items/alchemist/axe.vmdl|particles/a.vpcf"
+            "glow|npc_dota_hero_alchemist|particles/a.vpcf|0:PATTACH_POINT_FOLLOW:^attach_weapon_l;7:PATTACH_ABSORIGIN_FOLLOW:|models/items/alchemist/axe.vmdl|particles/a.vpcf"
         );
         // no item model, nothing left for the hero
-        assert_eq!(config_line("npc", "p.vpcf", &d[..1], None, &[]), "glow|npc|p.vpcf|0:PATTACH_POINT_FOLLOW:attach_weapon_l||");
+        assert_eq!(config_line("npc", "p.vpcf", &d[..1], None, &[]), "glow|npc|p.vpcf|0:PATTACH_POINT_FOLLOW:^attach_weapon_l||");
         // an emblem: control point 0 at the world origin in its preview goes on the hero
         let emblem = vec![(0, "PATTACH_WORLDORIGIN".to_string(), String::new()), (6, "PATTACH_WORLDORIGIN".to_string(), "1.0,0.0,0.0".to_string())];
         assert_eq!(

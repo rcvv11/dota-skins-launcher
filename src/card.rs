@@ -93,13 +93,20 @@ fn run(ctx: egui::Context) {
                     }
                     continue;
                 }
-                // Dota's persona switch: «@persona», hero name
+                // Dota's persona switch: «@persona», hero name, «on» or «off» (none: the
+                // other look than the preset's)
                 if press.labels.first().map(String::as_str) == Some("@persona") {
                     if !picks.is_empty() {
                         let _ = wear(&ctx, &std::mem::take(&mut picks));
                     }
                     let hero = press.labels.get(1).cloned().unwrap_or_default();
-                    let _ = toggle_persona(&ctx, &hero);
+                    let want = match press.labels.get(2).map(|s| s.trim()) {
+                        Some("on") => Some(true),
+                        Some("off") => Some(false),
+                        _ => None,
+                    };
+                    crate::picks::trace(&format!("  persona {} for {hero}", match want { Some(true) => "on", Some(false) => "off", None => "switched" }));
+                    let _ = set_persona(&ctx, &hero, want);
                     continue;
                 }
                 let ids: Vec<String> = crate::picks::items_at(&catalog, &press, names.get()).iter().map(|s| s.id.clone()).collect();
@@ -107,6 +114,13 @@ fn run(ctx: egui::Context) {
                 if !ids.is_empty() {
                     // the style picked with the arrows on Dota's item card («2 / 2»)
                     picks.push((ids, crate::styles::from_labels(&press.labels)));
+                } else if let Some((npc, slot)) = default_item_slot(press.def).or_else(|| default_named(&press.labels, names.get())) {
+                    // a slot's default item («Razor's Weapon»): the preset's item there out
+                    if !picks.is_empty() {
+                        let _ = wear(&ctx, &std::mem::take(&mut picks));
+                    }
+                    crate::picks::trace(&format!("  default item {} of {npc}: «{slot}» back to it", press.def));
+                    let _ = unwear_slot(&ctx, &npc, &slot);
                 }
             }
             if !picks.is_empty() {
@@ -119,15 +133,75 @@ fn run(ctx: egui::Context) {
     }
 }
 
+/// The hero (npc name) and slot of a default item by its definition index (None: not one,
+/// or the game's table could not be read).
+fn default_item_slot(def: u32) -> Option<(String, String)> {
+    if def == 0 {
+        return None;
+    }
+    let dir = crate::vpk::game_dir_from_exe(&config::load_config().dota_path)?;
+    let data = crate::gamedata::load(&dir).ok()?;
+    crate::schema::default_item_slot(data.table, def)
+}
+
+/// The hero (npc name) and slot of the default item a press names: its hero from the
+/// press's «@hero=<name>» label (the page's hero), the item by its name on the card (the
+/// localized names of default items are shared by many heroes).
+fn default_named(labels: &[String], names: Option<&crate::sets::NameIndex>) -> Option<(String, String)> {
+    let names = names?;
+    let hero = labels.iter().find_map(|l| l.strip_prefix("@hero="))?;
+    let dir = crate::vpk::game_dir_from_exe(&config::load_config().dota_path)?;
+    let data = crate::gamedata::load(&dir).ok()?;
+    let npc = data.npcs.get(&crate::schema::norm(hero))?.to_ascii_lowercase();
+    let slot = names.default_slot(&npc, labels)?;
+    Some((npc, slot))
+}
+
+/// Takes the active preset's items of a hero's slot out (Dota's own default item in it
+/// again) and applies the preset. Ok(whether any was taken out).
+pub fn unwear_slot(ctx: &egui::Context, npc: &str, slot: &str) -> Result<bool, ()> {
+    let cfg = config::load_config();
+    if !cfg.memory_swap {
+        return Err(());
+    }
+    let assets = config::assets_dir();
+    let mut catalog = Catalog::load(&assets).unwrap_or_default();
+    catalog.merge_custom(&config::load_custom_files());
+    let dir = crate::vpk::game_dir_from_exe(&cfg.dota_path).ok_or(())?;
+    let data = crate::gamedata::load(&dir).map_err(|_| ())?;
+    let of_slot = |s: &Skin| {
+        s.slot.eq_ignore_ascii_case(slot)
+            && s.hero_names().iter().any(|h| data.npcs.get(&crate::schema::norm(h)).is_some_and(|n| n.eq_ignore_ascii_case(npc)))
+    };
+    let mut profiles = config::load_profiles();
+    let index = cfg.active_profile.min(profiles.len().saturating_sub(1));
+    let profile = profiles.get_mut(index).ok_or(())?;
+    let before = profile.skins.len();
+    profile.skins.retain(|id| !catalog.skins.iter().any(|s| &s.id == id && of_slot(s)));
+    if profile.skins.len() == before {
+        return Ok(false);
+    }
+    let plan = plan_for(&cfg, &catalog, &assets, profile);
+    config::save_profiles(&profiles).map_err(|_| ())?;
+    let rx = job::spawn(plan, ctx.clone());
+    let ok = rx.iter().find_map(|m| match m {
+        job::Msg::Done(r) => Some(r.is_ok()),
+        job::Msg::Step(_) => None,
+    });
+    ctx.request_repaint();
+    if ok == Some(true) { Ok(true) } else { Err(()) }
+}
+
 /// Hero name as Dota shows it ("ANTI-MAGE") compared with the catalog's.
 fn same_hero(a: &str, b: &str) -> bool {
     let n = |s: &str| s.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase();
     !a.trim().is_empty() && n(a) == n(b)
 }
 
-/// Puts the hero's persona into the active preset, or takes it out (back to
-/// the classic look) when it is there, and applies the preset.
-pub fn toggle_persona(ctx: &egui::Context, hero: &str) -> Result<bool, ()> {
+/// Puts the hero's persona into the active preset (`want` true) or takes it out (back
+/// to the classic look; `None`: whichever the preset does not have), and applies the
+/// preset. Ok(whether the persona is worn now).
+pub fn set_persona(ctx: &egui::Context, hero: &str, want: Option<bool>) -> Result<bool, ()> {
     let cfg = config::load_config();
     if !cfg.memory_swap {
         return Err(());
@@ -145,6 +219,10 @@ pub fn toggle_persona(ctx: &egui::Context, hero: &str) -> Result<bool, ()> {
     let index = cfg.active_profile.min(profiles.len().saturating_sub(1));
     let profile = profiles.get_mut(index).ok_or(())?;
     let worn = profile.skins.iter().any(|id| personas.iter().any(|p| &p.id == id));
+    let on = want.unwrap_or(!worn);
+    if on == worn {
+        return Ok(worn);
+    }
     if worn {
         profile.skins.retain(|id| !personas.iter().any(|p| &p.id == id));
     } else {
@@ -158,7 +236,7 @@ pub fn toggle_persona(ctx: &egui::Context, hero: &str) -> Result<bool, ()> {
         job::Msg::Step(_) => None,
     });
     ctx.request_repaint();
-    if ok == Some(true) { Ok(!worn) } else { Err(()) }
+    if ok == Some(true) { Ok(on) } else { Err(()) }
 }
 
 /// Gives the item (catalog id) the prismatic gem `color` in the active preset (an
@@ -192,10 +270,14 @@ pub fn set_gem(ctx: &egui::Context, id: &str, color: &str) -> Result<(), ()> {
 
 /// Install plan for a preset, as the launcher's «Apply» builds it.
 fn plan_for(config: &Config, catalog: &Catalog, assets: &std::path::Path, profile: &Profile) -> job::Plan {
-    let chosen: Vec<&Skin> = catalog.skins.iter().filter(|s| profile.skins.contains(&s.id)).collect();
+    let all: Vec<&Skin> = catalog.skins.iter().filter(|s| profile.skins.contains(&s.id)).collect();
+    // as the heroes look (a hero whose persona the preset has: its persona's items); its
+    // classic items' swaps stay for the menu's classic look
+    let chosen = crate::catalog::worn(all.clone());
+    let menu_only = crate::catalog::menu_only(&all, &chosen);
     // the items the account wears: their files take the preset's too
     let owned = crate::vpk::game_dir_from_exe(&config.dota_path).map(|d| crate::owned::equipped(&d)).unwrap_or_default();
-    let (overrides, schema_picks, unsupported) = crate::extract::plan(&chosen, catalog, &config.override_targets, &owned);
+    let (overrides, schema_picks, unsupported) = crate::extract::plan(&all, catalog, &config.override_targets, &owned);
     let mut general = crate::visuals::general_items(&chosen);
     let mut hero_items = crate::visuals::hero_items(&chosen);
     crate::visuals::with_siblings(&mut hero_items, catalog, &owned);
@@ -215,6 +297,7 @@ fn plan_for(config: &Config, catalog: &Catalog, assets: &std::path::Path, profil
         memory_swap: config.memory_swap,
         owned,
         gems: crate::gems::chosen(catalog, &profile.gems),
+        menu_only,
     }
 }
 

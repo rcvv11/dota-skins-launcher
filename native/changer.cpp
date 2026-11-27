@@ -28,6 +28,8 @@
 #include <fstream>
 #include <unordered_map>
 #include <algorithm>
+#include <cctype>
+#include <malloc.h>
 
 #pragma comment(lib, "psapi.lib")
 
@@ -79,6 +81,12 @@ struct Rules {
     std::unordered_map<std::string, std::vector<std::string>> heroes;
     std::vector<std::string> hiddenPrefixes;
     std::set<std::string> keep;
+    // A file's swap in a match where the menu's differs (lines ...|match): a persona's, whose
+    // look the menu shows as worn (see g_personaDefs) while its hero's classic items stay for
+    // the menu's classic look (lines ...|menu: not in a match). See RuleFor.
+    std::unordered_map<std::string, std::string> matchReplacements;
+    std::unordered_map<std::string, std::vector<std::string>> matchHeroes;  // a persona swap's heroes
+    std::set<std::string> menuOnly;
 };
 static Rules* g_rules = new Rules();
 static std::string g_lang = "ru";  // language of the interface buttons
@@ -95,7 +103,9 @@ static std::string Normalize(std::string p) {
 
 static std::vector<std::string> Split(const std::string& s, char sep);
 
-static void AddRule(Rules& rules, const std::string& from, const std::string& to, const std::string& heroes) {
+enum RuleMode { kRuleAlways, kRuleMatch, kRuleMenu };
+
+static void AddRule(Rules& rules, const std::string& from, const std::string& to, const std::string& heroes, RuleMode mode) {
     std::string f = Normalize(from), t = Normalize(to);
     if (f.empty() || t.empty() || f == t) return;
     if (f == "hide") {
@@ -103,9 +113,18 @@ static void AddRule(Rules& rules, const std::string& from, const std::string& to
         rules.hiddenPrefixes.push_back(t);
     } else if (t == "keep") {
         rules.keep.insert(f);
+    } else if (mode == kRuleMatch) {
+        if (rules.matchReplacements.emplace(f, t).second) {
+            for (auto& h : Split(heroes, ','))
+                if (!h.empty()) rules.matchHeroes[f].push_back(Normalize(h));
+            if (!rules.heroes.count(f)) rules.heroes[f] = rules.matchHeroes[f];
+        }
     } else if (rules.replacements.emplace(f, t).second) {  // the first swap of a file wins, as in the file mode
+        auto& list = rules.heroes[f];
+        list.clear();
         for (auto& h : Split(heroes, ','))
-            if (!h.empty()) rules.heroes[f].push_back(Normalize(h));
+            if (!h.empty()) list.push_back(Normalize(h));
+        if (mode == kRuleMenu) rules.menuOnly.insert(f);
     }
 }
 
@@ -116,6 +135,10 @@ static std::string g_localNpc;
 // script's first report (the dashboard's loading screen) the menu's rules hold, or a hero's
 // items loaded then (the front page's heroes) kept their own files for the whole session
 static volatile LONG g_inMenu = 1;
+// A match before its game starts (hero pick, strategy, showcase: DSL_PREGAME from the script):
+// a persona's models are put on the strategy screen's preview live (its switch may take them
+// off again); after it the entities made get them by name (see HookedFindOrRegister)
+static volatile LONG g_preGame = 1;
 
 // The game's interface state (ChangeGameUIState): 0 none, 1 the loading screen, 2 a game,
 // 3 the dashboard; -1 not seen yet. The interface script's "menu" (the game state 0) lasts
@@ -142,7 +165,55 @@ static bool RuleActive(const Rules& rules, const std::string& dst) {
     return false;
 }
 
+// The heroes (npc names) with a persona, and those shown in it now (the preset's word, or a
+// switch just pressed on the hero page or the strategy screen). Under g_rulesLock.
+static std::set<std::string> g_personaNpcs, g_personaShownNpcs;
+
+// Whether a file's persona swap (persona true, lines ...|match) or its classic look's swap
+// (false, lines ...|menu) applies in a match: the one of the look its hero is shown in now
+// (the switch, before the launcher has put it into the preset). A hero with no persona
+// known: as the table says (its match swaps, not the menu's). Under g_rulesLock.
+static bool PersonaLookOn(const Rules& rules, const std::string& dst, bool persona) {
+    // the persona swap's own heroes first (the classic look's swap of the same file may name
+    // none: Legion Commander's weapon), then the other's
+    for (auto* map : {&rules.matchHeroes, &rules.heroes}) {
+        auto h = map->find(dst);
+        if (h == map->end()) continue;
+        for (auto& npc : h->second)
+            if (g_personaNpcs.count(npc)) return (g_personaShownNpcs.count(npc) > 0) == persona;
+    }
+    return persona;
+}
+
+// The replacement of a file that applies now, nullptr for none: in a match its persona swap
+// first, then its swap unless that one is the classic look's while the persona is shown.
+// `forRead`: for reading the file itself, where a persona's models are never swapped: a match
+// reads a model once (at the pick), and the strategy screen's switch may take the persona off
+// again; its models are put on the hero live instead (LiveModelTick). Under g_rulesLock.
+static const std::string* RuleFor(const Rules& rules, const std::string& dst, bool forRead = false) {
+    const std::string* to = nullptr;
+    if (!g_inMenu) {
+        auto m = rules.matchReplacements.find(dst);
+        bool model = dst.size() > 5 && dst.compare(dst.size() - 5, 5, ".vmdl") == 0;
+        if (m != rules.matchReplacements.end() && !(forRead && model) && PersonaLookOn(rules, dst, true)) to = &m->second;
+    }
+    if (!to) {
+        auto it = rules.replacements.find(dst);
+        if (it == rules.replacements.end()) return nullptr;
+        if (!g_inMenu && rules.menuOnly.count(dst) && !PersonaLookOn(rules, dst, false)) return nullptr;
+        to = &it->second;
+    }
+    return RuleActive(rules, dst) ? to : nullptr;
+}
+
+// Whether `to` (RuleFor's answer for dst) is a persona's swap
+static bool IsPersonaRule(const Rules& rules, const std::string& dst, const std::string* to) {
+    auto m = rules.matchReplacements.find(dst);
+    return to && m != rules.matchReplacements.end() && &m->second == to;
+}
+
 static void QueuePreloads(const Rules& rules, const std::set<std::string>& extra);
+static bool IsSwappableResource(const char* name);
 // Item glows for a match (lines glow|npc|particle|cp:type:attachment;...):
 // a JS array the interface script gets through DSLSetGlows
 static std::string g_glowsJs = "[]";
@@ -151,8 +222,11 @@ static std::string g_glowsJs = "[]";
 static std::unordered_map<std::string, std::string> g_itemModels;
 // The glows as the DLL creates them itself in a match (the interface script cannot: a
 // regular match gives its scripts no entities, so their effects hung on nothing)
-struct GlowCp { int cp; int attach; std::string att; float vec[3]; bool world; };
-struct GlowDef { std::string npc, fx, item; std::vector<GlowCp> cps; std::vector<std::string> parts; bool hasParts; };
+// parent: on the hero the effect's model hangs on (its file's driver on "parent", "^" in the line)
+struct GlowCp { int cp; int attach; std::string att; float vec[3]; bool world; bool parent = false; };
+// place: where the item spawns it (its "spawn_in_loadout_only"): 0 everywhere, 1 on the
+// menu's models and the strategy screen's (loadout) only, 2 in the game only
+struct GlowDef { std::string npc, fx, item; std::vector<GlowCp> cps; std::vector<std::string> parts; bool hasParts; int place = 0; };
 static std::vector<GlowDef> g_glowDefs;
 // The emblem's attack effect (line attack|particle): added to the attacks of the hero
 // you play, as the game adds an owned emblem's (see HookedCreateTracking)
@@ -194,6 +268,91 @@ static std::map<std::string, std::string> g_taunts;
 static SRWLOCK g_tauntLock = SRWLOCK_INIT;
 static volatile LONG g_glowsVersion = 0;
 static SRWLOCK g_glowsLock = SRWLOCK_INIT;
+// Personas (lines personadef|HERO|hero id|persona item|npc, persona|hero id): the hero page's
+// persona switch for a persona the account does not own. The game asks its inventory for a
+// hero's item in each loadout slot (GetItemInLoadout); for the persona slot of a hero whose
+// persona the preset has it gets an item of that persona, made as the game makes the items
+// it previews, and shows the persona as if worn: the switch, the model, the persona's slots
+// and its wardrobe. In the menu, and in a match on the strategy screen for the hero you play
+// (its switch and preview; the match's hero itself is the server's: the persona's models are
+// put on it live, see LiveModelTick). See PersonaTick.
+struct PersonaDef {
+    int hero = 0, def = 0;
+    std::string npc;
+    bool operator==(const PersonaDef& o) const { return hero == o.hero && def == o.def && npc == o.npc; }
+};
+struct PersonaPick { bool on; ULONGLONG at; };
+static std::map<std::string, PersonaDef> g_personaDefs;  // hero name (slot key) -> hero, persona item
+static std::set<int> g_personaOn;                        // heroes whose persona the preset has
+static std::map<int, PersonaPick> g_personaPicked;       // switched on the page, the preset not yet told
+static SRWLOCK g_personaLock = SRWLOCK_INIT;
+static volatile LONG g_personaVersion = 0;
+static std::string g_personaKeysJs = "{}";  // the heroes shown in their persona, for the script
+// The items the game shows as worn in the menu (lines wear|hero id|npc|slot|item|style): the
+// preset's items of a hero with a body item no file can give (an arcana's skin, stance and
+// effects: Legion Commander's Blades of Voth Domosh), the whole hero dressed by the game
+struct WearItem {
+    int hero = 0;
+    std::string npc, slot;
+    int def = 0, style = 0;
+    // the item's effects are ours (the game makes none for an item giving the hero another
+    // body: Razor's arcana Tormentor)
+    bool ownGlows = false;
+    bool operator==(const WearItem& o) const {
+        return hero == o.hero && npc == o.npc && slot == o.slot && def == o.def && style == o.style && ownGlows == o.ownGlows;
+    }
+};
+static std::vector<WearItem> g_wearItems;
+// The preset's item models not merged into the hero's model (lines nomerge|model: their item
+// says "skip_model_combine", and the mounted item table gives their slot's items the flag).
+// A regular match's server knows nothing of the flag: it hides the slot's piece as merged,
+// while this client's merged model leaves it out: The Barren Vector's claws were nowhere.
+// Such a piece of your hero is shown again (LiveModelTick)
+static std::set<std::string> g_noMerge;
+static std::string g_dressedJs = "{}";  // their npc names, for the script (no glows of ours)
+static std::set<std::string> g_dressedNpcs;  // the same, for the DLL (their skins are the game's)
+// The preset's items' activity modifiers (lines actmod|npc|hero id|modifier|persona): the
+// hero in the menu takes the stance they give (Legion Commander's arcana: "dualwield" and
+// "arcana", both swords in hand). The game gathers a hero's modifiers from the items it
+// dressed it in, and the preset's never are; a persona's only while it is shown.
+struct ActMod {
+    std::string npc;
+    int hero = 0;
+    std::string mod;
+    bool persona = false;
+    bool operator==(const ActMod& o) const { return npc == o.npc && hero == o.hero && mod == o.mod && persona == o.persona; }
+};
+static std::vector<ActMod> g_actMods;  // (g_personaLock)
+static volatile LONG g_actModsCount = 0;
+
+// (g_personaNpcs, g_personaShownNpcs: see PersonaLookOn)
+// the hero you play, by its hero id, when it has a persona: its strategy screen shows ours
+static volatile LONG g_localHeroId = 0;
+
+static bool PersonaShownLocked(int hero) {  // (g_personaLock held)
+    auto p = g_personaPicked.find(hero);
+    return p != g_personaPicked.end() ? p->second.on : g_personaOn.count(hero) > 0;
+}
+
+// (see g_personaShownNpcs) After the preset, a switch or the hero you play changed.
+static void UpdatePersonaShown() {
+    std::set<std::string> all, shown;
+    std::map<std::string, int> ids;
+    AcquireSRWLockShared(&g_personaLock);
+    for (auto& d : g_personaDefs) {
+        if (d.second.npc.empty()) continue;
+        all.insert(d.second.npc);
+        ids[d.second.npc] = d.second.hero;
+        if (PersonaShownLocked(d.second.hero)) shown.insert(d.second.npc);
+    }
+    ReleaseSRWLockShared(&g_personaLock);
+    AcquireSRWLockExclusive(&g_rulesLock);
+    g_personaNpcs.swap(all);
+    g_personaShownNpcs.swap(shown);
+    auto id = ids.find(g_localNpc);
+    InterlockedExchange(&g_localHeroId, id != ids.end() ? id->second : 0);
+    ReleaseSRWLockExclusive(&g_rulesLock);
+}
 
 static std::string JsString(const std::string& v) {
     std::string out = "\"";
@@ -260,6 +419,7 @@ static GlowDef GlowDefOf(const std::vector<std::string>& f) {
     if (d.hasParts)
         for (auto& p : Split(f[5], ','))
             if (!p.empty()) d.parts.push_back(Normalize(p));
+    d.place = f.size() > 6 ? atoi(f[6].c_str()) : 0;
     for (auto& s : Split(f[3], ';')) {
         auto p = Split(s, ':');
         if (p.size() < 3 || p[0].empty()) continue;
@@ -271,7 +431,8 @@ static GlowDef GlowDefOf(const std::vector<std::string>& f) {
             auto v = Split(p[2], ',');
             for (int k = 0; k < 3; k++) c.vec[k] = v.size() == 3 ? (float)atof(v[k].c_str()) : 0.0f;
         } else {
-            c.att = p[2];
+            c.parent = !p[2].empty() && p[2][0] == '^';
+            c.att = c.parent ? p[2].substr(1) : p[2];
         }
         d.cps.push_back(c);
     }
@@ -298,11 +459,45 @@ static bool LoadConfig(const std::string& path) {
     std::unordered_map<std::string, MeshMask> meshMasks;
     std::unordered_map<std::string, uint32_t> gems;
     std::string gemColors, gemPicks, gemItems, preset;
+    std::map<std::string, PersonaDef> personaDefs;
+    std::set<int> personaOn;
+    std::vector<WearItem> wearItems;
+    std::set<std::string> noMerge;
+    std::vector<ActMod> actMods;
     std::string lang = "ru";
     while (std::getline(file, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty() || line[0] == '#') continue;
         if (line.compare(0, 5, "lang|") == 0) { lang = line.substr(5); continue; }
+        if (line.compare(0, 11, "personadef|") == 0) {
+            // personadef|HERO|hero id|persona item|npc
+            auto f = Split(line, '|');
+            if (f.size() >= 4 && atoi(f[2].c_str()) > 0 && atoi(f[3].c_str()) > 0)
+                personaDefs[f[1]] = {atoi(f[2].c_str()), atoi(f[3].c_str()), f.size() > 4 ? Normalize(f[4]) : std::string()};
+            continue;
+        }
+        if (line.compare(0, 8, "persona|") == 0) {
+            if (int hero = atoi(line.c_str() + 8)) personaOn.insert(hero);
+            continue;
+        }
+        if (line.compare(0, 5, "wear|") == 0) {
+            // wear|hero id|npc|slot|item|style|own glows (1)
+            auto f = Split(line, '|');
+            if (f.size() >= 6 && atoi(f[1].c_str()) > 0 && atoi(f[4].c_str()) > 0)
+                wearItems.push_back({atoi(f[1].c_str()), f[2], f[3], atoi(f[4].c_str()), atoi(f[5].c_str()), f.size() > 6 && f[6] == "1"});
+            continue;
+        }
+        if (line.compare(0, 8, "nomerge|") == 0) {
+            noMerge.insert(Normalize(line.substr(8)));
+            continue;
+        }
+        if (line.compare(0, 7, "actmod|") == 0) {
+            // actmod|npc|hero id|modifier|persona (0/1)
+            auto f = Split(line, '|');
+            if (f.size() >= 5 && !f[1].empty() && !f[3].empty())
+                actMods.push_back({f[1], atoi(f[2].c_str()), f[3], f[4] == "1"});
+            continue;
+        }
         if (line.compare(0, 8, "slotdef|") == 0) {
             // slotdef|HERO|CAPTION|item|style
             std::vector<std::string> f;
@@ -416,9 +611,10 @@ static bool LoadConfig(const std::string& path) {
             continue;
         }
         if (line.compare(0, 5, "glow|") == 0) {
-            std::string g = GlowJs(line);
-            if (!g.empty()) glows += (glows.empty() ? "" : ",") + g;
             auto f = Split(line, '|');
+            // (the menu's script: not one the item spawns in the game only)
+            std::string g = f.size() > 6 && f[6] == "2" ? std::string() : GlowJs(line);
+            if (!g.empty()) glows += (glows.empty() ? "" : ",") + g;
             if (f.size() > 4 && !f[4].empty()) itemKeys.insert(Normalize(f[4]));
             // the effects the script creates itself, loaded in the menu beforehand: a
             // regular match loads nothing on demand (red crosses instead of them)
@@ -429,16 +625,22 @@ static bool LoadConfig(const std::string& path) {
                     if (!part.empty()) glowFiles.insert(Normalize(part));
             continue;
         }
-        // dst|src, or dst|src|npc,npc for a hero item's swap
+        // dst|src, or dst|src|npc,npc for a hero item's swap (|match: a match's swap of
+        // the file, |menu: the menu's only)
         auto rule = Split(line, '|');
-        if (rule.size() >= 2) AddRule(*fresh, rule[0], rule[1], rule.size() > 2 ? rule[2] : std::string());
+        if (rule.size() >= 2) {
+            RuleMode mode = rule.size() > 3 && rule[3] == "match" ? kRuleMatch
+                          : rule.size() > 3 && rule[3] == "menu" ? kRuleMenu : kRuleAlways;
+            AddRule(*fresh, rule[0], rule[1], rule.size() > 2 ? rule[2] : std::string(), mode);
+        }
     }
     // an item model is worn under any model the swap table turns into it (the
     // slot's default one, the player's own item)
     std::unordered_map<std::string, std::string> itemModels;
     for (auto& k : itemKeys) itemModels[k] = k;
-    for (auto& r : fresh->replacements)
-        if (itemKeys.count(r.second)) itemModels.emplace(r.first, r.second);
+    for (auto* map : {&fresh->replacements, &fresh->matchReplacements})
+        for (auto& r : *map)
+            if (itemKeys.count(r.second)) itemModels.emplace(r.first, r.second);
     AcquireSRWLockExclusive(&g_rulesLock);
     g_lang = (lang == "en") ? "en" : "ru";
     Rules* old = g_rules;
@@ -471,12 +673,49 @@ static bool LoadConfig(const std::string& path) {
     AcquireSRWLockExclusive(&g_tauntLock);
     g_taunts.swap(taunts);
     ReleaseSRWLockExclusive(&g_tauntLock);
+    {
+        AcquireSRWLockExclusive(&g_personaLock);
+        bool changed = personaDefs != g_personaDefs || personaOn != g_personaOn || wearItems != g_wearItems;
+        g_personaDefs.swap(personaDefs);
+        g_personaOn.swap(personaOn);
+        g_wearItems.swap(wearItems);
+        g_noMerge.swap(noMerge);
+        g_actMods.swap(actMods);
+        InterlockedExchange(&g_actModsCount, (LONG)g_actMods.size());
+        // a switch on the page the preset now says too is the preset's again (one it does
+        // not say, e.g. the launcher had not got to it yet, stays a while)
+        ULONGLONG now = GetTickCount64();
+        for (auto it = g_personaPicked.begin(); it != g_personaPicked.end();) {
+            bool agrees = (g_personaOn.count(it->first) > 0) == it->second.on;
+            if (agrees || now - it->second.at > 15000) {
+                // (an expired one the preset does not say: the page shows the preset's again)
+                if (!agrees) changed = true;
+                it = g_personaPicked.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        ReleaseSRWLockExclusive(&g_personaLock);
+        UpdatePersonaShown();
+        if (changed) InterlockedIncrement(&g_personaVersion);
+    }
     InterlockedIncrement(&g_glowsVersion);
     static bool first = true;
     if (!first) InterlockedExchange(&g_refreshPending, 1);
     first = false;
+    // the originals of the swaps that go (an item taken out: Razor's arcana Tormentor, its
+    // body, whip and robe), loaded before the preview is made again: handed out as their
+    // replacement while the swap was on, they were never read (or let go since), and the
+    // preview made again with them unloaded drew nothing of Razor but his armor and bracers
+    std::set<std::string> preload = glowFiles;
+    if (old)
+        for (auto& r : old->replacements) {
+            auto now = fresh->replacements.find(r.first);
+            if ((now == fresh->replacements.end() || now->second != r.second) && IsSwappableResource(r.first.c_str()))
+                preload.insert(r.first);
+        }
     delete old;
-    QueuePreloads(*fresh, glowFiles);
+    QueuePreloads(*fresh, preload);
     Log("[+] Config %s: %zu replacements, %zu hidden folders",
         path.c_str(), fresh->replacements.size(), fresh->hiddenPrefixes.size());
     return true;
@@ -515,9 +754,8 @@ using GetFileNameFn = void (*)(void* rs, void* binding, void* outName, uintptr_t
 static void* g_ResourceSystem = nullptr;
 
 static bool FindReplacementFile(const Rules& rules, const std::string& base, bool compiled, std::string& out) {
-    auto it = rules.replacements.find(base);
-    if (it != rules.replacements.end() && RuleActive(rules, base)) {
-        out = compiled ? it->second + "_c" : it->second;
+    if (const std::string* to = RuleFor(rules, base, true)) {
+        out = compiled ? *to + "_c" : *to;
         return true;
     }
 
@@ -550,10 +788,18 @@ static bool FindReplacementFile(const char* fileName, std::string& out) {
 static SRWLOCK g_loadedAsLock = SRWLOCK_INIT;
 static std::unordered_map<std::string, std::string> g_loadedAs;
 
+// A resource's own file under another name: "dsl_own/<name>". A file read as an item's
+// (the slot's default whip read as Razor's arcana Tormentor while the preset had it) stays
+// so in memory under its own name when the item is taken out: the menu hands out this
+// copy, read from the file itself, instead (see HookedFindOrRegister)
+static const char kOwnPrefix[] = "dsl_own/";
+static const size_t kOwnPrefixLen = sizeof(kOwnPrefix) - 1;
+
 static void RememberRead(const char* fileName, const std::string& replacement) {
     std::string name = Normalize(fileName);
-    if (name.size() < 7 || name.compare(name.size() - 7, 7, ".vmdl_c") != 0) return;
+    if (name.size() < 7 || name.compare(name.size() - 2, 2, "_c") != 0 || name.compare(0, kOwnPrefixLen, kOwnPrefix) == 0) return;
     name.resize(name.size() - 2);
+    if (!IsSwappableResource(name.c_str())) return;
     std::string held = replacement.empty() ? name : Normalize(replacement);
     if (held.size() > 2 && held.compare(held.size() - 2, 2, "_c") == 0) held.resize(held.size() - 2);
     AcquireSRWLockExclusive(&g_loadedAsLock);
@@ -561,8 +807,34 @@ static void RememberRead(const char* fileName, const std::string& replacement) {
     ReleaseSRWLockExclusive(&g_loadedAsLock);
 }
 
+// Whether a resource's file was read as another one's (an item's), and still is in memory so
+static bool ReadAsOther(const std::string& name) {
+    AcquireSRWLockShared(&g_loadedAsLock);
+    auto f = g_loadedAs.find(name);
+    bool other = f != g_loadedAs.end() && f->second != name;
+    ReleaseSRWLockShared(&g_loadedAsLock);
+    return other;
+}
+
 static void HookedInitForFileRead(void* self, void* binding, uintptr_t priority, uintptr_t flag, const char* fileName) {
     std::string replacement;
+    {
+        // an own copy ("dsl_own/<name>"): the file of <name> itself
+        std::string own;
+        if (fileName && fileName[0]) {
+            own = fileName;
+        } else {
+            StackBufferString name;
+            auto getName = (*(GetFileNameFn**)g_ResourceSystem)[0x180 / 8];
+            getName(g_ResourceSystem, binding, &name, 0);
+            own = BufStr_Get(&name);
+        }
+        if (_strnicmp(own.c_str(), kOwnPrefix, kOwnPrefixLen) == 0) {
+            std::string real = own.substr(kOwnPrefixLen);
+            Log("[+] %s: its own file %s", own.c_str(), real.c_str());
+            return g_OrigInitForFileRead(self, binding, priority, flag, real.c_str());
+        }
+    }
     if (fileName && fileName[0]) {
         bool swapped = FindReplacementFile(fileName, replacement);
         RememberRead(fileName, swapped ? replacement : std::string());
@@ -618,14 +890,28 @@ static bool IsSwappableResource(const char* name) {
                        _stricmp(name + len - 5, ".vmat") == 0);
 }
 
+// Every replacement of a new table is looked at again, the ones loaded before too: the
+// game lets go of a resource nothing uses (a hero's classic items while the preset had its
+// persona), and one let go was handed out by name no more (RunPreloads loads it again)
 static void QueuePreloads(const Rules& rules, const std::set<std::string>& extra) {
     AcquireSRWLockExclusive(&g_preloadLock);
     for (auto& r : rules.replacements) {
         const std::string& t = r.second;
-        if (IsSwappableResource(t.c_str()) && !g_resident.count(t)) g_preloadQueue.insert(t);
+        if (IsSwappableResource(t.c_str())) g_preloadQueue.insert(t);
     }
     for (auto& t : extra)
-        if (IsSwappableResource(t.c_str()) && !g_resident.count(t)) g_preloadQueue.insert(t);
+        if (IsSwappableResource(t.c_str())) g_preloadQueue.insert(t);
+    ReleaseSRWLockExclusive(&g_preloadLock);
+    // files read as an item that no swap has now (the item taken out): their own copies (the
+    // menu's: a match is given only what its manifest holds)
+    if (!g_inMenu) return;
+    std::vector<std::string> own;
+    AcquireSRWLockShared(&g_loadedAsLock);
+    for (auto& l : g_loadedAs)
+        if (l.second != l.first && !rules.replacements.count(l.first)) own.push_back(kOwnPrefix + l.first);
+    ReleaseSRWLockShared(&g_loadedAsLock);
+    AcquireSRWLockExclusive(&g_preloadLock);
+    for (auto& o : own) g_preloadQueue.insert(o);
     ReleaseSRWLockExclusive(&g_preloadLock);
 }
 
@@ -675,14 +961,15 @@ static void RunPreloads(ULONGLONG budget = 30) {
         ResourceName name;
         if (!g_SetResourceName(&name, model.c_str())) continue;
         auto status = (GetStatusFn)(*(void***)g_ResourceSystem)[kGetStatusSlot];
-        if (status(g_ResourceSystem, &name) != kResourceResident) g_BlockingLoad(g_ResourceSystem, &name, 0);
-        bool ok = status(g_ResourceSystem, &name) == kResourceResident;
-        Log("[%c] Preload %s", ok ? '+' : '-', model.c_str());
-        if (ok) {
-            AcquireSRWLockExclusive(&g_preloadLock);
-            g_resident.insert(model);
-            ReleaseSRWLockExclusive(&g_preloadLock);
-        }
+        bool loaded = status(g_ResourceSystem, &name) == kResourceResident;
+        if (!loaded) g_BlockingLoad(g_ResourceSystem, &name, 0);
+        bool ok = loaded || status(g_ResourceSystem, &name) == kResourceResident;
+        // (one still loaded is only noted)
+        if (!loaded) Log("[%c] Preload %s", ok ? '+' : '-', model.c_str());
+        AcquireSRWLockExclusive(&g_preloadLock);
+        if (ok) g_resident.insert(model);
+        else g_resident.erase(model);
+        ReleaseSRWLockExclusive(&g_preloadLock);
     }
 }
 
@@ -717,8 +1004,35 @@ static void LoadStandInNow(void* rs, ResourceName* name) {
     Log("[%c] Stand-in %s loaded for the match", status(rs, name) == kResourceResident ? '+' : '-', cur);
 }
 
+static bool PersonaModelFor(const char* name, std::string& out);
+
 static void* HookedFindOrRegister(void* rs, ResourceName* name, uintptr_t flag) {
     if (name) LoadStandInNow(rs, name);
+    // A match: a model of the hero you play that its persona (shown now) swaps, its body or a
+    // classic piece, is handed out as the persona's, loaded with its original beforehand (see
+    // PreloadPersonaModels). An entity made after the switch (the strategy screen's preview
+    // made again, the hero at its spawn, its illusions) so wears the persona from the start,
+    // its pieces on the persona's bones. (Never read into the files, and not put on live:
+    // a body changed under its pieces left them on the old bones.)
+    if (name && g_SetResourceName && !g_inMenu && !g_preGame && g_uiState != kUiLoading) {
+        std::string repl;
+        if (PersonaModelFor(BufStr_Get(name), repl)) {
+            ResourceName other;
+            if (g_SetResourceName(&other, repl.c_str())) {
+                void* r = g_OrigFindOrRegister(rs, &other, flag);
+                if (r) {
+                    static std::set<std::string> noted;
+                    static SRWLOCK notedLock = SRWLOCK_INIT;
+                    std::string from = Normalize(BufStr_Get(name));
+                    AcquireSRWLockExclusive(&notedLock);
+                    bool first = noted.insert(from).second;
+                    ReleaseSRWLockExclusive(&notedLock);
+                    if (first) Log("[*] Persona model handed out: %s -> %s", from.c_str(), repl.c_str());
+                    return r;
+                }
+            }
+        }
+    }
     // in the menu and in a match: a resource loaded before the pick (emblem ring, screen
     // shader) stays in the cache with the old swap otherwise
     if (name && g_SetResourceName) {
@@ -738,6 +1052,18 @@ static void* HookedFindOrRegister(void* rs, ResourceName* name, uintptr_t flag) 
             if (g_SetResourceName(&other, repl.c_str())) {
                 void* r = g_OrigFindOrRegister(rs, &other, flag);
                 if (r) { InterlockedIncrement(&g_substituted); return r; }
+            }
+        } else if (len > 5 && IsSwappableResource(cur) && MenuShown() && _strnicmp(cur, kOwnPrefix, kOwnPrefixLen) != 0 &&
+                   !FindReplacementFile(cur, repl)) {
+            // no swap now, its file read as an item's before (the item taken out): its own copy
+            std::string n = Normalize(cur);
+            std::string own = kOwnPrefix + n;
+            if (ReadAsOther(n) && IsResident(own)) {
+                ResourceName other;
+                if (g_SetResourceName(&other, own.c_str())) {
+                    void* r = g_OrigFindOrRegister(rs, &other, flag);
+                    if (r) { InterlockedIncrement(&g_substituted); return r; }
+                }
             }
         }
     }
@@ -860,7 +1186,7 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
   var loopKind = (root.paneltype === "DOTADashboard" || root.FindChildTraverse("DashboardCore") ||
               root.FindChildrenWithClassTraverse("DashboardPage").length > 0 || /dashboard/i.test(root.id || "")) ? "dash" : "hud";
   var last = "";
-  var lastMenu = null;
+  var lastMenu = null, lastPreGame = null;
   var lastHero = "", lastHeroWhy = "", lastPicked = "";
   // Your hero's entity. In a regular match the game gives none for the player: the
   // unit in the portrait, or a real hero of yours, stands in.
@@ -896,6 +1222,55 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
       picker.SetAttributeString("dsl_filters", "1");
       $.Msg("DSL_LOG every item shown in " + picker.id);
     }
+  };
+  // A persona switch (CLASSIC / persona). A persona you own switches as Dota's own. One you do
+  // not: over its tab lies Dota's invisible button (on the hero page from 150px on), whose
+  // press puts the persona on (its tab's own press too), and the classic tab takes it off:
+  // the DLL shows it at once (the game then shows the persona as worn) and the launcher puts
+  // it into the preset (or takes it out). On the hero page and on the strategy screen.
+  DSLPersonaSwitch = function (sel, nameOf) {
+    if (!sel || !sel.IsValid()) return;
+    var pb = sel.FindChildTraverse("PersonaInvisibleButton");
+    var db = sel.FindChildTraverse("DefaultCosmeticGroupButton");
+    var pc = sel.FindChildTraverse("PersonaCosmeticGroupButton");
+    if (!pb || !db) return;
+    if (!sel.BHasClass("HasUsablePersonas") && !pb.enabled) pb.enabled = true;
+    if (pb.GetAttributeString("dsl_persona", "") === "1") return;
+    pb.SetAttributeString("dsl_persona", "1");
+    var send = function (on) {
+      var name = nameOf();
+      $.Msg("DSL_LOG persona " + (on ? "on" : "off") + " for " + name);
+      $.Msg("DSL_PICK 0|@persona\t" + name + "\t" + (on ? "on" : "off"));
+    };
+    pb.SetPanelEvent("onactivate", function () {
+      if (!sel.BHasClass("HasUsablePersonas")) send(true);
+    });
+    if (pc) pc.SetPanelEvent("onactivate", function () {
+      if (sel.BHasClass("HasUsablePersonas")) $.DispatchEvent("DOTAPersonaSelectorSelected", pc);
+      else send(true);
+    });
+    db.SetPanelEvent("onactivate", function () {
+      if (sel.BHasClass("HasUsablePersonas")) $.DispatchEvent("DOTAPersonaSelectorSelected", db);
+      else send(false);
+    });
+  };
+  // The hero of the page a card is on (the hero page, the strategy screen's picker)
+  DSLPageHero = function (p) {
+    var top = p;
+    for (var u = 0; p && u < 60; u++, p = p.GetParent()) {
+      top = p;
+      if (p.paneltype === "DOTAHeroPageNewV2") {
+        var hn = p.FindChildTraverse("HeroName");
+        var lab = hn ? hn.FindChildrenWithClassTraverse("TitleExtraLarge")[0] : null;
+        if (lab && lab.text) return lab.text;
+      }
+      if (p.paneltype === "DOTACosmeticPicker") {
+        var title = p.FindChildrenWithClassTraverse("HeroTitle")[0];
+        if (title && title.text) return title.text;
+      }
+    }
+    var sel = top ? top.FindChildTraverse("SelectedHeroName") : null;
+    return sel && sel.text ? sel.text : "";
   };
   // A hero's npc name. In a regular match the game gives no unit names (empty), so the
   // --- Prismatic gems: the item page's «Replace gem» opens every colour ---
@@ -1207,13 +1582,22 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
         row.style.width = "100%";
         row.style.flowChildren = "right";
         row.style.marginTop = "10px";
+        // the prismatic gem as Dota draws it: the setting, and over it its stone (a grey
+        // picture) washed with the colour
         var sw = $.CreatePanel("Panel", row, "DSLGemSwatch");
-        sw.style.width = "40px";
-        sw.style.height = "40px";
+        sw.style.width = "66px";
+        sw.style.height = "44px";
         sw.style.verticalAlign = "center";
         sw.style.marginRight = "14px";
-        sw.style.borderRadius = "50%";
-        sw.style.border = "2px solid #ffffff40";
+        var setting = $.CreatePanel("Image", sw, "");
+        setting.SetImage("file://{images}/econ/sockets/gem_color.png");
+        var stone = $.CreatePanel("Image", sw, "DSLGemStone");
+        stone.SetImage("file://{images}/econ/sockets/gem_color_mask.png");
+        [stone, setting].forEach(function (im) {
+          im.SetScaling("stretch-to-fit-preserve-aspect");
+          im.style.width = "100%";
+          im.style.height = "100%";
+        });
         var info = $.CreatePanel("Panel", row, "");
         info.style.width = "fill-parent-flow(1.0)";
         info.style.flowChildren = "down";
@@ -1248,8 +1632,14 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
       var nameText = pick ? DSLGemName(pick) : (DSLTxt.gemOwn || "-");
       var nl = sec.FindChildTraverse("DSLGemNameText");
       if (nl && nl.text !== nameText) nl.text = nameText;
-      var swatch = sec.FindChildTraverse("DSLGemSwatch");
-      if (swatch) swatch.style.backgroundColor = hex ? "#" + hex : "#00000000";
+      var stone = sec.FindChildTraverse("DSLGemStone");
+      if (stone) {
+        var wash = hex ? "#" + hex : "none";
+        if (stone.GetAttributeString("dsl_wash", "") !== wash) {
+          stone.SetAttributeString("dsl_wash", wash);
+          stone.style.washColor = hex ? "#" + hex : null;
+        }
+      }
     }
   };
   // the item page: our «Replace gem» over Dota's for a prismatic socket (Dota's needs a
@@ -1360,6 +1750,10 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
         // equipped item, is the «SELECTED» one)
         var listHasPreset = false;
         for (var k0 = 0; k0 < infos.length && !listHasPreset; k0++) listHasPreset = DSLInPreset(infos[k0].GetParent());
+        // the preset's item of this slot further down the list (its card not made yet:
+        // the default whip said «SELECTED» and could not be picked with the arcana in the
+        // preset): the slot tiles' table says the preset has one
+        if (!listHasPreset && infos.length && typeof DSLPresetSlotHas === "function") listHasPreset = DSLPresetSlotHas(infos[0].GetParent());
         for (var k = 0; k < infos.length; k++) {
           var box = infos[k];
           var row = box.GetParent();
@@ -1371,22 +1765,35 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
           var statusText = nativeStatus && nativeStatus.FindChild("StatusLabel0") ? nativeStatus.FindChild("StatusLabel0").text : "";
           // an owned item: class Owned; the status text («OWNED») counts only if the card is not «UNAVAILABLE»
           var owned = DSLOwned(box) || (!!statusText && !unavailable);
+          // Dota's own status text on an owned card (before ours)
+          var lab = owned && nativeStatus ? nativeStatus.FindChild("StatusLabel0") : null;
+          if (lab) {
+            var mine = lab.GetAttributeString("dsl_set", "");
+            // (Dota may give the label its token first: «#DOTA_Loadout_Equipped»)
+            var seen = lab.text || "";
+            if (seen.charAt(0) === "#") seen = $.Localize(seen);
+            if (lab.text !== mine && seen !== mine) lab.SetAttributeString("dsl_orig", seen);
+          }
+          var orig = lab ? lab.GetAttributeString("dsl_orig", "") : "";
+          var origSelected = orig === DSLTxt.selected || /EQUIPPED/i.test(orig);
+          // an item of yours while the preset has another one in this list (a slot's
+          // default item among them): ours picks it into the preset, as on a card you do
+          // not own (Dota's own press equips it on the account, or nothing when it is worn
+          // already); a default item takes the preset's item of the slot out
+          var wornHere = owned && listHasPreset && !DSLInPreset(row);
+          var pickable = !owned || wornHere;
           var wrapHave = box.FindChild("DSLPickWrap");
-          if (wrapHave) wrapHave.visible = !owned;
-          if (nativeStatus && nativeStatus.GetAttributeString("dsl_hidden", "") === "1" && owned) {
+          if (wrapHave) wrapHave.visible = pickable;
+          if (nativeStatus && nativeStatus.GetAttributeString("dsl_hidden", "") === "1" && !pickable) {
             nativeStatus.visible = true;
             nativeStatus.SetAttributeString("dsl_hidden", "");
           }
-          if (owned) {
+          if (!pickable) {
             // Dota's status on an owned card («SELECTED» on the account's equipped item):
             // the preset's item is the selected one, the account's other items «OWNED»
-            var lab = nativeStatus ? nativeStatus.FindChild("StatusLabel0") : null;
             if (lab) {
-              var mine = lab.GetAttributeString("dsl_set", "");
-              if (lab.text !== mine) lab.SetAttributeString("dsl_orig", lab.text || "");
-              var orig = lab.GetAttributeString("dsl_orig", "");
-              var origSelected = orig === DSLTxt.selected || /EQUIPPED/i.test(orig);
               var want = DSLInPreset(row) ? DSLTxt.selected : (listHasPreset && origSelected ? DSLTxt.have : orig);
+              if (want && want.charAt(0) === "#") want = $.Localize(want);
               if (want && lab.text !== want) {
                 lab.text = want;
                 lab.SetAttributeString("dsl_set", want);
@@ -1397,7 +1804,7 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
           // hide the buy block with the price; on unavailable cards Dota's own «UNAVAILABLE» and the dimming
           var multi = box.FindChild("AvailableItemPurchaseButton");
           if (multi) multi.visible = false;
-          if (unavailable && nativeStatus) { nativeStatus.visible = false; nativeStatus.SetAttributeString("dsl_hidden", "1"); }
+          if ((unavailable || wornHere) && nativeStatus) { nativeStatus.visible = false; nativeStatus.SetAttributeString("dsl_hidden", "1"); }
           card.style.opacity = "1";
           card.style.brightness = "1";
           var chain = [row.paneltype + "#" + row.id];
@@ -1445,6 +1852,9 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
             b.SetPanelEvent("onactivate", function () {
               if (!row || !row.IsValid()) return;
               var rowLabels = DSLPickLabels(row);
+              // the page's hero: a default item is known by its name and hero only
+              var pageHero = DSLPageHero(row);
+              if (pageHero) rowLabels.push("@hero=" + pageHero);
               var key = DSLKey(row);
               if (DSLIsPicked(row)) return;
               var def = DSLItemDef(row);
@@ -1481,6 +1891,14 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
       var inMenu = false;
       try { inMenu = typeof Game !== "undefined" && Game.GetState() === 0; } catch (e2) {}
       if (inMenu !== lastMenu) { lastMenu = inMenu; $.Msg("DSL_MENU " + (inMenu ? 1 : 0)); }
+      // a match before its game starts (pick, strategy): the strategy screen's persona switch
+      if (!inMenu) {
+        var preGame = true;
+        try { preGame = Game.GameStateIsBefore(DOTA_GameState.DOTA_GAMERULES_STATE_PRE_GAME); } catch (eG) {}
+        if (preGame !== lastPreGame) { lastPreGame = preGame; $.Msg("DSL_PREGAME " + (preGame ? 1 : 0)); }
+      } else {
+        lastPreGame = null;
+      }
       // your hero in a match (for taunts): entity index and unit name
       if (!inMenu) {
         var heroWhy = "";
@@ -1505,35 +1923,38 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
         } catch (e3) { heroWhy += " error " + e3; }
         if (!lastHero && heroWhy !== lastHeroWhy) { lastHeroWhy = heroWhy; $.Msg("DSL_LOG no hero yet (" + loopKind + "): " + heroWhy); }
       }
-      // the persona switch (CLASSIC / persona): for a persona you do not own Dota's button
-      // is disabled: enable it and tell the launcher «toggle the hero's persona»
+      // the persona switch (CLASSIC / persona). A persona you own switches as Dota's own.
+      // One you do not: over its tab lies Dota's invisible button (from 150px on), whose
+      // press puts the persona on, and the classic tab takes it off: the DLL shows it at
+      // once (the game then shows the persona as worn) and the launcher puts it into the
+      // preset (or takes it out)
       if (inMenu) {
         try {
           var hpp = root.FindChildrenWithClassTraverse("DashboardPage");
           for (var pi2 = 0; pi2 < hpp.length; pi2++) {
             var hpg = hpp[pi2];
             if (hpg.paneltype !== "DOTAHeroPageNewV2" || !hpg.visible) continue;
-            var sels = ["PersonaSelector", "PersonaSelector2"];
-            for (var si = 0; si < sels.length; si++) {
-              var sel = hpg.FindChildTraverse(sels[si]);
-              var pb = sel ? sel.FindChildTraverse("PersonaInvisibleButton") : null;
-              if (!pb) continue;
-              if (!pb.enabled) pb.enabled = true;
-              if (pb.GetAttributeString("dsl_persona", "") === "1") continue;
-              pb.SetAttributeString("dsl_persona", "1");
-              (function (page) {
-                pb.SetPanelEvent("onactivate", function () {
-                  var hn = page.FindChildTraverse("HeroName");
-                  var lab = hn ? hn.FindChildrenWithClassTraverse("TitleExtraLarge")[0] : null;
-                  var name = lab ? lab.text : "";
-                  $.Msg("DSL_LOG persona toggle for " + name);
-                  $.Msg("DSL_PICK 0|@persona	" + name);
-                });
-              })(hpg);
-            }
+            (function (page) {
+              var nameOf = function () {
+                var hn = page.FindChildTraverse("HeroName");
+                var lab = hn ? hn.FindChildrenWithClassTraverse("TitleExtraLarge")[0] : null;
+                return lab ? lab.text : "";
+              };
+              DSLPersonaSwitch(page.FindChildTraverse("PersonaSelector"), nameOf);
+              DSLPersonaSwitch(page.FindChildTraverse("PersonaSelector2"), nameOf);
+            })(hpg);
           }
         } catch (e12) { $.Msg("DSL_LOG persona error " + e12); }
         try { DSLGemTick(root); DSLGemStoreTick(root); } catch (e13) { $.Msg("DSL_LOG gem error " + e13); }
+      } else if (loopKind === "hud") {
+        // the strategy screen's switch (the hero you play)
+        try {
+          var strat = root.FindChildTraverse("StrategyScreen");
+          if (strat) DSLPersonaSwitch(strat.FindChildTraverse("PersonaSelector"), function () {
+            var sn = strat.FindChildTraverse("SelectedHeroName");
+            return sn ? sn.text : "";
+          });
+        } catch (e14) { $.Msg("DSL_LOG strategy persona error " + e14); }
       }
       // item glows: on your own hero in a match, on the hero models in the menu
       $.Msg("DSL_GTICK " + loopKind);
@@ -1685,6 +2106,9 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
   // the preset's items by name (from the launcher): their cards are the «SELECTED» ones
   var presetNames = {}, presetStyles = {};
   DSLSetPreset = function (list) {
+    // the preset applied is what is picked now: a press's own mark goes (a default item's
+    // stayed «SELECTED» after the arcana was picked again, and could not be picked)
+    picked = {};
     presetNames = {};
     presetStyles = {};
     (list || []).forEach(function (it) {
@@ -1778,10 +2202,40 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
   // right after we asked the game to redraw the tiles (our model refresh): it does
   // so a frame or two later, so the tiles are watched on every frame for a moment
   DSLSlotRedrawn = function () { slotWatch(800); };
+  // Whether the preset has an item in the slot of a card (its caption among the card's labels,
+  // the hero the page's)
+  DSLPresetSlotHas = function (row) {
+    var map = pendingSlots || slotMap;
+    var hero = map ? map[slotKey(DSLPageHero(row))] : null;
+    if (!hero) return false;
+    var labels = DSLLabels(row);
+    for (var i = 0; i < labels.length; i++) {
+      var k = slotKey(labels[i]);
+      if (k && hero[k] && hero[k][0] > 0) return true;
+    }
+    return false;
+  };
   DSLSetSlots = function (m) {
     pendingSlots = m || {};
     $.Schedule(0, function () { DSLSlotTick(); });
   };
+  // the heroes the DLL shows in their persona ({HERO: 1}): their tiles are the persona's
+  // slots, given as "PERSONA"+caption and #P/#Q positions
+  if (typeof DSLPersonas === "undefined") DSLPersonas = {};
+  DSLSlotForce = function () { slotForceNext = true; slotWatch(1500); };
+  function personaShown(hp, heroName) {
+    if (DSLPersonas[slotKey(heroName)]) return true;
+    // a persona you own and wear (Dota's own switch)
+    var ids = ["PersonaSelector2", "PersonaSelector"];
+    for (var i = 0; i < ids.length; i++) {
+      var sel = hp.FindChildTraverse(ids[i]);
+      if (!sel || !sel.BHasClass("HasMultiplePersonas") || !sel.BHasClass("HasUsablePersonas")) continue;
+      var pc = sel.FindChildTraverse("PersonaCosmeticGroupButton");
+      if (pc && pc.checked) return true;
+    }
+    return false;
+  }
+  var personaLogged = {};
   function slotKey(s) { return ("" + s).toUpperCase().replace(/[^A-Z0-9\u0400-\u04FF]/g, ""); }
   function firstLabel(p) {
     var stack = [p];
@@ -1964,6 +2418,9 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
         }
       }
       var hero = slotMap[slotKey(heroName)];
+      var persona = false;
+      try { persona = personaShown(hp, heroName); } catch (ep) {}
+      var cap = persona ? "PERSONA" : "";
       if (heroName !== slotHero) { slotHero = heroName; force = true; }
       // the panels whose look tells whether the wardrobe is open (watched by slotViewTick)
       if (!picker && slotViewPage !== hp) {
@@ -1985,7 +2442,7 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
         var tile = labels[k].GetParent() ? labels[k].GetParent().GetParent() : null;
         var econ = tile ? tile.FindChildTraverse("SlotEconItem") : null;
         if (!econ) continue;
-        var m = hero ? hero[slotKey(labels[k].text)] : null;
+        var m = hero ? hero[cap + slotKey(labels[k].text)] : null;
         if (!m) {
           if (econ.GetAttributeInt("dsl_def", 0)) slotUndress(econ);
           continue;
@@ -1995,14 +2452,25 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
         catch (e) { if (!slotErr) { slotErr = true; $.Msg("DSL_LOG slot icon error " + e); } }
       }
       // the "equipped" row: DOTAEconItem tiles without captions, in the hero
-      // script's slot order (only when the count matches, e.g. not with a persona)
+      // script's slot order (only when the count matches). A persona's row: its slots
+      // shown in the loadout (#P), else all its item slots (#Q), whichever count matches
       for (var w = 0; w < rows.length; w++) {
         var tiles = [];
         for (var c2 = 0; c2 < rows[w].GetChildCount(); c2++)
           if (rows[w].GetChild(c2).paneltype === "DOTAEconItem") tiles.push(rows[w].GetChild(c2));
-        var fits = !!(hero && hero["#LEN"] && tiles.length === hero["#LEN"][0]);
+        var orders = persona ? ["#P", "#Q"] : ["#"];
+        var order = null;
+        for (var oi = 0; oi < orders.length && !order; oi++) {
+          var len = hero ? hero[orders[oi] + "LEN"] : null;
+          if (len && tiles.length === len[0]) order = orders[oi];
+        }
+        if (persona && !personaLogged[heroName + tiles.length]) {
+          personaLogged[heroName + tiles.length] = true;
+          $.Msg("DSL_LOG persona row of " + heroName + ": " + tiles.length + " tiles, " + (order ? "order " + order : "no order of that length"));
+        }
+        var fits = !!order;
         for (var r = 0; r < tiles.length; r++) {
-          var mr = fits ? hero["#" + r] : null;
+          var mr = fits ? hero[order + r] : null;
           if (!mr) {
             if (tiles[r].GetAttributeInt("dsl_def", 0)) slotUndress(tiles[r]);
             continue;
@@ -2157,7 +2625,11 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
     var alive = {};
     if (glowList.length) {
       var wanted = {};
-      for (var g0 = 0; g0 < glowList.length; g0++) wanted[glowList[g0].npc] = true;
+      for (var g0 = 0; g0 < glowList.length; g0++) {
+        // (in the menu not the heroes the game dresses itself: it makes their effects)
+        if (inMenu && typeof DSLDressed !== "undefined" && DSLDressed[glowList[g0].npc]) continue;
+        wanted[glowList[g0].npc] = true;
+      }
       var targets = [];
       if (inMenu) {
         // hero models on the menu pages: client entities with the hero's name
@@ -2194,6 +2666,9 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
           // outline, needs that skeleton); else on the hero, without such parts (on the
           // hero's skeleton they landed on its body)
           var host = hostOf(gl, ent);
+          // the item's model on the menu's other models but not on this one: it wears
+          // another item there (the wardrobe's preview of another weapon), none of its effects
+          if (!host && inMenu && gl.item && itemHosts[gl.item] && itemHosts[gl.item].length) continue;
           var on = host ? host[0] : ent;
           var fxs = host ? [gl.fx] : (gl.parts || [gl.fx]);
           for (var f = 0; f < fxs.length; f++) {
@@ -2212,7 +2687,10 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
               }
               var kind = ParticleAttachment_t[cp[1]];
               if (kind === undefined) kind = ParticleAttachment_t.PATTACH_ABSORIGIN_FOLLOW;
-              Particles.SetParticleControlEnt(p, cp[0], on, kind, cp[2], [0, 0, 0], true);
+              // "^": on the hero the item's model hangs on (its file's "parent")
+              var att = "" + cp[2], target = on;
+              if (att.charAt(0) === "^") { att = att.substring(1); target = ent; }
+              Particles.SetParticleControlEnt(p, cp[0], target, kind, att, [0, 0, 0], true);
             }
             glowFx[key] = { p: p, ent: on, handle: host ? host[1] : -1 };
             // once per glow and place (the wardrobe's cards re-create their models often)
@@ -2275,11 +2753,22 @@ if (typeof DSLTxt === "undefined") DSLTxt = { select: "SELECT", selected: "SELEC
       var redrawn = function () { if (typeof DSLSlotRedrawn === "function") DSLSlotRedrawn(); };
       // «REVERT» redraws the open slot's tiles too
       if (tryOn) redrawn();
-      $.Schedule(tryOn ? 0.15 : 0, function () { $.DispatchEvent("DOTALoadoutChanged"); redrawn(); });
+      $.Schedule(tryOn ? 0.08 : 0, function () { $.DispatchEvent("DOTALoadoutChanged"); redrawn(); });
       // «REVERT» rebuilds the model asynchronously and may override the first refresh: repeat;
       // after a set try-on Dota brings back the old model from its cache later: once more after 2 s
-      $.Schedule(0.8, function () { $.DispatchEvent("DOTALoadoutChanged"); redrawn(); });
-      if (tryOn) $.Schedule(2.0, function () { $.DispatchEvent("DOTALoadoutChanged"); redrawn(); });
+      $.Schedule(0.18, function () { $.DispatchEvent("DOTALoadoutChanged"); redrawn(); });
+      // (no read after 2 s for a set try-on's model Dota brought back from its cache: the
+      // scene loaded anew below is made from the loadout; a read after it changed the hero
+      // in place again)
+      // then the hero's scene loaded anew: on the loadout's change the page changes its
+      // hero's models in place, and a body changed so draws nothing of the hero but some
+      // pieces (Razor's arcana Tormentor out for another whip: only his armor and bracers;
+      // until then the arcana stayed). Once, after the last loadout read above (twice
+      // flickered)
+      var model = hp.FindChildTraverse("FocusedHeroSetPreview");
+      var scene3d = model ? model.FindChildTraverse("Preview3DItems") : null;
+      if (scene3d && typeof scene3d.ReloadScene === "function")
+        $.Schedule(0.25, function () { if (scene3d.IsValid()) { scene3d.ReloadScene(); redrawn(); } });
       $.Msg("DSL_LOG refresh: loadout changed (revert " + (revert ? (shown ? "shown" : "hidden") : "none") + ", controls " + (controls ? (controls.visible ? "shown" : "hidden") : "none") + ")");
       return;
     }
@@ -2329,6 +2818,10 @@ static void MaybeSendGlows(int kind) {
                          "if (typeof DSLSetGems === 'function') DSLSetGems(" + g_gemColorsJs + "," + g_gemPicksJs + "," + g_gemItemsJs + ");"
                          "if (typeof DSLSetPreset === 'function') DSLSetPreset(" + g_presetJs + ");";
     ReleaseSRWLockShared(&g_glowsLock);
+    // (a new script context of the menu: which heroes show their persona)
+    AcquireSRWLockShared(&g_personaLock);
+    script += "DSLPersonas = " + g_personaKeysJs + ";DSLDressed = " + g_dressedJs + ";";
+    ReleaseSRWLockShared(&g_personaLock);
     Log("[*] Sending item glows to the game UI (%s)", kLoopNames[kind]);
     t_inOurScript = true;
     // a new name every time (and per loop): Panorama keeps a compiled script by its name,
@@ -2338,7 +2831,39 @@ static void MaybeSendGlows(int kind) {
     t_inOurScript = false;
 }
 
+// Debugging: a script put in debug_run.js (the app folder) runs once in the hero page's
+// context when the file changes (its $.Msg("DSL_LOG ...") lines go to the log)
+static void MaybeRunDebugScript() {
+    static FILETIME last{};
+    static ULONGLONG checked = 0;
+    if (GetTickCount64() - checked < 500) return;
+    checked = GetTickCount64();
+    void* panel = g_loopPanels[kDash];
+    if (!g_uiEngine || !panel || !g_OrigRunScript) return;
+    std::string path = g_appDir + "debug_run.js";
+    WIN32_FILE_ATTRIBUTE_DATA data;
+    if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &data)) return;
+    if (CompareFileTime(&data.ftLastWriteTime, &last) == 0) return;
+    bool first = last.dwLowDateTime == 0 && last.dwHighDateTime == 0;
+    last = data.ftLastWriteTime;
+    if (first) return;  // (one left from before: not run at the start)
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return;
+    std::string script;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) script.append(buf, n);
+    fclose(f);
+    static int runs = 0;
+    std::string name = "dota_skins_debug_" + std::to_string(++runs) + ".js";
+    Log("[*] Debug script %d (%zu bytes)", runs, script.size());
+    t_inOurScript = true;
+    g_OrigRunScript(g_uiEngine, panel, script.c_str(), name.c_str(), 0);
+    t_inOurScript = false;
+}
+
 static void MaybeRefreshPreview() {
+    MaybeRunDebugScript();
     static LONG lastSubs = 0;
     static ULONGLONG lastLog = 0;
     LONG subs = g_substituted;
@@ -2369,6 +2894,203 @@ static void MaybeRefreshPreview() {
     g_OrigRunScript(g_uiEngine, panel, "if (typeof DSLRefresh === 'function') DSLRefresh();", name.c_str(), 0);
     t_inOurScript = false;
 }
+
+// --- Personas (see g_personaDefs) ---
+// CDOTAPlayerInventory::GetItemInLoadout(inventory, hero id, slot index, ignore previews):
+// the item a slot of the hero shows (the equipped one, else the slot's default). The
+// inventory manager holds the local player's inventory at +0x120 and the heroes' loadout
+// data: per hero 32 slots of 0x50 bytes from +8, the slot's type first (0x4E: the persona)
+using GetItemInLoadoutFn = void* (*)(void* inventory, int hero, int slot, bool ignorePreview);
+using HeroLoadoutDataFn = uint8_t* (*)(void* manager, int hero);
+// CEconItemView: its constructor, and its Init(definition, quality, level, account,
+// attributes, style), as the game makes the items a hero previews (0xd8 bytes)
+using ItemViewCtorFn = void (*)(void* view);
+using ItemViewInitFn = void (*)(void* view, int def, int quality, int level, uint32_t account, void* attributes, uint8_t style);
+static GetItemInLoadoutFn g_OrigGetItemInLoadout = nullptr;
+static HeroLoadoutDataFn g_HeroLoadoutData = nullptr;
+static ItemViewCtorFn g_ItemViewCtor = nullptr;
+static ItemViewInitFn g_ItemViewInit = nullptr;
+static uint8_t* g_inventoryManager = nullptr;
+static const int kInventoryOffset = 0x120;
+static const int kPersonaSlotType = 0x4E;
+// hero -> its slots' items (slot index, item view, whether it is the persona): made on the
+// main thread, then only read
+struct PersonaSlot { int slot; void* view; bool persona; };
+struct PersonaTable { std::unordered_map<int, std::vector<PersonaSlot>> heroes; };
+static PersonaTable* volatile g_personaTable = nullptr;
+
+static void* HookedGetItemInLoadout(void* inventory, int hero, int slot, bool ignorePreview) {
+    PersonaTable* t = g_personaTable;
+    bool menu = g_inMenu != 0;
+    if (t && inventory == g_inventoryManager + kInventoryOffset && (menu || hero == g_localHeroId)) {
+        auto it = t->heroes.find(hero);
+        if (it != t->heroes.end())
+            for (auto& s : it->second)
+                // in a match the persona only (the strategy screen's switch and preview): the
+                // hero's items there are the files' (a dressed hero's too)
+                if (s.slot == slot && (menu || s.persona)) return s.view;
+    }
+    return g_OrigGetItemInLoadout(inventory, hero, slot, ignorePreview);
+}
+
+// The index of the hero's slot of a loadout type, -1 if it has none
+static int SlotIndexOf(int hero, int type) {
+    uint8_t* data = g_HeroLoadoutData && type >= 0 ? g_HeroLoadoutData(g_inventoryManager, hero) : nullptr;
+    if (!data) return -1;
+    for (int i = 0; i < 32; i++)
+        if (*(const int*)(data + 8 + i * 0x50) == type) return i;
+    return -1;
+}
+
+// A loadout slot's type by its name ("hero_base"): the game's enum names (its table of
+// "DOTA_LOADOUT_TYPE_HERO_BASE" and the like, each with its value 8 bytes on)
+struct Section;
+static uint8_t* FindString(const Section& rdata, const char* s, bool prefix);
+static const Section* g_clientRdata = nullptr;
+static const Section* g_clientData = nullptr;
+static int SlotTypeOfIn(const std::string& name);
+static int SlotTypeOf(const std::string& slot) {
+    static std::map<std::string, int> cache;  // main thread
+    auto c = cache.find(slot);
+    if (c != cache.end()) return c->second;
+    std::string name = "DOTA_LOADOUT_TYPE_";
+    for (char ch : slot) name += (char)toupper((unsigned char)ch);
+    int type = SlotTypeOfIn(name);
+    cache[slot] = type;
+    return type;
+}
+
+// One item view per item and style, kept for good (main thread)
+static void* ItemView(int def, int style = 0) {
+    static std::map<std::pair<int, int>, void*> views;
+    auto it = views.find({def, style});
+    if (it != views.end()) return it->second;
+    void* view = nullptr;
+    if (g_ItemViewCtor && g_ItemViewInit) {
+        view = _aligned_malloc(0x200, 16);
+        if (view) {
+            memset(view, 0, 0x200);
+            g_ItemViewCtor(view);
+            // quality and level "any" (9999), as the game's previews
+            g_ItemViewInit(view, def, 9999, 9999, 0, nullptr, (uint8_t)style);
+        }
+    }
+    views[{def, style}] = view;
+    return view;
+}
+
+// Main thread, the menu loop's tick (in a match the HUD loop's): the table again when the
+// personas changed, and the hero page or the strategy screen (its switch, model and slots)
+// told to read the loadout again
+static void PreloadPersonaModels();
+
+static void PersonaTick(int kind) {
+    static LONG built = 0;
+    LONG v = g_personaVersion;
+    if (!g_OrigGetItemInLoadout || v == built) return;
+    void* panel = g_loopPanels[kind];
+    if (!g_uiEngine || !panel || !g_OrigRunScript) return;
+    built = v;
+    // a match: the persona's models ready before the strategy screen's preview is made again
+    // (it gets them by name then)
+    if (!g_inMenu) PreloadPersonaModels();
+    std::vector<PersonaDef> wanted;
+    std::string keys;  // for the script: {HERO: 1}
+    AcquireSRWLockShared(&g_personaLock);
+    for (auto& d : g_personaDefs) {
+        auto p = g_personaPicked.find(d.second.hero);
+        bool on = p != g_personaPicked.end() ? p->second.on : g_personaOn.count(d.second.hero) > 0;
+        if (!on) continue;
+        wanted.push_back(d.second);
+        keys += (keys.empty() ? "" : ",") + JsString(d.first) + ":1";
+    }
+    ReleaseSRWLockShared(&g_personaLock);
+    std::vector<WearItem> wear;
+    AcquireSRWLockShared(&g_personaLock);
+    wear = g_wearItems;
+    ReleaseSRWLockShared(&g_personaLock);
+    auto* table = new PersonaTable();
+    std::set<int> personaHeroes;
+    for (auto& d : wanted) {
+        int slot = SlotIndexOf(d.hero, kPersonaSlotType);
+        void* view = slot >= 0 ? ItemView(d.def) : nullptr;
+        if (view) table->heroes[d.hero].push_back({slot, view, true});
+        personaHeroes.insert(d.hero);
+        Log("[%c] Persona: hero %d wears persona item %d (slot %d, item %p)", view ? '+' : '-', d.hero, d.def, slot, view);
+    }
+    if (wanted.empty()) Log("[*] Persona: none worn");
+    // the dressed heroes' items (not over a persona shown: those are its classic look's)
+    std::string dressed;
+    std::set<std::string> dressedNpcs, ownGlows;
+    for (auto& w : wear)
+        if (w.ownGlows) ownGlows.insert(w.npc);
+    for (auto& w : wear) {
+        if (personaHeroes.count(w.hero)) continue;
+        int type = SlotTypeOf(w.slot);
+        int slot = SlotIndexOf(w.hero, type);
+        void* view = slot >= 0 ? ItemView(w.def, w.style) : nullptr;
+        if (view) table->heroes[w.hero].push_back({slot, view, false});
+        Log("[%c] Worn: hero %d %s item %d style %d (type %d, slot %d)", view ? '+' : '-', w.hero, w.slot.c_str(), w.def, w.style, type, slot);
+        // (the script's glows stay on a hero whose items' effects are ours)
+        if (view && dressedNpcs.insert(w.npc).second && !ownGlows.count(w.npc))
+            dressed += (dressed.empty() ? "" : ",") + JsString(w.npc) + ":1";
+    }
+    // the old table is left alone: another thread may be reading it (a few bytes per change)
+    InterlockedExchangePointer((void* volatile*)&g_personaTable, table);
+    static int runs = 0;
+    std::string name = "dota_skins_persona_" + std::to_string(++runs) + ".js";
+    AcquireSRWLockExclusive(&g_personaLock);
+    g_personaKeysJs = "{" + keys + "}";
+    g_dressedJs = "{" + dressed + "}";
+    g_dressedNpcs = dressedNpcs;
+    ReleaseSRWLockExclusive(&g_personaLock);
+    std::string script = "DSLPersonas = {" + keys + "};"
+                         "DSLDressed = {" + dressed + "};"
+                         "if (typeof DSLClearGlows === 'function') DSLClearGlows();"
+                         "$.DispatchEvent('DOTALoadoutChanged');"
+                         "if (typeof DSLSlotForce === 'function') DSLSlotForce();";
+    t_inOurScript = true;
+    g_OrigRunScript(g_uiEngine, panel, script.c_str(), name.c_str(), 0);
+    t_inOurScript = false;
+}
+
+// A hero name as the script and the launcher compare it: upper case letters and digits
+static std::string HeroKey(const std::string& name) {
+    std::string out;
+    for (unsigned char c : name) {
+        if (c >= 0x80) out += (char)c;
+        else if (isalnum(c)) out += (char)toupper(c);
+    }
+    return out;
+}
+
+// The page's switch pressed (pick 0|@persona<TAB>hero<TAB>on|off): shown at once, before
+// the launcher puts the persona into the preset (or takes it out)
+static void PersonaPicked(const char* payload) {
+    const char* bar = payload ? strchr(payload, '|') : nullptr;
+    if (!bar || strncmp(bar + 1, "@persona\t", 9) != 0) return;
+    auto f = Split(bar + 10, '\t');
+    if (f.size() < 2) return;
+    // (the message ends with a line break)
+    for (auto& s : f) {
+        while (!s.empty() && (s.back() == ' ' || s.back() == '\n' || s.back() == '\r')) s.pop_back();
+    }
+    bool on = f[1] == "on";
+    bool known = false;
+    AcquireSRWLockExclusive(&g_personaLock);
+    auto d = g_personaDefs.find(HeroKey(f[0]));
+    if (d != g_personaDefs.end()) {
+        g_personaPicked[d->second.hero] = {on, GetTickCount64()};
+        known = true;
+    }
+    ReleaseSRWLockExclusive(&g_personaLock);
+    Log("[*] Persona %s for %s%s", on ? "on" : "off", f[0].c_str(), known ? "" : " (no persona known for it)");
+    if (known) {
+        UpdatePersonaShown();
+        InterlockedIncrement(&g_personaVersion);
+    }
+}
+
 
 static void HookedRunScript(void* engine, void* panel, const char* script, const char* path, uint64_t lineCol) {
     if (script && strstr(script, "/*DSL_LOG*/")) {
@@ -2743,6 +3465,229 @@ static void ResolveGems(const Section& text, const Section& rdata, const Section
 using SkeletonSetModelFn = void (*)(void* skeleton, void* binding);
 static SkeletonSetModelFn g_SkeletonSetModel = nullptr;
 
+static uint8_t* FindMasked(const Section& text, const char* sig) {
+    std::vector<int> bytes;
+    for (const char* c = sig; *c;) {
+        if (*c == ' ') { c++; continue; }
+        if (c[0] == '?') { bytes.push_back(-1); c += c[1] == '?' ? 2 : 1; continue; }
+        bytes.push_back((int)strtoul(std::string(c, 2).c_str(), nullptr, 16));
+        c += 2;
+    }
+    uint8_t* found = nullptr;
+    for (size_t i = 0; i + bytes.size() <= text.size; i++) {
+        size_t k = 0;
+        while (k < bytes.size() && (bytes[k] < 0 || text.start[i + k] == bytes[k])) k++;
+        if (k < bytes.size()) continue;
+        if (found) return nullptr;  // not unique: do not risk it
+        found = text.start + i;
+    }
+    return found;
+}
+
+// (see SlotTypeOf)
+static int SlotTypeOfIn(const std::string& name) {
+    const uint8_t* s = g_clientRdata ? FindString(*g_clientRdata, name.c_str(), false) : nullptr;
+    if (!s) return -1;
+    for (const Section* sec : {g_clientRdata, g_clientData}) {
+        for (size_t i = 0; sec && i + 16 <= sec->size; i += 8)
+            if (*(const uint8_t* const*)(sec->start + i) == s) return *(const int*)(sec->start + i + 8);
+    }
+    return -1;
+}
+
+// --- The stance of the preset's items (see ActMod) ---
+// A hero (C_DOTA_BaseNPC) gathers its activity modifiers again and again: its items', its
+// buffs'; a hero on a menu page or the strategy screen (C_PortraitWorldUnit) adds "loadout"
+// and its own after them. Hooked: the preset's join them, so the game chooses the sequences
+// they give: in the menu for every hero, in a match for the hero you play (its strategy
+// screen preview, the hero itself, its illusions).
+using NpcModsFn = void* (*)(void* npc, intptr_t activity, intptr_t b, intptr_t c);
+using AddActModFn = uint16_t* (*)(void* npc, uint16_t* out, const char* name);
+static NpcModsFn g_OrigNpcMods = nullptr;
+static AddActModFn g_AddActMod = nullptr;
+static int g_unitNameOffset = -1;  // C_DOTA_BaseNPC::m_iszUnitName (a string)
+// C_DOTA_BaseNPC::m_nIsOriginalModel: 0 work it out (the model it was made with: its pieces
+// shown), 1 yes, 2 no (pieces hidden, as for a transformation): a persona's body put on live
+// is said to be one, or the game hid its pieces
+static int g_isOriginalOffset = -1;
+// C_DOTAWearableItem::m_bHiddenByCombiner and its setter: a piece merged into its hero's
+// combined model is hidden; on a body put on live its pieces are shown again
+static int g_hiddenByCombinerOffset = -1;
+using SetHiddenByCombinerFn = void (*)(void* wearable, bool hidden);
+static SetHiddenByCombinerFn g_SetHiddenByCombiner = nullptr;
+static int EntityIndexOf(const uint8_t* ent);
+
+// A unit name's pointer as an NPC holds it: nullptr unless it can be a string's (a
+// client-side NPC of the interface leaves it empty)
+static const char* UnitNameOf(const void* npc) {
+    const char* unit = *(const char* const*)((const uint8_t*)npc + g_unitNameOffset);
+    uintptr_t v = (uintptr_t)unit;
+    return v > 0x10000 && v < 0x7FFFFFFFFFFFull ? unit : nullptr;
+}
+
+// The hero (npc name) whose preset modifiers an NPC takes: in the menu any hero, in a match
+// the hero you play (a regular match gives its units no names: your hero by its entity
+// then); empty for none
+static std::string StanceHeroOf(void* npc) {
+    if (!g_actModsCount || g_unitNameOffset <= 0) return std::string();
+    const char* unit = UnitNameOf(npc);
+    if (g_inMenu) return unit && strncmp(unit, "npc_dota_hero_", 14) == 0 ? std::string(unit) : std::string();
+    std::string who;
+    AcquireSRWLockShared(&g_rulesLock);
+    if (!g_localNpc.empty()) {
+        if (unit && g_localNpc == unit) who = g_localNpc;
+        else if ((!unit || !*unit) && g_heroIndex > 0 && g_itemHostsReady && EntityIndexOf((const uint8_t*)npc) == g_heroIndex)
+            who = g_localNpc;
+    }
+    ReleaseSRWLockShared(&g_rulesLock);
+    return who;
+}
+
+// The preset's modifiers of a hero (its persona's while that is shown, else its classic
+// look's), up to `max`
+static int StanceMods(const std::string& who, std::string* out, int max) {
+    int n = 0;
+    AcquireSRWLockShared(&g_personaLock);
+    for (auto& m : g_actMods)
+        if (n < max && m.npc == who && m.persona == PersonaShownLocked(m.hero)) out[n++] = m.mod;
+    ReleaseSRWLockShared(&g_personaLock);
+    return n;
+}
+
+static void* HookedNpcMods(void* npc, intptr_t activity, intptr_t b, intptr_t c) {
+    void* r = g_OrigNpcMods(npc, activity, b, c);
+    if (!g_actModsCount || !g_AddActMod) return r;
+    std::string who = StanceHeroOf(npc);
+    if (who.empty()) return r;
+    std::string mods[16];
+    int n = StanceMods(who, mods, 16);
+    for (int i = 0; i < n; i++) {
+        uint16_t sym = 0xFFFF;
+        g_AddActMod(npc, &sym, mods[i].c_str());  // (one it has already is not added twice)
+    }
+    return r;
+}
+
+// --- The stance of the preset's items on the match's hero ---
+// The server chooses a networked NPC's sequences (your hero's without the preset's items)
+// and sends the activity and the sequence's place among that activity's sequences; on the
+// change the client plays the one at that place in its model (OnDataChanged). For the hero
+// you play the client chooses again, with the preset's modifiers joined to its own, and
+// plays that one (Legion Commander's arcana: both swords in hand).
+using NetSeqFn = void* (*)(void* npc, intptr_t a, intptr_t b, intptr_t c);
+using SetSeqFn = void* (*)(void* npc, intptr_t seq, intptr_t a, intptr_t b);
+static NetSeqFn g_OrigNetSeq = nullptr;
+static SetSeqFn g_SetSequence = nullptr;
+static uint32_t g_netActivityOffset = 0;  // C_DOTA_BaseNPC::m_NetworkActivity
+
+static void* HookedNetSeq(void* npc, intptr_t a, intptr_t b, intptr_t c) {
+    void* r = g_OrigNetSeq(npc, a, b, c);
+    if (g_inMenu || !g_actModsCount || !g_SetSequence || !g_netActivityOffset || !g_selectSlot || !g_AddSymbol ||
+        !g_modSymbols || !g_modsCount || !g_modsData)
+        return r;
+    std::string who = StanceHeroOf(npc);
+    if (who.empty()) return r;
+    std::string names[16];
+    int n = StanceMods(who, names, 16);
+    if (!n) return r;
+    int activity = *(const int*)((const uint8_t*)npc + g_netActivityOffset);
+    if (activity < 0) return r;
+    std::vector<uint16_t> mods;
+    int cnt = *(const int*)((const uint8_t*)npc + g_modsCount);
+    const uint16_t* data = *(uint16_t* const*)((const uint8_t*)npc + g_modsData);
+    for (int k = 0; data && k < cnt && k < 32; k++) mods.push_back(data[k]);
+    for (int i = 0; i < n; i++) {
+        uint16_t sym = 0xFFFF;
+        g_AddSymbol(g_modSymbols, &sym, names[i].c_str(), nullptr);
+        if (sym != 0xFFFF && std::find(mods.begin(), mods.end(), sym) == mods.end()) mods.push_back(sym);
+    }
+    auto select = (SelectSeqFn)(*(void***)npc)[g_selectSlot / 8];
+    int seq = -1;
+    select(npc, &seq, activity, mods.data(), (int)mods.size());
+    if (seq < 0) return r;
+    g_SetSequence(npc, seq, 2, 1);
+    static std::set<std::pair<int, int>> logged;
+    if (logged.size() < 64 && logged.insert({activity, seq}).second)
+        Log("[*] Stance: %s activity %d plays sequence %d (with the preset's modifiers)", who.c_str(), activity, seq);
+    return r;
+}
+
+static void ResolveStances(const Section& text, const Section& rdata, const Section& data) {
+    SchemaField want[] = {{"C_DOTA_BaseNPC", "m_iszUnitName", &g_unitNameOffset},
+                          {"C_DOTA_BaseNPC", "m_nIsOriginalModel", &g_isOriginalOffset},
+                          {"C_DOTAWearableItem", "m_bHiddenByCombiner", &g_hiddenByCombinerOffset}};
+    ReadSchemaOffsets(rdata, data, want, 3);
+    // push rbx; sub rsp,20h; mov rbx,rcx; cmp [rcx+X],dl; je; mov [rcx+X],dl; xor edx,edx; call
+    g_SetHiddenByCombiner = (SetHiddenByCombinerFn)FindMasked(text,
+        "40 53 48 83 EC 20 48 8B D9 38 91 ?? ?? 00 00 74 ?? 88 91 ?? ?? 00 00 33 D2 E8");
+    // mov [rsp+20h],rsi; push rbp; push rdi; push r15; mov rbp,rsp; sub rsp,60h;
+    // mov [rsp+90h],r14; mov rdi,rcx; call <the NPC's>; cmp byte [rdi+X],0; jne;
+    // lea r8,"loadout"; mov rcx,rdi; lea rdx,[rbp+20h]; call <add activity modifier>
+    uint8_t* fn = FindMasked(text,
+        "48 89 74 24 20 55 57 41 57 48 8B EC 48 83 EC 60 4C 89 B4 24 90 00 00 00 48 8B F9 E8 ?? ?? ?? ?? "
+        "80 BF ?? ?? 00 00 00 75 ?? 4C 8D 05 ?? ?? ?? ?? 48 8B CF 48 8D 55 20 E8");
+    if (fn) g_AddActMod = (AddActModFn)(fn + 60 + *(int32_t*)(fn + 56));
+    // the NPC's own, which it calls first: mov rax,rsp; push rbp/rbx/rsi/rdi; lea rbp,[rax-X];
+    // sub rsp,X (the first 14 bytes, to the lea, have no RIP-relative instructions)
+    uint8_t* npcMods = fn ? fn + 32 + *(int32_t*)(fn + 28) : nullptr;
+    static const uint8_t kNpcProlog[] = {0x48, 0x8B, 0xC4, 0x55, 0x53, 0x56, 0x57, 0x48, 0x8D, 0xA8};
+    if (npcMods && (memcmp(npcMods, kNpcProlog, sizeof(kNpcProlog)) != 0 || npcMods[14] != 0x48 ||
+                    npcMods[15] != 0x81 || npcMods[16] != 0xEC))
+        npcMods = nullptr;
+    bool ok = npcMods && g_AddActMod && g_unitNameOffset > 0 &&
+              InstallHook(npcMods, 14, (void*)&HookedNpcMods, (void**)&g_OrigNpcMods);
+    Log("[%c] Stances: NPC modifiers %p (portrait's %p), add modifier %p, unit name +0x%X, original model +0x%X, "
+        "hidden by combiner +0x%X (%p)", ok ? '+' : '-', (void*)npcMods, (void*)fn, (void*)g_AddActMod, g_unitNameOffset,
+        g_isOriginalOffset, g_hiddenByCombinerOffset, (void*)g_SetHiddenByCombiner);
+    // the match's hero: its sequence choice (the taunts' finds: modifiers, symbols, choice)
+    if (!g_tauntResolved) ResolveTaunts();
+    // mov rax,rsp; push r15; sub rsp,90h; movaps [rax-48h],xmm7; mov r15,rcx; mov [rax+18h],rbx;
+    // mov ebx,[rcx+<m_NetworkActivity>]; ... (the first 16 bytes, to the movaps, have no
+    // RIP-relative instructions); in it: mov r9d,1; mov r8d,2; mov rcx,r15; call <SetSequence>
+    uint8_t* net = FindMasked(text,
+        "48 8B C4 41 57 48 81 EC 90 00 00 00 0F 29 78 B8 4C 8B F9 48 89 58 18 8B 99 ?? ?? 00 00 48 89 78 E8 "
+        "4C 89 60 E0 44 0F B6 E2 E8");
+    static const uint8_t kSetSeq[] = {0x41, 0xB9, 0x01, 0x00, 0x00, 0x00, 0x41, 0xB8, 0x02, 0x00, 0x00, 0x00, 0x49, 0x8B, 0xCF, 0xE8};
+    g_SetSequence = (SetSeqFn)CallAfter(net, 0x200, kSetSeq, sizeof(kSetSeq));
+    if (net) g_netActivityOffset = *(uint32_t*)(net + 25);
+    bool netOk = net && g_SetSequence && g_netActivityOffset && g_selectSlot && g_modsCount && g_modsData &&
+                 g_AddSymbol && g_modSymbols && InstallHook(net, 16, (void*)&HookedNetSeq, (void**)&g_OrigNetSeq);
+    Log("[%c] Stances in a match: network sequence %p, SetSequence %p, activity +0x%X, choice +0x%X", netOk ? '+' : '-',
+        (void*)net, (void*)g_SetSequence, g_netActivityOffset, g_selectSlot);
+}
+
+static void ResolvePersonas(const Section& text, const Section& rdata, const Section& data) {
+    static Section keptRdata, keptData;
+    keptRdata = rdata;
+    keptData = data;
+    g_clientRdata = &keptRdata;
+    g_clientData = &keptData;
+    // mov [rsp+18h],rbp; mov [rsp+10h],edx; push rsi; push rdi; push r14; sub rsp,20h;
+    // movsxd rsi,r8d; movzx ebp,r9b; mov rdi,rcx; cmp esi,1Fh; ja; lea r14,[manager];
+    // mov rcx,r14; call <hero loadout data>; ...
+    uint8_t* get = FindMasked(text,
+        "48 89 6C 24 18 89 54 24 10 56 57 41 56 48 83 EC 20 49 63 F0 41 0F B6 E9 48 8B F9 83 FE 1F "
+        "0F 87 ?? ?? ?? ?? 4C 8D 35 ?? ?? ?? ?? 49 8B CE E8 ?? ?? ?? ?? 48 85 C0 0F 84 ?? ?? ?? ?? "
+        "48 89 5C 24 40 8B 5C 24 48 40 84 ED");
+    g_ItemViewCtor = (ItemViewCtorFn)FindMasked(text,
+        "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 33 F6 48 8D 05 ?? ?? ?? ?? 48 89 71 08 48 8B F9 "
+        "89 71 10 48 89 01 48 89 71 18 48 89 71 20 66 89 71 30 48 89 71 48 48 89 71 50 48 83 C1 58 E8");
+    g_ItemViewInit = (ItemViewInitFn)FindMasked(text,
+        "40 53 48 83 EC 40 0F B6 84 24 80 00 00 00 48 8B D9 88 44 24 30 48 8B 44 24 78 48 89 44 24 28 "
+        "8B 44 24 70 89 44 24 20 E8 ?? ?? ?? ?? 48 8B 8B D0 00 00 00");
+    if (get) {
+        g_inventoryManager = get + 0x2B + *(int32_t*)(get + 0x27);
+        g_HeroLoadoutData = (HeroLoadoutDataFn)(get + 0x33 + *(int32_t*)(get + 0x2F));
+    }
+    // the first 17 bytes (to sub rsp) have no RIP-relative instructions
+    bool ok = get && g_ItemViewCtor && g_ItemViewInit &&
+              InstallHook(get, 17, (void*)&HookedGetItemInLoadout, (void**)&g_OrigGetItemInLoadout);
+    if (!ok) g_OrigGetItemInLoadout = nullptr;
+    Log("[%c] Personas: GetItemInLoadout %p, inventory manager %p, hero loadout data %p, item view %p / %p",
+        ok ? '+' : '-', (void*)get, (void*)g_inventoryManager, (void*)g_HeroLoadoutData, (void*)g_ItemViewCtor,
+        (void*)g_ItemViewInit);
+}
+
 static DWORD WINAPI ResolveItemHosts(LPVOID) {
     HMODULE cl = nullptr;
     for (int i = 0; i < 6000 && !(cl = GetModuleHandleA("client.dll")); i++) Sleep(100);
@@ -2785,6 +3730,8 @@ static DWORD WINAPI ResolveItemHosts(LPVOID) {
     ResolveShaders(text);
     ResolveMatGroups(text, rdata);
     ResolveGems(text, rdata, data);
+    ResolvePersonas(text, rdata, data);
+    ResolveStances(text, rdata, data);
     // the function asserting "CSkeletonInstance::SetModel"
     g_SkeletonSetModel = (SkeletonSetModelFn)FunctionStart(FindRipRef(text, FindString(rdata, "CSkeletonInstance::SetModel")));
     Log("[%c] Live models: CSkeletonInstance::SetModel %p", g_SkeletonSetModel ? '+' : '-', (void*)g_SkeletonSetModel);
@@ -3415,6 +4362,25 @@ static void ResolveMatGroups(const Section& text, const Section& rdata) {
 }
 
 // Main thread, every glow tick (a few times a second at most)
+// Whether a model (a hero's or one of its pieces) is of a hero the game dresses itself in
+// the menu (its arcana's skin, level and effects are the game's then)
+static bool DressedEntity(const uint8_t* ent, const uint8_t* node) {
+    static std::unordered_map<const void*, bool> npcs;  // (the interface thread's only)
+    if (g_unitNameOffset <= 0 || !ent || !node) return false;
+    const uint8_t* hero = ent;
+    if (!IsA(ent, ".?AVC_DOTA_BaseNPC@@", npcs)) {
+        const uint8_t* parentNode = *(const uint8_t* const*)(node + g_ih.parent);
+        hero = parentNode ? *(const uint8_t* const*)(parentNode + g_ih.owner) : nullptr;
+        if (!hero || !IsA(hero, ".?AVC_DOTA_BaseNPC@@", npcs)) return false;
+    }
+    const char* unit = UnitNameOf(hero);
+    if (!unit || !*unit) return false;
+    AcquireSRWLockShared(&g_personaLock);
+    bool dressed = g_dressedNpcs.count(unit) > 0;
+    ReleaseSRWLockShared(&g_personaLock);
+    return dressed;
+}
+
 static void MatGroupTick() {
     if ((!g_GroupChanged && !g_MaskChanged) || !g_itemHostsReady || !g_entityList) return;
     static ULONGLONG last = 0;
@@ -3433,6 +4399,11 @@ static void MatGroupTick() {
     static std::set<std::string> logged;
     if (groups.empty() && applied.empty() && masks.empty() && appliedMasks.empty()) return;
     static std::unordered_map<std::string, uint32_t> tokens;
+    // the entities given a material group: entity handle -> the model it was given for. One
+    // that wears another model since keeps it otherwise: the hero page keeps its hero when an
+    // item changes, and Razor's body made his own again with the arcana's group was not drawn
+    static std::unordered_map<uint32_t, std::string> grouped;
+    std::set<uint32_t> seen;
     uint8_t** chunks = (uint8_t**)*g_entityList;
     for (int c = 0; chunks && c < 64; c++) {
         uint8_t* chunk = chunks[c];
@@ -3445,18 +4416,32 @@ static void MatGroupTick() {
             const uint8_t* node = nullptr;
             std::string model = ModelOf(ent, &node);
             if (model.empty() || !node) continue;
+            uint32_t handle = *(const uint32_t*)(e + 0x10);
+            seen.insert(handle);
             // the model the file holds: the swap table's replacement of it
             std::string key = model;
             AcquireSRWLockShared(&g_rulesLock);
-            auto rule = g_rules->replacements.find(model);
-            if (rule != g_rules->replacements.end() && RuleActive(*g_rules, model)) key = rule->second;
+            if (const std::string* to = RuleFor(*g_rules, model)) key = *to;
             ReleaseSRWLockShared(&g_rulesLock);
             auto g = groups.find(key);
+            auto gr = grouped.find(handle);
+            if (gr != grouped.end() && gr->second != key) {
+                if (g == groups.end() && g_GroupChanged) {
+                    uint32_t cur = *(const uint32_t*)(node + g_groupOffset), zero = 0;
+                    if (cur != 0) {
+                        g_GroupChanged((void*)node, nullptr, &zero);
+                        Log("[*] Style: entity %d now %s (was %s): group %08x -> its own", index, key.c_str(), gr->second.c_str(), cur);
+                    }
+                }
+                grouped.erase(gr);
+            }
             auto mk = masks.find(key);
             auto am = appliedMasks.find(key);
             bool matWork = g != groups.end() || applied.count(key);
             bool maskWork = mk != masks.end() || am != appliedMasks.end();
             if (!matWork && !maskWork) continue;
+            // a hero the game dresses itself in the menu: its skins and arcana level are the game's
+            if (g_inMenu && DressedEntity(ent, node)) continue;
             if (!g_inMenu && index < 0x4000) {
                 // a match: your hero and what it wears
                 const uint8_t* parentNode = *(const uint8_t* const*)(node + g_ih.parent);
@@ -3503,10 +4488,12 @@ static void MatGroupTick() {
                     Log("[*] Style: %s group %08x -> %08x (%s), now %08x", key.c_str(), cur, want,
                         g != groups.end() ? g->second.c_str() : "own", after);
             }
+            if (want) grouped[handle] = key;
             if (want && applied.insert(key).second)
                 Log("[*] Style: %s gets material group %s", key.c_str(), g->second.c_str());
         }
     }
+    for (auto it = grouped.begin(); it != grouped.end();) it = seen.count(it->first) ? std::next(it) : grouped.erase(it);
 }
 
 // --- Prismatic gems ---
@@ -3533,8 +4520,7 @@ static bool GemFor(const uint8_t* ent, uint32_t& color, std::string* keyOut = nu
     if (model.empty()) return false;
     std::string swapped;
     AcquireSRWLockShared(&g_rulesLock);
-    auto rule = g_rules->replacements.find(model);
-    if (rule != g_rules->replacements.end() && RuleActive(*g_rules, model)) swapped = rule->second;
+    if (const std::string* to = RuleFor(*g_rules, model)) swapped = *to;
     ReleaseSRWLockShared(&g_rulesLock);
     bool found = false;
     std::string key;
@@ -3811,7 +4797,7 @@ static void AttackFxTick() {
     g_attackBinding = binding;
 }
 
-static int32_t CreateGlow(void* mgr, const std::string& fx, void* ent, const std::vector<GlowCp>& cps) {
+static int32_t CreateGlow(void* mgr, const std::string& fx, void* ent, const std::vector<GlowCp>& cps, void* parent = nullptr) {
     ParticleDesc d{};
     d.name = fx.c_str();
     d.attach = 2;  // PATTACH_CUSTOMORIGIN: its control points place it
@@ -3825,7 +4811,7 @@ static int32_t CreateGlow(void* mgr, const std::string& fx, void* ent, const std
     static const float zero[3] = {0, 0, 0};
     for (auto& c : cps) {
         if (c.world) g_SetControl(mgr, out, c.cp, c.vec, 0.0f);
-        else g_SetControlEnt(mgr, out, c.cp, ent, c.attach, c.att.c_str(), zero, true, nullptr);
+        else g_SetControlEnt(mgr, out, c.cp, c.parent && parent ? parent : ent, c.attach, c.att.c_str(), zero, true, nullptr);
     }
     return out;
 }
@@ -3870,6 +4856,7 @@ static void MatchGlowTick() {
         for (auto& d : defs) {
             // "*": an effect for whichever hero you play (the emblem)
             if (d.npc != g_heroUnit && d.npc != "*") continue;
+            if (d.place == 1) continue;  // the item spawns it in the menu's preview only
             const ItemHost* host = nullptr;
             for (auto& h : g_hosts)
                 if (h.key == d.item && (h.parent == g_heroIndex || h.owner == g_heroIndex)) { host = &h; break; }
@@ -3882,7 +4869,7 @@ static void MatchGlowTick() {
                 std::string key = prefix + "|" + fx;
                 alive.insert(key);
                 if (g_matchFx.count(key)) continue;
-                int32_t idx = CreateGlow(mgr, fx, on, d.cps);
+                int32_t idx = CreateGlow(mgr, fx, on, d.cps, hero);
                 g_matchFx[key] = idx;
                 Log("[*] Match glow %s on %s: effect %d", fx.c_str(), host ? "the item model" : "the hero", idx);
             }
@@ -3897,6 +4884,7 @@ static void MatchGlowTick() {
             if (holder < 0x4000) continue;
             for (auto& d : defs) {
                 if (d.item.empty() || d.item != h.key) continue;
+                if (d.place == 2) continue;  // the item spawns it in the game only
                 // an ally's model on the pick screen wears its own items
                 std::string local;
                 AcquireSRWLockShared(&g_rulesLock);
@@ -3906,7 +4894,7 @@ static void MatchGlowTick() {
                 std::string key = "h" + std::to_string(h.handle) + "|" + d.fx;
                 alive.insert(key);
                 if (g_matchFx.count(key)) continue;
-                int32_t idx = CreateGlow(mgr, d.fx, h.ent, d.cps);
+                int32_t idx = CreateGlow(mgr, d.fx, h.ent, d.cps, EntityByIndex(holder));
                 g_matchFx[key] = idx;
                 Log("[*] Match glow %s on the preview's item model (entity %d): effect %d", d.fx.c_str(), h.index, idx);
             }
@@ -3928,8 +4916,15 @@ static void MatchGlowTick() {
 // loaded by its own name into the engine's just-in-time manifest (what the engine does for
 // an asset that was not precached) and set on the wearable's skeleton, as the game sets
 // the model of an item it equips. Only the strategy screen's model (a client-side entity,
-// index from 16384) and your own hero's wearables.
+// index from 16384) and your own hero's wearables (your illusions' too).
+// A persona's models go on this way too (its swaps are never read into the files: the
+// strategy screen's switch may take it off again), its body as well: the strategy screen's
+// preview, and the hero you play made with its own model; the entities made once the game has
+// started get them by name instead (see HookedFindOrRegister).
 static std::map<std::string, void*> g_liveBindings;  // item model -> its binding (loaded once)
+// the models loaded so in this match (any thread asks, see PersonaModelFor)
+static std::set<std::string> g_liveResident;
+static SRWLOCK g_liveResidentLock = SRWLOCK_INIT;
 
 static void* LiveBinding(const std::string& model) {
     auto it = g_liveBindings.find(model);
@@ -3942,20 +4937,134 @@ static void* LiveBinding(const std::string& model) {
     Log("[%c] Live model: %s loaded %s", resident ? '+' : '-', model.c_str(), resident ? "" : "(not resident)");
     if (!resident) binding = nullptr;
     g_liveBindings[model] = binding;
+    if (resident) {
+        AcquireSRWLockExclusive(&g_liveResidentLock);
+        g_liveResident.insert(model);
+        ReleaseSRWLockExclusive(&g_liveResidentLock);
+    }
     return binding;
 }
 
-struct LiveSwap { const uint8_t* node; int index; std::string model, desired; bool wearable; };
+static bool IsLiveResident(const std::string& model) {
+    AcquireSRWLockShared(&g_liveResidentLock);
+    bool r = g_liveResident.count(model) != 0;
+    ReleaseSRWLockShared(&g_liveResidentLock);
+    return r;
+}
+
+// (see HookedFindOrRegister) The persona's model for one of the hero you play, when its
+// persona is shown and both are loaded. Any thread.
+static bool PersonaModelFor(const char* name, std::string& out) {
+    if (!name) return false;
+    size_t len = strlen(name);
+    bool compiled = len > 7 && _stricmp(name + len - 7, ".vmdl_c") == 0;
+    if (!compiled && (len < 6 || _stricmp(name + len - 5, ".vmdl") != 0)) return false;
+    std::string base = Normalize(name);
+    if (compiled) base.resize(base.size() - 2);
+    std::string to;
+    AcquireSRWLockShared(&g_rulesLock);
+    const std::string* r = RuleFor(*g_rules, base);
+    if (r && IsPersonaRule(*g_rules, base, r) && r->size() > 5 && r->compare(r->size() - 5, 5, ".vmdl") == 0) to = *r;
+    ReleaseSRWLockShared(&g_rulesLock);
+    if (to.empty() || !IsLiveResident(to) || !IsLiveResident(base)) return false;
+    out = compiled ? to + "_c" : to;
+    return true;
+}
+
+// Main thread, in a match: the models of the persona shown of the hero you play, and the
+// ones they stand for, loaded into the engine's just-in-time manifest: then handed out by
+// name (the original too, when the switch takes the persona off again)
+static void PreloadPersonaModels() {
+    if (g_inMenu || !g_SetResourceName || !g_BlockingLoad || !g_ResourceSystem) return;
+    std::vector<std::pair<std::string, std::string>> pairs;
+    AcquireSRWLockShared(&g_rulesLock);
+    for (auto& r : g_rules->matchReplacements) {
+        const std::string& dst = r.first;
+        if (dst.size() < 6 || dst.compare(dst.size() - 5, 5, ".vmdl") != 0) continue;
+        const std::string* to = RuleFor(*g_rules, dst);
+        if (to && IsPersonaRule(*g_rules, dst, to) && to->size() > 5 && to->compare(to->size() - 5, 5, ".vmdl") == 0)
+            pairs.push_back({dst, *to});
+    }
+    ReleaseSRWLockShared(&g_rulesLock);
+    for (auto& pr : pairs) {
+        LiveBinding(pr.first);
+        LiveBinding(pr.second);
+    }
+    static size_t logged = (size_t)-1;
+    if (pairs.size() != logged) {
+        logged = pairs.size();
+        Log("[*] Persona models for the match: %zu loaded with their originals", pairs.size());
+    }
+}
+
+struct LiveSwap {
+    const uint8_t* node;
+    const uint8_t* ent;
+    int index;
+    uint32_t handle;
+    std::string model, base, desired;
+    bool wearable;
+    int kind;  // 0 a model, 1 a body: a persona's put on live (or its own again)
+};
+// Bodies changed live (a persona's body on a hero made with its own, or its own again)
+static std::set<uint32_t> g_bodyLive;
+// The entities wearing a model put on live: entity handle -> {the model the game gave it (its
+// swap is looked up by that one: the model put on may take its name's place), the one put on}
+static std::unordered_map<uint32_t, std::pair<std::string, std::string>> g_liveOrig;
+
+// Whether an entity is the hero you play or one of its illusions: an NPC of its unit name (a
+// regular match gives its units no names: your hero's entity, and the NPCs it owns, then).
+// Under g_rulesLock.
+static bool IsLocalHeroNpc(const uint8_t* ent, int index) {
+    static std::unordered_map<const void*, bool> npcs;  // (the interface thread's only)
+    if (!ent) return false;
+    if (g_heroIndex > 0 && index == g_heroIndex) return true;
+    if (g_localNpc.empty() || !IsA(ent, ".?AVC_DOTA_BaseNPC@@", npcs)) return false;
+    if (g_unitNameOffset > 0) {
+        const char* unit = UnitNameOf(ent);
+        if (unit && *unit) return g_localNpc == unit;
+    }
+    int owner = (int)(*(const uint32_t*)(ent + g_ih.ownerEntity) & 0x7fff);
+    return g_heroIndex > 0 && owner == g_heroIndex;
+}
+
+// The model a hero's merged one is made of: "x_c_1.vmdl" -> "x.vmdl" (others as they are)
+static std::string UncombinedName(const std::string& m) {
+    if (m.size() < 10 || m.compare(m.size() - 5, 5, ".vmdl") != 0) return m;
+    size_t dot = m.size() - 5, i = dot;
+    while (i > 0 && isdigit((unsigned char)m[i - 1])) i--;
+    if (i == dot || i < 3 || m.compare(i - 3, 3, "_c_") != 0) return m;
+    return m.substr(0, i - 3) + ".vmdl";
+}
 
 static void LiveModelTick() {
     if (g_inMenu) {
         g_liveBindings.clear();  // the match's just-in-time manifest goes with it
+        g_liveOrig.clear();
+        g_bodyLive.clear();
+        AcquireSRWLockExclusive(&g_liveResidentLock);
+        g_liveResident.clear();
+        ReleaseSRWLockExclusive(&g_liveResidentLock);
         return;
     }
     if (!g_itemHostsReady || !g_entityList || !g_SkeletonSetModel || !g_BlockingLoad || !g_SetResourceName || !g_ResourceSystem) return;
     std::vector<LiveSwap> todo;
+    std::set<uint32_t> seen;
+    std::vector<const uint8_t*> originals;  // bodies made with a persona's model: shown with their pieces
+    std::vector<uint8_t*> unhide;           // pieces merged into a body put on live since
+    static std::unordered_map<const void*, bool> npcs;  // (this thread's only)
     uint8_t** chunks = (uint8_t**)*g_entityList;
+    std::set<std::string> noMerge;
+    AcquireSRWLockShared(&g_personaLock);
+    noMerge = g_noMerge;
+    ReleaseSRWLockShared(&g_personaLock);
     AcquireSRWLockShared(&g_rulesLock);
+    // the persona bodies handed out by name (the active persona swaps' models)
+    std::set<std::string> personaModels;
+    for (auto& r : g_rules->matchReplacements) {
+        const std::string* to = RuleFor(*g_rules, r.first);
+        if (to && IsPersonaRule(*g_rules, r.first, to)) personaModels.insert(*to);
+    }
     for (int c = 0; chunks && c < 64; c++) {
         uint8_t* chunk = chunks[c];
         if (!chunk) continue;
@@ -3968,27 +5077,106 @@ static void LiveModelTick() {
             const uint8_t* node = nullptr;
             std::string model = ModelOf(ent, &node);
             if (model.empty()) continue;
-            auto rule = g_rules->replacements.find(model);
-            if (rule == g_rules->replacements.end() || !RuleActive(*g_rules, model)) continue;
-            const std::string& desired = rule->second;
-            if (desired.size() < 5 || desired.compare(desired.size() - 5, 5, ".vmdl") != 0) continue;
+            seen.insert(handle);
+            // the model its swap is looked up by: the one the game gave it
+            std::string base = model;
+            auto o = g_liveOrig.find(handle);
+            if (o != g_liveOrig.end()) {
+                if (model == o->second.first || model == o->second.second) base = o->second.first;
+                else g_liveOrig.erase(o);  // the game gave it another model since
+            }
+            bool npc = IsA(ent, ".?AVC_DOTA_BaseNPC@@", npcs);
+            // a hero in a match wears its body merged with its pieces (legion_commander_c_1):
+            // its swap is the body's
+            const std::string lookup = npc ? UncombinedName(base) : base;
+            const std::string* to = RuleFor(*g_rules, lookup);
+            bool persona = to && IsPersonaRule(*g_rules, lookup, to);
+            // wearing a model of ours and no swap now (an item taken out, a persona switched
+            // off): the game's again
+            bool restore = !to && g_liveOrig.count(handle);
             const uint8_t* parentNode = *(const uint8_t* const*)(node + g_ih.parent);
+            if (parentNode && !npc && g_hiddenByCombinerOffset > 0 && g_SetHiddenByCombiner &&
+                *(const uint8_t*)(ent + g_hiddenByCombinerOffset)) {
+                const uint8_t* holderEnt = *(const uint8_t* const*)(parentNode + g_ih.owner);
+                const uint8_t* id = holderEnt ? *(const uint8_t* const*)(holderEnt + g_ih.entity) : nullptr;
+                if (id && g_bodyLive.count(*(const uint32_t*)(id + 0x10))) unhide.push_back((uint8_t*)ent);
+                // a piece of your hero not merged into its model (see g_noMerge)
+                else if ((noMerge.count(model) || (to && noMerge.count(*to))) && IsLocalHeroNpc(holderEnt, EntityIndexOf(holderEnt)))
+                    unhide.push_back((uint8_t*)ent);
+            }
+            if (g_heroIndex > 0 && index == g_heroIndex) {
+                // what your hero has, when it changes (a persona's body put on or not)
+                static std::string lastNote;
+                std::string note = model + "|" + (to ? *to : std::string("-")) + (persona ? "|p" : "") +
+                                   (parentNode ? "|parented" : "");
+                if (note != lastNote) {
+                    lastNote = note;
+                    Log("[*] Your hero's model: %s (swap %s%s%s)", model.c_str(), to ? to->c_str() : "none",
+                        persona ? ", the persona's" : "", parentNode ? ", parented" : "");
+                }
+            }
+            // A hero's body (the strategy screen's preview, yours, your illusions'): a persona's
+            // body put on live, and its own again when the persona goes off
+            if (npc && (persona || (restore && g_bodyLive.count(handle)))) {
+                if (index < 0x4000 && !IsLocalHeroNpc(ent, index)) continue;
+                const std::string want = persona ? *to : base;
+                if (want.size() < 6 || want.compare(want.size() - 5, 5, ".vmdl") != 0) continue;
+                todo.push_back({node, ent, index, handle, model, base, want, false, 1});
+                continue;
+            }
+            // one made with a persona's body (handed out by name in the game): said to be its
+            // own model, or the game hides its pieces
+            if (npc && personaModels.count(model) && (index >= 0x4000 || IsLocalHeroNpc(ent, index))) {
+                originals.push_back(ent);
+                continue;
+            }
+            if (!to && !restore) continue;
+            const std::string desired = to ? *to : base;
+            if (desired.size() < 5 || desired.compare(desired.size() - 5, 5, ".vmdl") != 0) continue;
             if (parentNode) {
-                // a wearable: on a hero's bones (its scene node's parent), the strategy screen's or yours
-                int holder = EntityIndexOf(*(const uint8_t* const*)(parentNode + g_ih.owner));
-                if (holder < 0x4000 && !(g_heroIndex > 0 && holder == g_heroIndex)) continue;
+                // a wearable: on a hero's bones (its scene node's parent): the strategy
+                // screen's, yours or your illusions'
+                const uint8_t* holderEnt = *(const uint8_t* const*)(parentNode + g_ih.owner);
+                int holder = EntityIndexOf(holderEnt);
+                if (holder < 0x4000 && !IsLocalHeroNpc(holderEnt, holder)) continue;
             } else {
                 // a unit of its own (lane creeps, towers, couriers, wards): a general swap only.
                 // Its model may be loaded from a match before the preset changed: the new one
                 // goes on the units then, with no restart
-                auto heroes = g_rules->heroes.find(model);
+                auto heroes = g_rules->heroes.find(base);
                 if (heroes != g_rules->heroes.end() && !heroes->second.empty()) continue;
             }
-            todo.push_back({node, index, model, desired, parentNode != nullptr});
+            todo.push_back({node, ent, index, handle, model, base, desired, parentNode != nullptr, 0});
         }
     }
     ReleaseSRWLockShared(&g_rulesLock);
+    for (auto it = g_liveOrig.begin(); it != g_liveOrig.end();) it = seen.count(it->first) ? std::next(it) : g_liveOrig.erase(it);
+    for (auto it = g_bodyLive.begin(); it != g_bodyLive.end();) it = seen.count(*it) ? std::next(it) : g_bodyLive.erase(it);
+    for (auto* w : unhide) g_SetHiddenByCombiner(w, false);
+    if (g_isOriginalOffset > 0)
+        for (auto* ent : originals)
+            if (*(const uint8_t*)(ent + g_isOriginalOffset) != 1) *(uint8_t*)(ent + g_isOriginalOffset) = 1;
     for (auto& s : todo) {
+        if (s.kind == 1) {
+            // a body: the persona's (said to be its own model: the game shows its pieces on
+            // it), or its own again (worked out by the game again)
+            void* binding = LiveBinding(s.desired);
+            if (!binding) continue;
+            bool on = s.desired != s.base;
+            if (on) g_liveOrig[s.handle] = {s.base, s.desired};
+            else g_liveOrig.erase(s.handle);
+            if (g_isOriginalOffset > 0) {
+                uint8_t want = on ? 1 : 0;
+                if (*(const uint8_t*)(s.ent + g_isOriginalOffset) != want) *(uint8_t*)(s.ent + g_isOriginalOffset) = want;
+            }
+            void* current = g_ih.modelHandle >= 0 ? *(void* const*)(s.node + g_ih.modelState + g_ih.modelHandle) : nullptr;
+            if (current == binding) continue;
+            g_SkeletonSetModel((void*)s.node, binding);
+            if (on) g_bodyLive.insert(s.handle);
+            else g_bodyLive.erase(s.handle);
+            Log("[*] Live body: entity %d %s -> %s", s.index, s.model.c_str(), s.desired.c_str());
+            continue;
+        }
         std::string held = s.model;
         AcquireSRWLockShared(&g_loadedAsLock);
         auto f = g_loadedAs.find(s.model);
@@ -4002,6 +5190,9 @@ static void LiveModelTick() {
         if (g_ih.modelHandle < 0 && held == s.desired) continue;
         void* binding = LiveBinding(s.desired);
         if (!binding) continue;
+        // remembered while it wears a model of ours
+        if (s.desired != s.base) g_liveOrig[s.handle] = {s.base, s.desired};
+        else g_liveOrig.erase(s.handle);
         void* current = g_ih.modelHandle >= 0 ? *(void* const*)(s.node + g_ih.modelState + g_ih.modelHandle) : nullptr;
         if (current == binding) continue;
         g_SkeletonSetModel((void*)s.node, binding);
@@ -4024,7 +5215,12 @@ static void SetLocalNpc(const char* v) {
     bool changed = npc != g_localNpc;
     g_localNpc = npc;
     ReleaseSRWLockExclusive(&g_rulesLock);
-    if (changed) Log("[*] You play %s: its items' swaps apply to it only", npc.c_str());
+    if (changed) {
+        Log("[*] You play %s: its items' swaps apply to it only", npc.c_str());
+        // its persona (the strategy screen's switch and preview): the loadout read again
+        UpdatePersonaShown();
+        InterlockedIncrement(&g_personaVersion);
+    }
 }
 
 // "index|unit name" from the interface script
@@ -4292,10 +5488,13 @@ static bool CheckDslMessage(const char* msg) {
         ShaderTick();
         if (g_inMenu) {
             RunPreloads();
+            if (kind == kDash) PersonaTick(kDash);
             if (kind == kDash) MaybeRefreshPreview();
             MaybeSendGlows(kind);
         } else {
             MaybeTaunt();
+            // the strategy screen's persona switch
+            if (kind == kHud) PersonaTick(kHud);
         }
     }
     else if (strncmp(p, "DSL_HERO ", 9) == 0) {
@@ -4303,6 +5502,11 @@ static bool CheckDslMessage(const char* msg) {
         if (!g_heroUnit.empty()) SetLocalNpc(g_heroUnit.c_str());
     }
     else if (strncmp(p, "DSL_PICKED ", 11) == 0) SetLocalNpc(p + 11);
+    else if (strncmp(p, "DSL_PREGAME", 11) == 0) {
+        LONG v = p[12] == '1';
+        if (InterlockedExchange(&g_preGame, v) != v)
+            Log("[*] %s", v ? "Before the game: a persona goes on the preview live" : "The game: a persona's models handed out by name");
+    }
     else if (strncmp(p, "DSL_GTICK", 9) == 0) {
         MaybeSendGlows(kind);
         MaybeSendItemHosts(kind);
@@ -4321,7 +5525,10 @@ static bool CheckDslMessage(const char* msg) {
             g_itemHostsSent[kind] = "{}";
         }
     }
-    else if (strncmp(p, "DSL_PICK", 8) == 0) RecordPick(p[8] == ' ' ? p + 9 : nullptr);
+    else if (strncmp(p, "DSL_PICK", 8) == 0) {
+        PersonaPicked(p[8] == ' ' ? p + 9 : nullptr);
+        RecordPick(p[8] == ' ' ? p + 9 : nullptr);
+    }
     else if (strncmp(p, "DSL_MENU", 8) == 0) {
         LONG v = p[9] == '1';
         if (InterlockedExchange(&g_inMenu, v) != v) {
@@ -4330,6 +5537,8 @@ static bool CheckDslMessage(const char* msg) {
             AcquireSRWLockExclusive(&g_rulesLock);
             g_localNpc.clear();
             ReleaseSRWLockExclusive(&g_rulesLock);
+            InterlockedExchange(&g_localHeroId, 0);
+            InterlockedExchange(&g_preGame, 1);
             // the emblem's attack effect: its binding taken again in the match
             g_attackBinding = nullptr;
             g_attackBound.clear();

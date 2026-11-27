@@ -67,23 +67,63 @@ fn modelless_reason(slot: &str) -> String {
     }
 }
 
+/// The model a hidden piece becomes (the game's own invisible box).
+const HIDDEN_MODEL: &str = "models/development/invisiblebox.vmdl";
+
 /// A persona in the preset (Anti-Mage's Wei): the body becomes the persona's
-/// (its `entity_model`, visuals.rs), and the classic default pieces would stay
-/// on it. Each classic default file gets the persona's piece instead: the
-/// preset's item for the `<slot>_persona_1` slot, or the persona's default.
-/// These come first, so classic items of the preset (which do not fit the
-/// persona body) do not take those files.
-fn persona_defaults(skins: &[&Skin], catalog: &Catalog) -> Vec<Req> {
+/// (its `entity_model`, visuals.rs), and the classic pieces would stay on it. Each
+/// classic default piece becomes one of the persona's: the persona's slot of the
+/// same name (the preset's item for `<slot>_persona_1`, or the persona's default);
+/// the persona's pieces left over (slots no classic one has, Legion Commander's
+/// automaton's "misc") go on the classic pieces left over, and the classic pieces
+/// still left are hidden. An own item the account wears in a classic slot is loaded
+/// in place of its default: it becomes the same. These come first, so classic items
+/// do not take those files. (They are for a match: in the menu the game shows the
+/// persona as worn and changer.dll leaves them out.)
+fn persona_defaults(skins: &[&Skin], catalog: &Catalog, owned: &HashSet<u32>) -> Vec<Req> {
     let mut out = Vec::new();
     for persona in skins.iter().filter(|s| s.slot == "persona_selector") {
         for hero in persona.hero_names() {
             let Some(hm) = catalog.hero_models.get(hero) else { continue };
-            for (slot, persona_default) in &hm.defaults {
-                let Some(classic) = slot.strip_suffix("_persona_1") else { continue };
-                let Some(dst) = hm.defaults.get(classic) else { continue };
-                let picked = skins.iter().find(|s| &s.slot == slot && s.fits_hero(hero)).and_then(|s| s.model.as_deref());
-                let src = picked.unwrap_or(persona_default);
-                out.push(Req { id: persona.name.clone(), src: compiled_path(src), dst: compiled_path(dst) });
+            let piece = |slot: &str, default: &str| -> String {
+                skins
+                    .iter()
+                    .find(|s| s.slot == slot && s.fits_hero(hero))
+                    .and_then(|s| s.model.clone())
+                    .unwrap_or_else(|| default.to_string())
+            };
+            let mut classic: Vec<(&String, &String)> =
+                hm.defaults.iter().filter(|(slot, _)| !catalog::is_persona_slot(slot)).collect();
+            let mut pieces: Vec<(&String, String)> = Vec::new();
+            let mut leftover: Vec<String> = Vec::new();
+            for (slot, default) in hm.defaults.iter().filter(|(slot, _)| slot.ends_with("_persona_1")) {
+                let src = piece(slot, default);
+                let base = slot.strip_suffix("_persona_1").unwrap_or(slot);
+                match classic.iter().position(|(c, _)| c.as_str() == base) {
+                    Some(i) => pieces.push((classic.remove(i).0, src)),
+                    None => leftover.push(src),
+                }
+            }
+            for (slot, _) in classic {
+                let src = if leftover.is_empty() { HIDDEN_MODEL.to_string() } else { leftover.remove(0) };
+                pieces.push((slot, src));
+            }
+            for (slot, src) in pieces {
+                let src = compiled_path(&src);
+                let mut dsts: Vec<String> = hm.defaults.get(slot).map(|d| compiled_path(d)).into_iter().collect();
+                // the own items worn in that slot instead of its default
+                dsts.extend(
+                    catalog
+                        .skins
+                        .iter()
+                        .filter(|o| &o.slot == slot && o.fits_hero(hero) && o.index.is_some_and(|i| owned.contains(&i)))
+                        .filter_map(|o| o.model.as_deref().map(str::trim).filter(|m| !m.is_empty()).map(compiled_path)),
+                );
+                for dst in dsts {
+                    if dst != src {
+                        out.push(Req { id: persona.name.clone(), src: src.clone(), dst });
+                    }
+                }
             }
         }
     }
@@ -105,7 +145,7 @@ pub fn plan(
     targets: &std::collections::BTreeMap<String, String>,
     owned: &HashSet<u32>,
 ) -> (Vec<Req>, Vec<crate::schema::Pick>, Vec<Skip>) {
-    let mut reqs = persona_defaults(skins, catalog);
+    let mut reqs = persona_defaults(skins, catalog, owned);
     let mut picks = Vec::new();
     let mut unsupported = Vec::new();
     for s in skins {

@@ -57,6 +57,9 @@ pub struct Modifier {
     pub style: Option<u32>,
     /// An `arcana_level` modifier's level (`"level"`).
     pub level: Option<u32>,
+    /// A particle's `"spawn_in_loadout_only"`: 1 the menu's (loadout) models only, 2 the
+    /// game only (Razor's arcana: its `_game` effects next to the loadout ones).
+    pub loadout: Option<u32>,
 }
 
 /// Items of the preset that belong to no hero (map items, emblem excluded):
@@ -363,7 +366,17 @@ impl<'a> Table<'a> {
                 }
             }
         }
-        scalar(&top, b"skin")?.trim().parse().ok()
+        if let Some(skin) = scalar(&top, b"skin").and_then(|v| v.trim().parse().ok()) {
+            return Some(skin);
+        }
+        // a model_skin modifier for every style (Legion Commander's Blades of Voth Domosh:
+        // the body's group "1")
+        children(text, (v_open, v_close)).into_iter().find_map(|(_, o, c)| {
+            let body = &text[o..=c];
+            (scalar(body, b"type").as_deref() == Some("model_skin") && scalar(body, b"style").is_none())
+                .then(|| scalar(body, b"skin").and_then(|v| v.trim().parse().ok()))
+                .flatten()
+        })
     }
 
     /// Every `asset_modifier` in the item's `visuals`; `None` if the item is not in the table.
@@ -498,6 +511,7 @@ impl<'a> Table<'a> {
                         modifier: scalar(body, b"modifier"),
                         style: scalar(body, b"style").and_then(|v| v.trim().parse().ok()),
                         level: scalar(body, b"level").and_then(|v| v.trim().parse().ok()),
+                        loadout: scalar(body, b"spawn_in_loadout_only").and_then(|v| v.trim().parse().ok()),
                     }
                 })
                 .collect()
@@ -735,6 +749,9 @@ pub struct Glow {
     /// `model_player`: in the game the glow hangs on that model.
     pub item: String,
     pub model: Option<String>,
+    /// Where the item spawns it (`Modifier::loadout`): 0 everywhere, 1 the menu's models
+    /// (and the strategy screen's) only, 2 the game only.
+    pub place: u32,
 }
 
 /// `hero_overrides`, plus the item glows left without a place. `owned`: the items
@@ -804,11 +821,18 @@ pub fn hero_overrides_and_glows(
         for particle in own.iter().skip(placed) {
             for hero in &h.heroes {
                 if let Some(npc) = npcs.get(&crate::schema::norm(hero)) {
+                    let place = mods
+                        .iter()
+                        .find(|m| m.kind == "particle_create" && m.modifier.as_deref() == Some(*particle))
+                        .and_then(|m| m.loadout)
+                        .filter(|p| *p == 1 || *p == 2)
+                        .unwrap_or(0);
                     glows.push(Glow {
                         npc: npc.clone(),
                         particle: particle.to_string(),
                         item: h.item.name.clone(),
                         model: h.model.clone(),
+                        place,
                     });
                 }
             }

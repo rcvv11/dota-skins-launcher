@@ -264,6 +264,40 @@ pub(crate) fn find_default_item(text: &[u8], npc: &str, slot: &str) -> Option<(u
     None
 }
 
+/// The hero (npc name) and slot of a default item (`"prefab" "default_item"`) by its
+/// definition index, None for any other item: a press on a slot's default item in Dota's
+/// wardrobe takes the preset's item of that slot out.
+pub fn default_item_slot(text: &[u8], def: u32) -> Option<(String, String)> {
+    let items_open = items_section(text)?;
+    let items_close = block_end(text, items_open)?;
+    let key = format!("\"{def}\"");
+    let mut from = items_open;
+    while let Some(at) = find_from(text, key.as_bytes(), from) {
+        if at >= items_close {
+            break;
+        }
+        from = at + key.len();
+        // an item's own key: alone on its line at the section's depth, its block after it
+        let line_start = text[..at].iter().rposition(|&c| c == b'\n').map_or(0, |p| p + 1);
+        if &text[line_start..at] != b"\t\t" {
+            continue;
+        }
+        let rest = &text[from..];
+        let Some(skip) = rest.iter().position(|c| !c.is_ascii_whitespace()) else { break };
+        if rest[skip] != b'{' {
+            continue;
+        }
+        let open = from + skip;
+        let close = block_end(text, open)?;
+        let block = &text[open..=close];
+        if !has_scalar(block, b"prefab", b"default_item") {
+            return None;
+        }
+        return Some((hero_of(block)?, slot_of(block).unwrap_or_else(|| "weapon".into())));
+    }
+    None
+}
+
 /// The `{` that opens the table's `"items"` section.
 pub(crate) fn items_section(text: &[u8]) -> Option<usize> {
     let at = find_from(text, b"\"items\"", 0)?;
@@ -536,6 +570,16 @@ mod tests {
             model: model.into(),
             name: "Oathbound Defiant Pauldrons".into(),
         }
+    }
+
+    #[test]
+    fn default_items_give_their_hero_and_slot() {
+        let t = SAMPLE.as_bytes();
+        assert_eq!(default_item_slot(t, 572), Some(("npc_dota_hero_antimage".into(), "head".into())));
+        assert_eq!(default_item_slot(t, 563), Some(("npc_dota_hero_antimage".into(), "shoulder".into())));
+        // an item to buy is not one, nor an index nowhere in the table
+        assert_eq!(default_item_slot(t, 9725), None);
+        assert_eq!(default_item_slot(t, 1), None);
     }
 
     #[test]

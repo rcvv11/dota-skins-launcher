@@ -33,6 +33,33 @@ pub fn is_persona_slot(slot: &str) -> bool {
     slot.ends_with("_persona_1") || slot == "persona_selector"
 }
 
+/// The preset's items as its heroes look: a hero whose persona the preset has wears the
+/// persona's items, not its classic ones (those would show on the persona in a match,
+/// their effects on it in the menu too).
+pub fn worn<'a>(chosen: Vec<&'a Skin>) -> Vec<&'a Skin> {
+    let personas: std::collections::HashSet<&str> = chosen
+        .iter()
+        .filter(|s| s.slot == "persona_selector")
+        .flat_map(|s| s.hero_names())
+        .collect();
+    if personas.is_empty() {
+        return chosen;
+    }
+    chosen
+        .into_iter()
+        .filter(|s| s.is_general() || is_persona_slot(&s.slot) || !s.hero_names().iter().any(|h| personas.contains(h)))
+        .collect()
+}
+
+/// The names of the preset's items `worn` left out (a hero's classic items while the
+/// preset has its persona): their swaps are kept for the menu's classic look only.
+pub fn menu_only(all: &[&Skin], worn: &[&Skin]) -> std::collections::HashSet<String> {
+    all.iter()
+        .filter(|s| !worn.iter().any(|w| w.id == s.id))
+        .map(|s| s.name.clone())
+        .collect()
+}
+
 /// Player emblems: drawn as particles on the selection ring, not worn as a model.
 pub fn is_emblem(slot: &str) -> bool {
     slot == "emblem"

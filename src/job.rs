@@ -41,6 +41,9 @@ pub struct Plan {
     pub owned: std::collections::HashSet<u32>,
     /// The prismatic gems picked per item (gems.rs): the item and the colour's name.
     pub gems: Vec<(crate::visuals::HeroItem, String)>,
+    /// Items whose swaps are the menu's only (a hero's classic items while the preset has
+    /// its persona: Dota's switch shows the classic look at once, a match the persona).
+    pub menu_only: std::collections::HashSet<String>,
 }
 
 pub fn spawn(plan: Plan, ctx: egui::Context) -> Receiver<Msg> {
@@ -194,7 +197,12 @@ fn run(plan: &Plan, step: &dyn Fn(&str)) -> Result<String, String> {
                     let d = drivers.get(&g.particle).cloned().unwrap_or_default();
                     let list = parts.get(&(model.clone(), g.particle.clone())).cloned().unwrap_or_else(|| vec![g.particle.clone()]);
                     let item = item_model(&reqs, g);
-                    glow_lines.push(crate::glow::config_line(&g.npc, &g.particle, &d, item.as_deref(), &list));
+                    let mut line = crate::glow::config_line(&g.npc, &g.particle, &d, item.as_deref(), &list);
+                    // where the item spawns it: the menu's models only (1) or the game only (2)
+                    if g.place != 0 {
+                        line.push_str(&format!("|{}", g.place));
+                    }
+                    glow_lines.push(line);
                 }
             }
             // Taunts: their animation, played by changer.dll on your own hero (client-side).
@@ -210,13 +218,38 @@ fn run(plan: &Plan, step: &dyn Fn(&str)) -> Result<String, String> {
             // The picked items' icons in Dota's slot tiles.
             if plan.memory_swap {
                 glow_lines.extend(crate::slot_icons::config_lines(data, &plan.hero_items));
+                // the heroes' personas, and the preset's shown as worn on the hero page
+                let catalog = crate::catalog::Catalog::load(&crate::config::assets_dir()).unwrap_or_default();
+                glow_lines.extend(crate::slot_icons::persona_lines(data, &catalog, &plan.hero_items));
+                // a hero with an arcana on its body: dressed by the game itself in the menu
+                glow_lines.extend(crate::slot_icons::wear_lines(data, &plan.hero_items));
+                // the stance the preset's items give (an arcana's both swords in hand)
+                glow_lines.extend(crate::slot_icons::actmod_lines(data, &plan.hero_items));
+                // the items not merged into the hero's model (see changer.dll's g_noMerge)
+                glow_lines.extend(
+                    plan.hero_items
+                        .iter()
+                        .filter(|h| data.index.skips_model_combine(&h.item))
+                        .filter_map(|h| h.model.as_deref())
+                        .map(|m| format!("nomerge|{}", m.trim_end_matches("_c").to_ascii_lowercase())),
+                );
                 // the preset's items by name, with their style: their wardrobe cards say
                 // «SELECTED» (not the account's own item's) and show that style
                 let items = plan.hero_items.iter().map(|h| &h.item).chain(plan.general.iter());
                 glow_lines.extend(items.map(|i| format!("picked|{}|{}", i.name.replace('|', " "), i.style)));
             }
             // Colourings that are another material group of the model.
-            let wanted = crate::skins::wanted(&index, &plan.hero_items);
+            let mut wanted = crate::skins::wanted(&index, &plan.hero_items);
+            // a body item without a model of its own picks its hero's body's group (Legion
+            // Commander's Blades of Voth Domosh: the body's group "1")
+            for h in plan.hero_items.iter().filter(|h| h.slot == "hero_base" && h.model.is_none()) {
+                let Some(skin) = index.visual_skin(&h.item).filter(|&s| s > 0) else { continue };
+                for hero in &h.heroes {
+                    if let Some(model) = npcs.get(&crate::schema::norm(hero)).and_then(|n| units.get(n)) {
+                        wanted.push((h, model.clone(), skin as usize));
+                    }
+                }
+            }
             if let (false, Some(cli)) = (wanted.is_empty(), &plan.vrf_cli) {
                 step(crate::tr!("Подбираю раскраску предметов…", "Matching item colourings…"));
                 let models: Vec<String> = wanted.iter().map(|(_, m, _)| m.clone()).collect();
@@ -335,6 +368,18 @@ fn run(plan: &Plan, step: &dyn Fn(&str)) -> Result<String, String> {
             crate::picks::trace(&format!("  effect swap left out (never ends by itself): {} -> {}", r.dst, r.src));
         }
     }
+    // A hero item's swap of an effect every hero's shop items share (The Barren Vector's Orb of
+    // Venom, Razor's arcana Eul's Scepter and Phase Boots): the game gives the item's owner
+    // alone that look, a swap of the file every hero (an enemy Clinkz's Orb of Venom hits got
+    // Sand King's debuff, missing from a regular match's manifest: red crosses)
+    let hero_items: std::collections::HashSet<&str> = plan.hero_items.iter().map(|h| h.item.name.as_str()).collect();
+    reqs.retain(|r| {
+        let shared = hero_items.contains(r.id.as_str()) && shared_item_effect(&r.dst);
+        if shared {
+            crate::picks::trace(&format!("  effect swap left out (a shop item's, every hero's): {} -> {}", r.dst, r.src));
+        }
+        !shared
+    });
     // An item that got any file (an arcana with no model of its own, but a
     // body swap and effects) is applied.
     skipped.retain(|s| !reqs.iter().any(|r| r.id == s.name));
@@ -415,6 +460,15 @@ fn item_model(reqs: &[crate::extract::Req], glow: &crate::visuals::Glow) -> Opti
     first.map(str::to_string).or(own).map(|m| m.trim_end_matches("_c").to_string())
 }
 
+/// Whether an effect is one of the shop items' (`particles/items_fx/`, `items2_fx/`, ...): every
+/// hero's, not the hero's own.
+fn shared_item_effect(path: &str) -> bool {
+    let p = path.trim_start_matches('/').to_ascii_lowercase();
+    p.strip_prefix("particles/items")
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(n, _)| n.trim_end_matches("_fx").chars().all(|c| c.is_ascii_digit()) && n.ends_with("_fx"))
+}
+
 /// What the mounted item table changes, from the whole catalog (not the
 /// preset, so it stays the same and Dota needs no restart for a pick): every
 /// hero's wearable slots that items exist for (the empty ones get a stand-in),
@@ -437,6 +491,23 @@ fn schema_layout(
         if data.index.skips_model_combine(&crate::visuals::ItemRef::of(s)) {
             for npc in npcs {
                 no_merge.push((npc, s.slot.clone()));
+            }
+        }
+    }
+    // A hero with a persona: none of its pieces merged. In a match Dota merges a hero and its
+    // wearables into one model (legion_commander_c_1), and changer.dll could put the persona's
+    // body on no such model (the persona's pieces lay on the classic body, its weapon at its
+    // feet); the persona item says "skip_model_combine" itself, but the server never sees it.
+    for s in catalog.skins.iter().filter(|s| s.slot == "persona_selector") {
+        for hero in s.hero_names() {
+            let Some(npc) = data.npcs.get(&crate::schema::norm(hero)) else { continue };
+            let lower = npc.to_ascii_lowercase();
+            let mut hero_slots: Vec<String> = slots.iter().filter(|(n, _)| *n == lower).map(|(_, slot)| slot.clone()).collect();
+            if let Some(hm) = catalog.hero_models.get(hero) {
+                hero_slots.extend(hm.defaults.keys().map(|k| k.to_ascii_lowercase()));
+            }
+            for slot in hero_slots {
+                no_merge.push((npc.clone(), slot));
             }
         }
     }
@@ -465,7 +536,10 @@ fn run_in_memory(
     // gives it when Dota starts
     let mut lines = glows.to_vec();
     lines.push(format!("weather|{}", weather.unwrap_or(0)));
-    let rules = crate::inject::write_config(reqs, &lines, hero_of)?;
+    // a persona's swaps are for a match: in the menu the game shows it as worn
+    let personas: std::collections::HashSet<String> =
+        plan.hero_items.iter().filter(|h| h.slot == "persona_selector").map(|h| h.item.name.clone()).collect();
+    let rules = crate::inject::write_config(reqs, &lines, hero_of, &personas, &plan.menu_only)?;
     crate::picks::trace("  swap table written");
     if !plan.install.files.is_empty() {
         skipped.push(crate::extract::Skip::new(crate::tr!("Свои файлы", "Own files"), crate::tr!("в режиме «в памяти» не применяются", "do not apply in memory mode")));
@@ -523,6 +597,14 @@ fn skipped_note(skipped: &[crate::extract::Skip]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shop_item_effects_are_every_heros() {
+        assert!(super::shared_item_effect("particles/items2_fx/orb_of_venom.vpcf_c"));
+        assert!(super::shared_item_effect("particles/items_fx/cyclone.vpcf_c"));
+        assert!(!super::shared_item_effect("particles/units/heroes/hero_sandking/sandking_caustic_finale_debuff.vpcf_c"));
+        assert!(!super::shared_item_effect("particles/econ/items/razor/razor_arcana/razor_arcana_cyclone_v2.vpcf_c"));
+    }
+
     use super::*;
     use crate::extract::Skip;
 
@@ -545,6 +627,7 @@ mod tests {
             particle: "particles/a.vpcf".into(),
             item: "Twilight Schism".into(),
             model: model.map(str::to_string),
+            place: 0,
         };
         let reqs = vec![
             req("Twilight Schism", "particles/a.vpcf_c", "particles/b.vpcf_c"),

@@ -106,7 +106,69 @@ impl LauncherApp {
         tiles.extend(heroes.into_iter().map(|(h, (p, n))| (h, p, n)));
         tiles.retain(|(h, _, _)| query.is_empty() || hero_title(h).to_lowercase().contains(&query));
 
+        // type-to-find: letters typed while no text field has the keyboard light up
+        // the heroes whose names fit and dim the rest; Backspace takes a letter back,
+        // Esc clears, Enter opens the first one. The letters fade after a moment.
+        const TYPED_FOR: Duration = Duration::from_millis(3000);
+        if !self.hero_typed.is_empty() && self.hero_typed_at.elapsed() > TYPED_FOR {
+            self.hero_typed.clear();
+        }
+        let mut typed_changed = false;
+        let mut open_typed = false;
+        if ctx.memory(|m| m.focused().is_none()) {
+            let events = ctx.input(|i| i.events.clone());
+            for e in events {
+                match e {
+                    egui::Event::Text(t) => {
+                        let t: String = t.chars().filter(|c| !c.is_control()).collect();
+                        if !t.is_empty() && !(self.hero_typed.is_empty() && t.trim().is_empty()) {
+                            self.hero_typed.push_str(&t);
+                            typed_changed = true;
+                        }
+                    }
+                    egui::Event::Key { key: egui::Key::Backspace, pressed: true, .. } if !self.hero_typed.is_empty() => {
+                        self.hero_typed.pop();
+                        typed_changed = true;
+                    }
+                    egui::Event::Key { key: egui::Key::Escape, pressed: true, .. } if !self.hero_typed.is_empty() => {
+                        self.hero_typed.clear();
+                        typed_changed = true;
+                    }
+                    egui::Event::Key { key: egui::Key::Enter, pressed: true, .. } => open_typed = true,
+                    _ => {}
+                }
+            }
+        }
+        if typed_changed {
+            self.hero_typed_at = Instant::now();
+        }
+        let typed = self.hero_typed.to_lowercase();
+        // the names that start so; else those with a word that does; else any that hold it
+        let matches: Vec<usize> = if typed.is_empty() {
+            Vec::new()
+        } else {
+            let names: Vec<String> = tiles.iter().map(|t| hero_title(&t.0).to_lowercase()).collect();
+            let pick = |f: &dyn Fn(&str) -> bool| (0..names.len()).filter(|&i| f(&names[i])).collect::<Vec<_>>();
+            let starts = pick(&|n| n.starts_with(&typed));
+            let words = if starts.is_empty() { pick(&|n| n.split([' ', '-']).any(|w| w.starts_with(&typed))) } else { starts };
+            if words.is_empty() { pick(&|n| n.contains(&typed)) } else { words }
+        };
+        let matched = matches.first().copied();
+        // the letters stay a moment, then fade out
+        let shown = self.hero_typed_at.elapsed().as_secs_f32();
+        let fade = 1.0 - ((shown - 1.5) / 1.5).clamp(0.0, 1.0);
+        if !self.hero_typed.is_empty() {
+            // the letters fade on their own: wake up to clear them
+            ctx.request_repaint();
+        }
+        let typed_text = self.hero_typed.clone();
+
         let mut picked: Option<String> = None;
+        if open_typed {
+            if let Some(i) = matched {
+                picked = Some(tiles[i].0.clone());
+            }
+        }
         let assets = &self.assets;
         let icons = &mut self.icons;
 
@@ -132,27 +194,42 @@ impl LauncherApp {
             let cols = (((avail + GAP) / (HERO_W + GAP)).floor() as usize).max(1);
             let w = (avail - GAP * (cols as f32 - 1.0)) / cols as f32;
             let rows = tiles.len().div_ceil(cols);
-            egui::ScrollArea::vertical().id_salt("hero_picker_page")
-                .auto_shrink([false, false])
-                .show_rows(ui, HERO_H + GAP, rows, |ui, range| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    for row in range {
-                        ui.horizontal_top(|ui| {
-                            ui.spacing_mut().item_spacing.x = GAP;
-                            for (hero, portrait, count) in
-                                &tiles[row * cols..((row + 1) * cols).min(tiles.len())]
-                            {
-                                let key = format!("hero:{hero}");
-                                let tex = icons.get(&key, None, portrait.as_deref().map(|p| assets.join(p)));
-                                if hero_tile(ui, w, hero_title(hero), *count, tex.as_ref(), hero == NO_HERO).clicked() {
-                                    picked = Some(hero.clone());
-                                }
+            let panel = ui.max_rect();
+            let mut scroll = egui::ScrollArea::vertical().id_salt("hero_picker_page").auto_shrink([false, false]);
+            if typed_changed {
+                if let Some(i) = matched {
+                    // the found hero's row near the top
+                    let pitch = HERO_H + GAP + ui.spacing().item_spacing.y;
+                    scroll = scroll.vertical_scroll_offset(((i / cols) as f32 - 0.5).max(0.0) * pitch);
+                }
+            }
+            scroll.show_rows(ui, HERO_H + GAP, rows, |ui, range| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                for row in range {
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = GAP;
+                        for (k, (hero, portrait, count)) in
+                            tiles[row * cols..((row + 1) * cols).min(tiles.len())].iter().enumerate()
+                        {
+                            let key = format!("hero:{hero}");
+                            let tex = icons.get(&key, None, portrait.as_deref().map(|p| assets.join(p)));
+                            let mark = (!typed.is_empty()).then(|| matches.contains(&(row * cols + k)));
+                            if hero_tile(ui, w, hero_title(hero), *count, tex.as_ref(), hero == NO_HERO, mark).clicked() {
+                                picked = Some(hero.clone());
                             }
-                        });
-                        ui.add_space(GAP);
-                    }
-                });
+                        }
+                    });
+                    ui.add_space(GAP);
+                }
+            });
+
+            if !typed_text.is_empty() {
+                typed_overlay(ui.ctx(), panel, &typed_text, matched.map(|i| hero_title(&tiles[i].0)), fade);
+            }
         });
+        if !typed_text.is_empty() && picked.is_some() {
+            self.hero_typed.clear();
+        }
 
         if let Some(h) = picked {
             self.hero_filter = h;
@@ -557,10 +634,21 @@ fn hero_tile(
     count: usize,
     tex: Option<&egui::TextureHandle>,
     general: bool,
+    mark: Option<bool>,
 ) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, HERO_H), Sense::click());
     if ui.is_rect_visible(rect) {
-        let hover = ui.ctx().animate_bool_with_time(resp.id.with("h"), resp.hovered(), 0.12);
+        // typing: the heroes that fit light up (`Some(true)`), the rest dim
+        let lit_t = ui.ctx().animate_bool_with_time(resp.id.with("lit"), mark == Some(true), 0.15);
+        let dim_t = ui.ctx().animate_bool_with_time(resp.id.with("dim"), mark == Some(false), 0.2);
+        let hover = ui.ctx().animate_bool_with_time(resp.id.with("h"), resp.hovered(), 0.12).max(lit_t);
+        if lit_t > 0.01 {
+            // found by typing: an accent glow around the tile
+            ui.painter().add(
+                egui::Shadow { offset: egui::Vec2::ZERO, blur: 18.0, spread: 1.0, color: theme::ACCENT.gamma_multiply(0.55 * lit_t) }
+                    .as_shape(rect, Rounding::same(theme::R_LG - 2.0)),
+            );
+        }
         let p = ui.painter();
         let radius = theme::R_LG - 2.0;
         let r = Rounding::same(radius);
@@ -592,9 +680,43 @@ fn hero_tile(
             Color32::WHITE,
         );
         let outline = theme::lerp_color(Color32::from_white_alpha(14), Color32::from_white_alpha(80), hover);
-        p.rect_stroke(rect, r, Stroke::new(1.0_f32, outline));
+        p.rect_stroke(rect, r, Stroke::new(1.0_f32, theme::lerp_color(outline, theme::ACCENT_HI, lit_t)));
+        if lit_t > 0.01 {
+            p.rect_stroke(rect, r, Stroke::new(2.0 * lit_t, theme::ACCENT_HI));
+        }
+        if dim_t > 0.01 {
+            p.rect_filled(rect, r, Color32::from_black_alpha((185.0 * dim_t) as u8));
+        }
     }
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// The letters typed on the hero picker, large in the middle of the page (with
+/// "no such hero" under them when none fits); `fade` 1..0 as they go.
+fn typed_overlay(ctx: &egui::Context, panel: Rect, typed: &str, found: Option<&str>, fade: f32) {
+    if fade <= 0.0 {
+        return;
+    }
+    let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("hero_typed")));
+    let layout = |text: &str, font: FontId| ctx.fonts(|f| f.layout_no_wrap(text.to_string(), font, Color32::WHITE));
+    let letters = layout(&typed.to_uppercase(), bold_font(72.0));
+    let (hint, hint_color) = match found {
+        Some(_) => (String::new(), theme::TEXT),
+        None => (crate::tr!("Нет такого героя", "No such hero").to_string(), theme::DANGER),
+    };
+    let hint = layout(&hint, bold_font(15.0));
+    let center = panel.center();
+    let lpos = Pos2::new(center.x - letters.size().x / 2.0, center.y - letters.size().y / 2.0 - 12.0);
+    let hpos = Pos2::new(center.x - hint.size().x / 2.0, lpos.y + letters.size().y + 4.0);
+    // a soft dark cloud behind, so the letters read over any picture
+    let cloud = Rect::from_center_size(center, egui::vec2(letters.size().x.max(hint.size().x) + 80.0, letters.size().y + 50.0));
+    p.add(
+        egui::Shadow { offset: egui::Vec2::ZERO, blur: 60.0, spread: 0.0, color: Color32::from_black_alpha((150.0 * fade) as u8) }
+            .as_shape(cloud.shrink(30.0), Rounding::same(40.0)),
+    );
+    p.galley_with_override_text_color(lpos + egui::vec2(0.0, 3.0), letters.clone(), Color32::from_black_alpha((120.0 * fade) as u8));
+    p.galley_with_override_text_color(lpos, letters, Color32::WHITE.gamma_multiply(fade));
+    p.galley_with_override_text_color(hpos, hint, hint_color.gamma_multiply(0.9 * fade));
 }
 
 /// A slot of the hero: its caption and count, the item chosen for it (or an

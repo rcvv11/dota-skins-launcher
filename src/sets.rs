@@ -15,6 +15,9 @@ const LOCALIZATION: &[&str] = &[
 #[derive(Default)]
 pub struct NameIndex {
     by_name: HashMap<String, Vec<String>>,
+    /// The heroes' default items (npc name, slot, their names as rows show them): their
+    /// localized names are shared by many heroes («Стандартные наручи»)
+    defaults: Vec<(String, String, Vec<String>)>,
 }
 
 impl NameIndex {
@@ -28,7 +31,18 @@ impl NameIndex {
                 parse_tokens(&text, &mut tokens);
             }
         }
-        Ok(Self::build(&table, &tokens))
+        let mut index = Self::build(&table, &tokens);
+        index.defaults = default_items(&table, &tokens);
+        Ok(index)
+    }
+
+    /// The slot of the hero's default item a row names (its labels), None for none.
+    pub fn default_slot(&self, npc: &str, labels: &[String]) -> Option<String> {
+        let wanted: Vec<String> = labels.iter().map(|l| norm(l)).collect();
+        self.defaults
+            .iter()
+            .find(|(n, _, names)| n.eq_ignore_ascii_case(npc) && names.iter().any(|x| wanted.contains(x)))
+            .map(|(_, slot, _)| slot.clone())
     }
 
     fn build(table: &[u8], tokens: &HashMap<String, Vec<String>>) -> Self {
@@ -57,6 +71,37 @@ impl NameIndex {
     pub fn resolve(&self, labels: &[String]) -> Vec<String> {
         labels.iter().find_map(|l| self.by_name.get(&norm(l))).cloned().unwrap_or_default()
     }
+}
+
+/// Every default item of the table (`"prefab" "default_item"`): its hero, slot and names.
+fn default_items(table: &[u8], tokens: &HashMap<String, Vec<String>>) -> Vec<(String, String, Vec<String>)> {
+    use crate::schema::{block_end, find_from, has_scalar, hero_of, items_section, scalar, slot_of};
+    let mut out = Vec::new();
+    let (Some(open_items), Some(close_items)) = (items_section(table), items_section(table).and_then(|o| block_end(table, o)))
+    else {
+        return out;
+    };
+    let mut pos = open_items + 1;
+    while pos < close_items {
+        let Some(open) = find_from(table, b"{", pos) else { break };
+        if open >= close_items {
+            break;
+        }
+        let Some(close) = block_end(table, open) else { break };
+        pos = close + 1;
+        let block = &table[open..=close];
+        if !has_scalar(block, b"prefab", b"default_item") {
+            continue;
+        }
+        let Some(hero) = hero_of(block) else { continue };
+        let slot = slot_of(block).unwrap_or_else(|| "weapon".into());
+        let mut names: Vec<String> = scalar(block, b"name").into_iter().collect();
+        if let Some(texts) = scalar(block, b"item_name").and_then(|t| tokens.get(&t.trim_start_matches('#').to_lowercase())) {
+            names.extend(texts.iter().cloned());
+        }
+        out.push((hero.to_ascii_lowercase(), slot, names.iter().map(|n| norm(n)).collect()));
+    }
+    out
 }
 
 /// A set's name without its "Bundle" / «Комплект» word, when it has one.

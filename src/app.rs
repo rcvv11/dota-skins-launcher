@@ -116,6 +116,9 @@ pub struct LauncherApp {
     /// The Heroes tab's sets of one hero, as cards: (hero, persona, sets loaded,
     /// catalog size) -> (card, members). Worked out once, not every frame.
     hero_sets: Option<((String, bool, usize, usize), Vec<(Skin, Vec<String>)>)>,
+    /// Letters typed on the hero picker (type-to-find) and when the last one came.
+    hero_typed: String,
+    hero_typed_at: Instant,
 }
 
 enum PreviewRequest {
@@ -249,6 +252,8 @@ impl LauncherApp {
             catalog_outdated,
             mounted_mod_dir: mod_dir,
             hero_sets: None,
+            hero_typed: String::new(),
+            hero_typed_at: Instant::now(),
         }
     }
 
@@ -938,16 +943,15 @@ impl LauncherApp {
 
     fn build_plan(&self, restart: bool) -> job::Plan {
         let ids = self.selected_ids();
-        let chosen: Vec<&Skin> = self
-            .catalog
-            .skins
-            .iter()
-            .filter(|s| ids.contains(&s.id))
-            .collect();
+        let all: Vec<&Skin> = self.catalog.skins.iter().filter(|s| ids.contains(&s.id)).collect();
+        // as the heroes look (a hero whose persona the preset has: its persona's items); its
+        // classic items' swaps stay for the menu's classic look
+        let chosen = catalog::worn(all.clone());
+        let menu_only = catalog::menu_only(&all, &chosen);
         // the items the account wears: their files take the preset's too
         let owned = crate::vpk::game_dir_from_exe(&self.config.dota_path).map(|d| crate::owned::equipped(&d)).unwrap_or_default();
         let (overrides, schema_picks, unsupported) =
-            crate::extract::plan(&chosen, &self.catalog, &self.config.override_targets, &owned);
+            crate::extract::plan(&all, &self.catalog, &self.config.override_targets, &owned);
         let emblem = crate::emblem::from_preset(&chosen);
         let mut general = crate::visuals::general_items(&chosen);
         let mut hero_items = crate::visuals::hero_items(&chosen);
@@ -973,6 +977,7 @@ impl LauncherApp {
             memory_swap: self.config.memory_swap,
             owned,
             gems: crate::gems::chosen(&self.catalog, &self.profiles[self.active_index()].gems),
+            menu_only,
         }
     }
 
@@ -1112,7 +1117,7 @@ impl LauncherApp {
         let mod_dir = config::resolve_mod_dir(&self.config);
         let mut errors: Vec<String> = Vec::new();
         // an empty table: the DLL drops its swaps, glows, taunts and slot icons
-        if let Err(e) = crate::inject::write_config(&[], &[], &std::collections::HashMap::new()) {
+        if let Err(e) = crate::inject::write_config(&[], &[], &std::collections::HashMap::new(), &std::collections::HashSet::new(), &std::collections::HashSet::new()) {
             errors.push(e);
         }
         if !dota.is_empty() {

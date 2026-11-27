@@ -21,6 +21,12 @@ pub struct GameData {
     /// npc_dota_hero_* -> its slots in the order of the hero page's "equipped" row
     /// (the script's order, without persona slots and slots not shown in the loadout).
     pub slot_order: HashMap<String, Vec<String>>,
+    /// npc_dota_hero_* -> its persona's slots shown in the loadout, in the script's order.
+    pub persona_order: HashMap<String, Vec<String>>,
+    /// npc_dota_hero_* -> all its persona's item slots (shown in the loadout or not).
+    pub persona_all: HashMap<String, Vec<String>>,
+    /// npc_dota_hero_* -> the game's hero id (`HeroID`).
+    pub hero_ids: HashMap<String, u32>,
 }
 
 /// `(game version key, data)`. A new game version replaces the entry; the old
@@ -47,15 +53,18 @@ pub fn load(game_dir: &Path) -> Result<&'static GameData, String> {
         crate::trf!("в pak01_dir.vpk игры нет {}", "the game's pak01_dir.vpk has no {}", crate::schema::SCHEMA_PATH)
     })?;
     let units = crate::visuals::all_unit_models(game_dir)?;
-    let (slot_texts, slot_order) = slot_texts(game_dir);
+    let slots = slot_texts(game_dir);
     let table: &'static [u8] = Box::leak(table.into_boxed_slice());
     let data: &'static GameData = Box::leak(Box::new(GameData {
         table,
         index: Table::new(table),
         npcs: crate::schema::hero_npcs(table),
         units,
-        slot_texts,
-        slot_order,
+        slot_texts: slots.texts,
+        slot_order: slots.order,
+        persona_order: slots.persona_order,
+        persona_all: slots.persona_all,
+        hero_ids: slots.hero_ids,
     }));
     *cache = Some((key, data));
     Ok(data)
@@ -70,9 +79,19 @@ pub fn warm_up(dota_exe: String) {
     });
 }
 
+/// What the hero scripts say about the heroes' slots.
+#[derive(Default)]
+struct Slots {
+    texts: HashMap<(String, String), Vec<String>>,
+    order: HashMap<String, Vec<String>>,
+    persona_order: HashMap<String, Vec<String>>,
+    persona_all: HashMap<String, Vec<String>>,
+    hero_ids: HashMap<String, u32>,
+}
+
 /// The loadout captions of every hero's slots, from the hero scripts and the
-/// game's English and Russian texts.
-fn slot_texts(game_dir: &Path) -> (HashMap<(String, String), Vec<String>>, HashMap<String, Vec<String>>) {
+/// game's English and Russian texts; their order, the persona's, the hero ids.
+fn slot_texts(game_dir: &Path) -> Slots {
     let mut tokens: HashMap<String, Vec<String>> = HashMap::new();
     for f in ["resource/localization/dota_english.txt", "resource/localization/dota_russian.txt"] {
         if let Ok(Some(text)) = crate::vpk::read_file(game_dir, f) {
@@ -85,6 +104,9 @@ fn slot_texts(game_dir: &Path) -> (HashMap<(String, String), Vec<String>>, HashM
     .unwrap_or_default();
     let mut out = HashMap::new();
     let mut order: HashMap<String, Vec<String>> = HashMap::new();
+    let mut persona_order: HashMap<String, Vec<String>> = HashMap::new();
+    let mut persona_all: HashMap<String, Vec<String>> = HashMap::new();
+    let mut hero_ids: HashMap<String, u32> = HashMap::new();
     for bytes in scripts.values() {
         // "npc_dota_hero_x" { ... "ItemSlots" { "0" { "SlotName" "weapon" "SlotText" "#LoadoutSlot_Weapon" } } }
         let s = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
@@ -113,6 +135,13 @@ fn slot_texts(game_dir: &Path) -> (HashMap<(String, String), Vec<String>>, HashM
                         if shown && !name.contains("persona") {
                             order.entry(hero.clone()).or_default().push(name.clone());
                         }
+                        // the persona's item slots (its abilities' effects are no item tiles)
+                        if name.ends_with("_persona_1") && !name.starts_with("ability_effects") {
+                            persona_all.entry(hero.clone()).or_default().push(name.clone());
+                            if shown {
+                                persona_order.entry(hero.clone()).or_default().push(name.clone());
+                            }
+                        }
                         out.entry((hero, name)).or_insert(texts);
                     }
                     path.pop();
@@ -125,6 +154,12 @@ fn slot_texts(game_dir: &Path) -> (HashMap<(String, String), Vec<String>>, HashM
                 }
                 _ => match key.take() {
                     None => key = Some(tok),
+                    // the hero's own keys: <file root> > <hero> > HeroID
+                    Some(k) if path.len() == 2 && k.eq_ignore_ascii_case(b"HeroID") => {
+                        if let Ok(id) = s(tok).trim().parse::<u32>() {
+                            hero_ids.insert(path[1].to_ascii_lowercase(), id);
+                        }
+                    }
                     // only the slot block's own keys
                     Some(_) if !(path.len() >= 3 && path[path.len() - 2].eq_ignore_ascii_case("ItemSlots")) => {}
                     Some(k) => {
@@ -140,5 +175,5 @@ fn slot_texts(game_dir: &Path) -> (HashMap<(String, String), Vec<String>>, HashM
             }
         }
     }
-    (out, order)
+    Slots { texts: out, order, persona_order, persona_all, hero_ids }
 }
